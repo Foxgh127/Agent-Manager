@@ -44,6 +44,19 @@ class DashboardTemporarilyUnavailable(core.ManagerError):
     """The service failed to answer; saved login credentials remain unproven."""
 
 
+class DashboardSiteRejected(DashboardTemporarilyUnavailable):
+    """The site denied this transport, without proving the login expired."""
+
+    def __init__(self, reason: str = "access_denied") -> None:
+        self.reason = reason
+        messages = {
+            "site_challenge": "网站要求浏览器验证（HTTP 403）；请通过网页登录窗口刷新余额。登录凭据已保留。",
+            "csrf_rejected": "网站拒绝了请求来源或 CSRF 校验（HTTP 403）；请通过网页登录窗口刷新余额。登录凭据已保留。",
+            "access_denied": "网站拒绝管理接口访问（HTTP 403），尚不能判定登录过期；请通过网页确认访问权限。",
+        }
+        super().__init__(messages.get(reason, messages["access_denied"]))
+
+
 class DashboardLoginRequired(core.ManagerError):
     """The dashboard conclusively rejected or lacks its saved login session."""
 
@@ -1012,6 +1025,51 @@ def _auth_probe_script(expected_origin: str, expected_adapter: str) -> str:
 """.strip()
 
 
+def _browser_balance_probe_script(expected_origin: str, expected_adapter: str) -> str:
+    """Read a user snapshot in an already-authorized window; never export tokens.
+
+    The browser keeps its own cookies and challenge state. This does not move
+    them to the HTTP client, automate a challenge, or rotate credentials.
+    """
+    return f"""
+(async () => {{
+  const EXPECTED = {json.dumps(expected_origin)};
+  const ADAPTER = {json.dumps(expected_adapter)};
+  if (location.origin !== EXPECTED) return {{ authenticated: false }};
+  let token = '', userId = '';
+  for (const store of [localStorage, sessionStorage]) {{
+    for (const name of ['auth_token', 'access_token', 'token', 'user', 'auth_user']) {{
+      try {{
+        let value = store.getItem(name);
+        try {{ value = JSON.parse(value); }} catch {{}}
+        if (value && typeof value === 'object') {{
+          userId = userId || value.id || value.user_id || '';
+          token = token || value.access_token || value.accessToken || value.token || value.auth_token || '';
+        }} else if (typeof value === 'string' && !token) token = value;
+      }} catch {{}}
+    }}
+  }}
+  const headers = {{ Accept: 'application/json' }};
+  if (typeof token === 'string' && token) headers.Authorization = `Bearer ${{token}}`;
+  if (ADAPTER === 'sub2api') headers['X-User-UI-Request'] = '1';
+  else if (userId) headers['New-Api-User'] = String(userId);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {{
+    const path = ADAPTER === 'sub2api' ? '/api/v1/auth/me' : '/api/user/self';
+    const response = await fetch(new URL(path, EXPECTED).href, {{
+      credentials: 'include', cache: 'no-store', redirect: 'error', headers,
+      signal: controller.signal,
+    }});
+    let body = null, json = true;
+    try {{ body = await response.json(); }} catch {{ json = false; }}
+    return {{ adapter: ADAPTER, user: {{ status: response.status, body, json }} }};
+  }} catch {{ return {{ authenticated: false }}; }}
+  finally {{ clearTimeout(timer); }}
+}})()
+""".strip()
+
+
 def _probe_script(expected_origin: str) -> str:
     """Return a fixed, auditable same-origin probe. No user string becomes code."""
 
@@ -1730,6 +1788,7 @@ def _saved_json_request(
         if len(raw_body) > 4 * 1024 * 1024:
             raise core.ManagerError("中转站管理接口返回内容过大，已停止读取。")
         content_type = str(getattr(response_object, "headers", {}).get("Content-Type", ""))[:120]
+        site_challenge = str(getattr(response_object, "headers", {}).get("cf-mitigated", "")).casefold() == "challenge"
     try:
         parsed_body = json.loads(raw_body.decode("utf-8-sig")) if raw_body else {}
         is_json = isinstance(parsed_body, (dict, list))
@@ -1741,6 +1800,7 @@ def _saved_json_request(
         "body": parsed_body,
         "json": is_json,
         "contentType": content_type,
+        "siteChallenge": site_challenge,
     }
 
 
@@ -1781,17 +1841,36 @@ def _is_user_response(value: object) -> bool:
 
 def _raise_dashboard_user_error(response: dict) -> None:
     status = int(response.get("status") or 0)
-    if status in {401, 403}:
+    if status == 403:
+        raise DashboardSiteRejected(_dashboard_rejection_reason(response))
+    if status == 401:
         raise DashboardLoginRequired("中转站登录凭据已失效，请重新登录一次以续期。")
     raise DashboardTemporarilyUnavailable(f"中转站用户接口暂不可用（HTTP {status}），已保留登录凭据。")
 
 
 def _dashboard_response_is_transient(response: dict) -> bool:
     status = int(response.get("status") or 0)
-    return status == 429 or status >= 500 or response.get("json") is False
+    return status in {403, 429} or status >= 500 or response.get("json") is False
+
+
+def _dashboard_rejection_reason(response: dict) -> str:
+    # Response contents are inspected only for fixed diagnostic markers and
+    # never copied into UI state, logs, or credential fields.
+    body = response.get("body")
+    evidence = json.dumps(body, ensure_ascii=False).casefold()[:2048]
+    if response.get("siteChallenge") or (
+        response.get("json") is False
+        and any(marker in evidence for marker in ("just a moment", "cf-chl-", "challenge-platform"))
+    ):
+        return "site_challenge"
+    if any(marker in evidence for marker in ("csrf", "origin not allowed", "invalid origin", "origin mismatch")):
+        return "csrf_rejected"
+    return "access_denied"
 
 
 def _check_dashboard_transient(response: dict) -> None:
+    if int(response.get("status") or 0) == 403:
+        raise DashboardSiteRejected(_dashboard_rejection_reason(response))
     if _dashboard_response_is_transient(response):
         raise DashboardTemporarilyUnavailable(f"中转站接口暂不可用（HTTP {response.get('status') or 0}），已保留登录凭据。")
 
@@ -2090,9 +2169,13 @@ def _probe_saved_dashboard(session: dict) -> tuple[dict, dict]:
         raise core.ManagerError("中转站网页登录凭据类型不受支持，请重新登录。")
 
     refreshed = _saved_json_request(current, "/api/user/auth/refresh", method="POST")
+    if int(refreshed.get("status") or 0) == 403:
+        _check_dashboard_transient(refreshed)
     if refreshed.get("status") == 409 and "AUTH_SESSION_MISMATCH" in json.dumps(refreshed.get("body"), ensure_ascii=False):
         current.pop("sessionId", None)
         refreshed = _saved_json_request(current, "/api/user/auth/refresh", method="POST")
+        if int(refreshed.get("status") or 0) == 403:
+            _check_dashboard_transient(refreshed)
     refreshed_data = _response_data(refreshed)
     if isinstance(refreshed_data, dict) and isinstance(refreshed_data.get("access_token"), str):
         current["accessToken"] = refreshed_data["access_token"]
@@ -4060,6 +4143,70 @@ class RelayPortalService:
             ],
         }
 
+    def _probe_open_dashboard_quick(self, account: dict) -> dict | None:
+        """Use only this account's existing isolated window for two live reads.
+
+        A blocked HTTP client must not replay browser challenge cookies or
+        substitute another browser identity. The normal login UI owns all
+        verification; this path only reads the already-authorized page.
+        """
+        account_id = str(account.get("id") or "")
+        with self.lock:
+            session_id = str(self._session.get("sessionId") or "")
+            if (
+                not session_id or self.window is None or self._expired_locked()
+                or self._session.get("accountId") != account_id
+                or self._session.get("_autoAuthInFlight")
+            ):
+                return None
+        adapter = str(account.get("adapter") or "")
+        if adapter not in {"sub2api", "new-api"}:
+            return None
+        origin = core._provider_url_origin(account.get("origin") or account.get("portalUrl"))
+        expected_identity = account.get("user") if isinstance(account.get("user"), dict) else {}
+        first_identity = None
+        raw = None
+        for _ in range(2):
+            window, _portal_url, window_origin = self._validate_session(session_id)
+            if core._provider_url_origin(window_origin) != origin:
+                return None
+            raw = self._evaluate(
+                window, _browser_balance_probe_script(window_origin, adapter),
+                timeout=AUTO_AUTH_CHECK_TIMEOUT_SECONDS,
+            )
+            # Recheck navigation and cancellation before trusting a response.
+            validated_window, _, validated_origin = self._validate_session(session_id)
+            if validated_window is not window or validated_origin != window_origin:
+                return None
+            with self.lock:
+                cancel_event = self._session.get("_cancelEvent")
+                if isinstance(cancel_event, threading.Event) and cancel_event.is_set():
+                    return None
+            if not isinstance(raw, dict) or not _is_user_response(raw.get("user") or {}):
+                return None
+            actual_identity = _dashboard_user_identity(raw["user"])
+            _assert_dashboard_identity(
+                expected_identity, actual_identity,
+                expected_adapter=adapter, actual_adapter=str(raw.get("adapter") or ""),
+            )
+            if first_identity is not None:
+                _assert_dashboard_identity(first_identity, actual_identity)
+            first_identity = actual_identity
+        metadata = account.get("dashboardMetadata") if isinstance(account.get("dashboardMetadata"), dict) else {}
+        snapshot = _quick_dashboard_account_snapshot(
+            raw["user"], adapter, quota_per_unit=metadata.get("quotaPerUnit"),
+        )
+        return {
+            "adapter": adapter,
+            "_accountUser": snapshot["user"],
+            "_balance": snapshot["balance"],
+            "_balanceUnavailableReason": snapshot["balanceUnavailableReason"],
+            "_quotaPerUnit": snapshot["quotaPerUnit"],
+            "_quotaPerUnitLearned": None,
+            "_requestCount": 2,
+            "_refreshScope": "account",
+        }
+
     @_serialized_dashboard
     def refresh_account(self, account_id: object, *, full: bool = False) -> dict:
         """Refresh one relay card, using the lightweight path by default.
@@ -4333,6 +4480,33 @@ class RelayPortalService:
                         + core._redact_sensitive_text(exc, limit=220)
                     )
             return finish_balance(full_result, fresh=balance_written)
+        except DashboardSiteRejected as exc:
+            browser_error = ""
+            identity_changed = False
+            try:
+                browser_preview = self._probe_open_dashboard_quick(account)
+            except core.ManagerError as browser_exc:
+                browser_preview = None
+                identity_changed = isinstance(browser_exc, DashboardIdentityChanged)
+                browser_error = core._redact_sensitive_text(browser_exc, limit=240)
+            if browser_preview is not None:
+                result = quick_key_refresh(
+                    dashboard_authenticated=True, requires_login=False,
+                    dashboard_requests=2, quick_preview=browser_preview,
+                )
+                result.update({"dashboardTransport": "browser", "requiresBrowser": False})
+                return result
+            result = quick_key_refresh(
+                dashboard_authenticated=False, requires_login=identity_changed,
+                dashboard_requests=None,
+                warning=browser_error or core._redact_sensitive_text(exc, limit=240),
+            )
+            result.update({
+                "requiresBrowser": True,
+                "browserRefreshRequired": True,
+                "dashboardFailure": {"reason": exc.reason, "status": 403},
+            })
+            return result
         except DashboardTemporarilyUnavailable as exc:
             return quick_key_refresh(
                 dashboard_authenticated=False,

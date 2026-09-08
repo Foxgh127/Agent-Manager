@@ -4423,6 +4423,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = core.save_codex_config_document(self._read_json())
                 self._json({"ok": True, "result": result, **result})
                 return
+            if path in {"/api/codex-config/backups", "/api/codex-config/backups/delete"}:
+                import codex_config_recovery
+                payload = self._read_json()
+                result = (codex_config_recovery.create_manual_backup(expected_fingerprint=str(payload.get("expectedFingerprint") or ""))
+                          if path.endswith("/backups") else codex_config_recovery.delete_backup(backup_id=str(payload.get("backupId") or "")))
+                self._json({"ok": True, "result": result, "inspection": codex_config_recovery.inspect_recovery()})
+                return
             if path == "/api/codex-config/recovery":
                 import codex_config_recovery
                 payload = self._read_json()

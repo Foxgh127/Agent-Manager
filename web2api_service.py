@@ -54,7 +54,7 @@ GATEWAY_CLIENT_TIMEOUT_SECONDS = 20.0
 MAX_UPSTREAM_CONCURRENCY = 8
 RESPONSES_AUXILIARY_PATHS = {"/v1/responses/compact", "/v1/responses/input_tokens"}
 UPSTREAM_QUEUE_TIMEOUT_SECONDS = 2.0
-SAFE_FORWARD_HEADERS = {"openai-model", "x-reasoning-included", "retry-after"}
+SAFE_FORWARD_HEADERS = {"openai-model", "x-reasoning-included", "retry-after", "x-codex-history-compatibility"}
 CODEX_RESPONSES_LITE_HEADER = "X-OpenAI-Internal-Codex-Responses-Lite"
 SAFE_CLIENT_IDENTITY_HEADERS = (
     "User-Agent",
@@ -108,7 +108,8 @@ def protocol_capabilities() -> dict:
         },
         "features": {"functionTools": True, "customTools": True, "reasoningSummary": True,
                      "structuredOutputs": True, "chatStreamUsage": True,
-                     "responseIdentityBinding": True, "replayAfterOutput": False},
+                     "responseIdentityBinding": True, "replayAfterOutput": False,
+                     "statelessHistoryCompatibility": "explicit_encrypted_rejection_only"},
         "limitations": ["upstream_endpoint_support_required", "websocket_one_response_at_a_time",
                         "no_websocket_warmup_multiplexing_steering", "websocket_continuation_uses_http_state",
                         "no_response_retrieve_delete_cancel_api", "no_oauth_token_count_estimate"],
@@ -2696,6 +2697,106 @@ def _response_session_affine(payload: dict) -> bool:
     return bool(str(conversation or "").strip())
 
 
+def _has_opaque_history(payload: dict) -> bool:
+    items = payload.get("input")
+    return isinstance(items, list) and any(
+        isinstance(item, dict) and item.get("encrypted_content")
+        for item in items
+    )
+
+
+def _portable_history_replay(payload: dict) -> dict | None:
+    """Copy an explicit stateless history after an encrypted-state rejection.
+
+    Cursor-backed requests and compacted windows do not establish the original
+    context. Never guess their missing messages, tools or encrypted contents.
+    Only an ordinary message/function/custom-tool history can be replayed.
+    """
+    if _response_session_affine(payload) or not _has_opaque_history(payload):
+        return None
+    items = payload.get("input")
+    portable = []
+    pending = {}
+    seen_calls = set()
+    user_seen = assistant_seen = False
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("type", "message" if item.get("role") else "")
+        if not isinstance(kind, str):
+            return None
+        if kind == "reasoning" and item.get("encrypted_content"):
+            continue
+        if kind == "message":
+            role = item.get("role")
+            content = item.get("content")
+            if not isinstance(role, str) or role not in {"user", "assistant", "system", "developer"}:
+                return None
+            if not isinstance(content, (str, list)) or not content:
+                return None
+            if isinstance(content, list):
+                for part in content:
+                    if (not isinstance(part, dict)
+                            or part.get("type") not in ("input_text", "output_text", "refusal", "input_image", "input_file")
+                            or part.get("file_id")):
+                        return None
+            if role == "user":
+                if pending:
+                    return None
+                user_seen = True
+            elif role == "assistant":
+                if not user_seen:
+                    return None
+                assistant_seen = True
+        elif kind in {"function_call", "custom_tool_call"}:
+            call_id = item.get("call_id")
+            if not user_seen or not isinstance(call_id, str) or not call_id or call_id in seen_calls:
+                return None
+            if not isinstance(item.get("name"), str) or not item["name"]:
+                return None
+            if not isinstance(item.get("arguments" if kind == "function_call" else "input"), str):
+                return None
+            seen_calls.add(call_id)
+            pending[call_id] = kind + "_output"
+        elif kind in {"function_call_output", "custom_tool_call_output"}:
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or pending.pop(call_id, None) != kind or "output" not in item:
+                return None
+            assistant_seen = True
+        else:
+            # Includes compaction, item_reference and provider-owned tool state.
+            return None
+        copied = dict(item)
+        # Item IDs are server-owned. Tool association uses call_id, which is
+        # preserved with arguments/output, message phase and all content parts.
+        copied.pop("id", None)
+        portable.append(copied)
+    if not user_seen or not assistant_seen or pending:
+        return None
+    replay = json.loads(json.dumps(payload))
+    replay["input"] = json.loads(json.dumps(portable))
+    return replay
+
+
+def _encrypted_history_replay(payload: dict, status: int, body: bytes) -> dict | None:
+    """Retry only an explicit pre-inference encrypted-content validation error."""
+    if status != 400:
+        return None
+    try:
+        error = _explicit_error_object(json.loads(body))
+    except (ValueError, UnicodeError):
+        return None
+    if not error or (error.get("code") != "invalid_encrypted_content" and error.get("type") != "invalid_encrypted_content"):
+        return None
+    replay = _portable_history_replay(payload)
+    if replay is None:
+        raise GatewayError(
+            "当前上游无法读取旧会话的加密上下文。请切回原账号/服务继续，或提供包含原始消息及配对工具调用的完整历史；"
+            "压缩上下文或 previous_response_id 不能直接跨账号恢复。原会话未修改。", 409,
+        )
+    return replay
+
+
 def _abort_upstream_response(response: Any) -> None:
     """Interrupt a blocked HTTP read before closing its buffered wrapper."""
     pending = [(response, 0)]
@@ -4791,6 +4892,7 @@ class Web2APIManager:
         last_attempt_account: dict | None = None
         requested_model = str(payload.get("model") or "")
         session_affine = _response_session_affine(payload)
+        opaque_history = _has_opaque_history(payload)
         request_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         for account in self._accounts(
             allowed_ids,
@@ -4801,6 +4903,8 @@ class Web2APIManager:
             last_attempt_account = account
             refresh_after_401 = False
             rejected_access_token = ""
+            compatibility_retried = False
+            replay_identity = ""
             while True:
                 access_token = ""
                 try:
@@ -4820,6 +4924,8 @@ class Web2APIManager:
                     fingerprint = _oauth_binding_fingerprint(credentials)
                     if expected_identity and expected_identity != fingerprint:
                         raise GatewayError("原响应的账号身份已改变，已拒绝向新身份续轮。", 409)
+                    if replay_identity and replay_identity != fingerprint:
+                        raise GatewayError("兼容重试期间账号身份已改变，请重新加载原会话后重试。", 409)
                     request = Request(
                         UPSTREAM_RESPONSES_URL,
                         data=request_body,
@@ -4842,6 +4948,8 @@ class Web2APIManager:
                     self.account_last_used[account_id] = time.monotonic()
                     self.last_error = None
                     headers = _codex_quota_headers(response.headers, account)
+                    if compatibility_retried:
+                        headers["X-Codex-History-Compatibility"] = "plaintext-replay"
                     self._remember_quota(account, headers)
                     return response, account, headers
                 except HTTPError as exc:
@@ -4853,6 +4961,13 @@ class Web2APIManager:
                         self._remember_quota(account, headers)
                     finally:
                         exc.close()
+                    if not compatibility_retried:
+                        replay = _encrypted_history_replay(payload, exc.code, error_body)
+                        if replay is not None:
+                            compatibility_retried = True
+                            replay_identity = fingerprint
+                            request_body = json.dumps(replay, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                            continue
                     if exc.code == 401 and not refresh_after_401:
                         refresh_after_401 = True
                         rejected_access_token = access_token
@@ -4895,7 +5010,7 @@ class Web2APIManager:
                     if exc.code not in {401, 403, 429}:
                         retry_error.route_account = account
                         raise retry_error
-                    if session_affine:
+                    if session_affine or opaque_history:
                         retry_error.route_account = account
                         self.last_error = str(retry_error)[:500]
                         raise retry_error
@@ -4903,6 +5018,9 @@ class Web2APIManager:
                 except core.ManagerError as exc:
                     detail = core._redact_sensitive_text(exc, limit=240)
                     retry_error = GatewayError(f"账号 {account.get('label')} 不可用：{detail}", 502)
+                    if session_affine or opaque_history:
+                        retry_error.route_account = account
+                        raise retry_error from exc
                     break
                 except (URLError, TimeoutError) as exc:
                     error = GatewayError(
@@ -4984,7 +5102,7 @@ class Web2APIManager:
                 if getattr(exc, "transient_capacity", False) is not True:
                     raise
                 last_capacity_error = exc
-                if attempt + 1 < UPSTREAM_CAPACITY_MAX_ATTEMPTS:
+                if attempt + 1 < UPSTREAM_CAPACITY_MAX_ATTEMPTS and not _has_opaque_history(payload):
                     continue
                 self.last_error = str(exc)[:500]
                 raise
@@ -4996,7 +5114,7 @@ class Web2APIManager:
             if capacity_error is None and prepared is not None:
                 return prepared, account, headers
             last_capacity_error = capacity_error
-            if attempt + 1 >= UPSTREAM_CAPACITY_MAX_ATTEMPTS:
+            if attempt + 1 >= UPSTREAM_CAPACITY_MAX_ATTEMPTS or _has_opaque_history(payload):
                 self.last_error = str(capacity_error)[:500]
                 raise capacity_error
         error = last_capacity_error or GatewayError("上游模型暂时繁忙，请稍后重试。", 503)
@@ -5055,10 +5173,28 @@ class Web2APIManager:
             },
         )
         try:
-            response = core._open_same_origin_request(
-                request,
-                timeout=UPSTREAM_OPEN_TIMEOUT_SECONDS,
-            )
+            try:
+                response = core._open_same_origin_request(
+                    request, timeout=UPSTREAM_OPEN_TIMEOUT_SECONDS,
+                )
+            except HTTPError as exc:
+                if path != "/v1/responses" or exc.code != 400:
+                    raise
+                try:
+                    rejected_body = _read_limited(exc)
+                    rejected_type = exc.headers.get_content_type() if exc.headers else "application/json"
+                    rejected_headers = _safe_response_headers(exc.headers)
+                finally:
+                    exc.close()
+                replay = _encrypted_history_replay(forwarded, exc.code, rejected_body)
+                if replay is None:
+                    raise GatewayError(f"{provider['name']} 返回 HTTP {exc.code}。", exc.code,
+                                       rejected_body, rejected_type, rejected_headers) from exc
+                # Same URL, credential, native model and client identity. Only
+                # a rejected request is replayed; SSE/transport failures are not.
+                request.data = json.dumps(replay, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                response = core._open_same_origin_request(request, timeout=UPSTREAM_OPEN_TIMEOUT_SECONDS)
+                response.headers["X-Codex-History-Compatibility"] = "plaintext-replay"
             response._gateway_identity_fingerprint = fingerprint
             _set_response_idle_timeout(response)
             self.last_error = None

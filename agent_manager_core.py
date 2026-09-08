@@ -1312,6 +1312,9 @@ def read_toml(path: Path) -> dict:
 
 
 def backup_file(path: Path) -> Path | None:
+    if path.absolute() == CONFIG_FILE.absolute():
+        import config_backup_service
+        return config_backup_service.backup_current()
     if not path.exists():
         return None
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1327,7 +1330,8 @@ def _prune_file_backups() -> None:
 
     try:
         backups = sorted(
-            (item for item in BACKUPS_DIR.glob("*.bak") if item.is_file()),
+            (item for item in BACKUPS_DIR.glob("*.bak")
+             if item.is_file() and not item.name.startswith("config.toml")),
             key=lambda item: item.stat().st_mtime_ns,
             reverse=True,
         )
@@ -21006,6 +21010,9 @@ def _apply_configuration_locked(
         "managedAgents": len(specs),
     }
     save_settings(settings)
+    # Also migrate/prune known legacy config history on an unchanged Apply.
+    import config_backup_service
+    config_backup_service.prune_automatic()
     changed = (
         config_before != config_after
         or agents_before != agents_after

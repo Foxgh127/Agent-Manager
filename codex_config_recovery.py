@@ -10,6 +10,7 @@ import tomllib
 import uuid
 
 import agent_manager_core as core
+import config_backup_service as backups
 
 
 def decode_toml(raw: bytes) -> str:
@@ -57,16 +58,7 @@ def _valid_text(raw: bytes) -> str | None:
 
 def _directory_is_direct(path: Path) -> bool:
     """Do not discover or create backups through a junction/symlink ancestor."""
-    absolute = path.absolute()
-    for component in (absolute, *absolute.parents):
-        try:
-            if component.is_symlink() or (
-                hasattr(component, "is_junction") and component.is_junction()
-            ):
-                return False
-        except OSError:
-            return False
-    return True
+    return backups.directory_is_direct(path)
 
 
 def claim_orphaned_overlay() -> None:
@@ -119,57 +111,17 @@ def inspect_recovery() -> dict:
         (b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")
     ):
         status = "encoding"
-    candidates = []
-    seen = set()
-    for directory in (
-        core.CONFIG_FILE.parent,
-        core.BACKUPS_DIR,
-        core.BACKUPS_DIR / "config-recovery",
-    ):
-        if not _directory_is_direct(directory) or not directory.is_dir():
-            continue
-        paths = (
-            list(directory.glob("config.toml*.bak"))
-            + list(directory.glob("config.toml*.backup"))
-            + list(directory.glob("config.toml*.original"))
-        )
-        paths.sort(
-            key=lambda path: path.stat().st_mtime_ns if path.is_file() else 0,
-            reverse=True,
-        )
-        for path in paths[:40]:
-            try:
-                if (
-                    not path.is_file()
-                    or path.is_symlink()
-                    or path.resolve().parent != directory.resolve()
-                ):
-                    continue
-                value = _read_bounded(path)
-                digest = _fingerprint(value)
-                if digest in seen or _valid_text(value) is None:
-                    continue
-                seen.add(digest)
-                candidates.append(
-                    {
-                        "id": _fingerprint(str(path.resolve()).encode() + value),
-                        "name": path.name,
-                        "path": str(path.resolve()),
-                        "size": len(value),
-                        "modifiedAt": path.stat().st_mtime,
-                        "fingerprint": digest,
-                    }
-                )
-            except (OSError, core.ManagerError):
-                continue
-    candidates.sort(key=lambda item: item["modifiedAt"], reverse=True)
+    files = backups.list_backups()
+    candidates = [item for item in files if item["canRestore"]]
     return {
         "status": status,
         "exists": exists,
         "path": str(core.CONFIG_FILE),
         "fingerprint": _fingerprint(raw),
         "size": len(raw),
-        "backups": candidates[:20],
+        "backups": candidates,
+        "backupFiles": files,
+        "automaticLimit": backups.AUTO_LIMIT,
         "canNormalize": status == "encoding",
         "message": "当前配置可正常解析。"
         if status == "valid"
@@ -177,6 +129,25 @@ def inspect_recovery() -> dict:
         if status == "encoding"
         else "当前配置无法解析，可选择有效备份恢复，或保留原文件后重建空配置。",
     }
+
+
+def create_manual_backup(*, expected_fingerprint: str) -> dict:
+    with core.SWITCH_OPERATION_LOCK, core.CONFIG_FILE_LOCK, core.RUNTIME_OVERLAY_LOCK:
+        original, exists = _current_config()
+        if _fingerprint(original) != expected_fingerprint:
+            raise core.ManagerError("配置已被其他程序修改，请重新检查后再备份。")
+        if not exists:
+            raise core.ManagerError("当前配置文件不存在，无法创建手动备份。")
+        result = backups.create_backup(original, kind="manual")
+        observed, observed_exists = _current_config()
+        if observed != original or observed_exists != exists:
+            result["warning"] = "备份已保存检查时的原始内容；当前配置随后被其他程序修改，请重新检查。"
+        return result
+
+
+def delete_backup(*, backup_id: str) -> dict:
+    with core.SWITCH_OPERATION_LOCK, core.CONFIG_FILE_LOCK, core.RUNTIME_OVERLAY_LOCK:
+        return backups.delete_backup(backup_id)
 
 
 def repair_config(
@@ -187,6 +158,8 @@ def repair_config(
         if current["fingerprint"] != expected_fingerprint:
             raise core.ManagerError("配置已被其他程序修改，请重新检查后再恢复。")
         original, original_exists = _current_config()
+        if _fingerprint(original) != expected_fingerprint:
+            raise core.ManagerError("配置在检查后再次变化，请重新检查后再恢复。")
         selected = (
             next((item for item in current["backups"] if item["id"] == backup_id), None)
             if backup_id
@@ -195,7 +168,7 @@ def repair_config(
         if backup_id and not selected:
             raise core.ManagerError("所选备份已变化或不可用，请重新检查。")
         if selected:
-            value = _read_bounded(Path(selected["path"]))
+            value = backups.read_backup(Path(selected["path"]), expected_id=selected["id"])
             if _fingerprint(value) != selected["fingerprint"]:
                 raise core.ManagerError("备份在检查后发生变化，未恢复。")
             text = _valid_text(value)

@@ -1055,10 +1055,10 @@ function RelayAccountCard({
           options={codexGroups.map(item => ({value:String(item.id),label:item.name,detail:formatRelayRate(item.rateMultiplier)}))}
         />
       </div>
-      {selectedGroup && [selectedGroup.dailyLimitUsd, selectedGroup.weeklyLimitUsd, selectedGroup.monthlyLimitUsd].some(value => typeof value === "number") && <div className="relay-route-limits">
-        {typeof selectedGroup.dailyLimitUsd === "number" && <span>日限 {formatBalanceAmount(selectedGroup.dailyLimitUsd, { currency: "USD" })}</span>}
-        {typeof selectedGroup.weeklyLimitUsd === "number" && <span>周限 {formatBalanceAmount(selectedGroup.weeklyLimitUsd, { currency: "USD" })}</span>}
-        {typeof selectedGroup.monthlyLimitUsd === "number" && <span>月限 {formatBalanceAmount(selectedGroup.monthlyLimitUsd, { currency: "USD" })}</span>}
+      {selectedGroup && [selectedGroup.dailyLimitUsd, selectedGroup.weeklyLimitUsd, selectedGroup.monthlyLimitUsd].some(value => typeof value === "number" && value > 0) && <div className="relay-route-limits">
+        {typeof selectedGroup.dailyLimitUsd === "number" && selectedGroup.dailyLimitUsd > 0 && <span>日限 {formatBalanceAmount(selectedGroup.dailyLimitUsd, { currency: "USD" })}</span>}
+        {typeof selectedGroup.weeklyLimitUsd === "number" && selectedGroup.weeklyLimitUsd > 0 && <span>周限 {formatBalanceAmount(selectedGroup.weeklyLimitUsd, { currency: "USD" })}</span>}
+        {typeof selectedGroup.monthlyLimitUsd === "number" && selectedGroup.monthlyLimitUsd > 0 && <span>月限 {formatBalanceAmount(selectedGroup.monthlyLimitUsd, { currency: "USD" })}</span>}
       </div>}
 
       <dl className="relay-account-metrics" aria-label={`${account.siteName || "中转站"} 账号信息`}>
@@ -5392,7 +5392,8 @@ function AccountsView({
         timeoutMs: 120_000,
       });
       await reloadConnections();
-      if (result.result?.requiresLogin) {
+      if (result.result?.requiresLogin || result.result?.requiresBrowser) {
+        if (result.result?.requiresBrowser) notify("站点要求通过网页验证，正在打开网页登录窗口；验证完成后会同步余额", "warning");
         setRelayRelogin(result.result?.account || account);
         return;
       }

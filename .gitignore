@@ -19,6 +19,10 @@ auth.json
 node_modules/
 gui/dist/
 work/
+artifacts/
+dist/
+.venv/
+*.egg-info/
 audit/
 release/
 .codex/

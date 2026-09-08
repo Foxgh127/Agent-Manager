@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import agent_manager_core as core
 import codex_config_recovery as recovery
+import config_backup_service as backups
 
 
 class CodexConfigRecoveryV96Tests(unittest.TestCase):
@@ -103,18 +104,14 @@ class CodexConfigRecoveryV96Tests(unittest.TestCase):
         self.config.write_bytes(damaged)
         backup = self._backup("config.toml.race.bak", b'model = "before"\n')
         selected_id = recovery.inspect_recovery()["backups"][0]["id"]
-        real_read = recovery._read_bounded
-        backup_reads = 0
+        real_read = backups.read_backup
 
-        def racing_read(path: Path) -> bytes:
-            nonlocal backup_reads
+        def racing_read(path: Path, **kwargs) -> bytes:
             if Path(path) == backup:
-                backup_reads += 1
-                if backup_reads == 2:
-                    backup.write_bytes(b'model = "after"\n')
-            return real_read(path)
+                backup.write_bytes(b'model = "after"\n')
+            return real_read(path, **kwargs)
 
-        with patch.object(recovery, "_read_bounded", side_effect=racing_read):
+        with patch.object(backups, "read_backup", side_effect=racing_read):
             with self.assertRaisesRegex(core.ManagerError, "备份在检查后发生变化"):
                 recovery.repair_config(
                     expected_fingerprint=hashlib.sha256(damaged).hexdigest(),
