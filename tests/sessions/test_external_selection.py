@@ -226,6 +226,9 @@ class FirstRunDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch.object(core, "STATE_DIR", Path(directory)),
+                # Windows/Python 3.11 can return the same monotonic clock tick
+                # for both lookups; a zero-age negative result is still fresh.
+                patch.object(core.time, "monotonic", return_value=100.0),
                 patch.dict(
                     core.CODEX_WINDOWS_APP_CACHE, {"at": 0, "value": None}, clear=True
                 ),

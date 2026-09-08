@@ -1071,7 +1071,7 @@ def _detect_codex_windows_app_locked(force: bool = False) -> dict | None:
     if (
         not force and cached is None
         and _core.CODEX_WINDOWS_APP_CACHE.get("scope") == cache_scope
-        and 0 < _core.time.monotonic() - float(_core.CODEX_WINDOWS_APP_CACHE.get("at") or 0) < 30.0
+        and 0 <= _core.time.monotonic() - float(_core.CODEX_WINDOWS_APP_CACHE.get("at") or 0) < 30.0
     ):
         return None
     cached_valid = durable_record(cached)
