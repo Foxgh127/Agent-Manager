@@ -4,3 +4,4 @@ pyinstaller==6.21.0
 Pillow==12.3.0
 pystray==0.19.5
 defusedxml==0.7.1
+tzdata==2026.2
