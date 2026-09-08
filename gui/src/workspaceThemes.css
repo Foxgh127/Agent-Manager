@@ -1,0 +1,83 @@
+/* Platform identity belongs to workspace chrome, not account group colors. */
+/* Feather the native caption into the client area; controls stay above/below it. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto;
+  height: 30px;
+  z-index: 40;
+  pointer-events: none;
+  background: linear-gradient(180deg, var(--bg), color-mix(in srgb, var(--bg) 65%, transparent) 45%, transparent);
+  backdrop-filter: blur(12px);
+  mask-image: linear-gradient(#000, transparent);
+  -webkit-mask-image: linear-gradient(#000, transparent);
+}
+:root[data-workspace="home"] {
+  --bg: #161b20; --surface: #232c31; --surface-2: #2b353b;
+  --canvas-rgb: 22 27 32; --panel-rgb: 35 44 49;
+  --accent-rgb: 157 193 185; --accent-strong: #bddbd3;
+  --glass: rgb(35 44 49 / .9); --on-accent: #172a29;
+}
+:root[data-workspace="codex"] {
+  --bg: #121c20; --sidebar: rgb(25 39 43 / .82);
+  --surface: #1c2c30; --surface-2: #25373c; --surface-3: #30454a;
+  --canvas-rgb: 18 28 32; --panel-rgb: 28 44 48;
+  --text-rgb: 233 243 241; --muted-rgb: 166 190 188; --muted-2: #91aaa8;
+  --line-rgb: 211 234 228; --accent-rgb: 127 202 183; --accent-strong: #a7ddce;
+  --on-accent: #12382f; --glass: rgb(30 47 51 / .91); --glass-line: rgb(208 238 226 / .15);
+}
+:root[data-workspace="claude"] {
+  --bg: #211d1b; --sidebar: rgb(44 37 33 / .86);
+  --surface: #302925; --surface-2: #3b322c; --surface-3: #4a3c33;
+  --canvas-rgb: 33 29 27; --panel-rgb: 48 41 37;
+  --text-rgb: 246 237 223; --muted-rgb: 198 180 159; --muted-2: #b49e88;
+  --line-rgb: 239 220 193; --accent-rgb: 223 176 138; --accent-strong: #edd0ac;
+  --on-accent: #432b1c; --glass: rgb(52 43 37 / .92); --glass-line: rgb(247 217 181 / .16);
+}
+:root[data-theme="light"][data-workspace="home"] {
+  --bg: #f5f5f0; --surface: #fffef9; --surface-2: #edf1eb;
+  --canvas-rgb: 245 245 240; --panel-rgb: 255 254 249;
+  --accent-rgb: 53 111 98; --accent-strong: #28594f; --glass: rgb(255 254 249 / .9); --on-accent: #fff;
+}
+:root[data-theme="light"][data-workspace="codex"] {
+  --bg: #eff5f2; --sidebar: rgb(250 255 251 / .82);
+  --surface: #fbfefb; --surface-2: #e5efea; --surface-3: #d7e6de;
+  --canvas-rgb: 239 245 242; --panel-rgb: 251 254 251;
+  --text-rgb: 27 49 45; --muted-rgb: 78 105 98; --muted-2: #627e75;
+  --line-rgb: 43 85 71; --accent-rgb: 38 112 91; --accent-strong: #1f5d4b;
+  --on-accent: #fff; --glass: rgb(250 255 251 / .93); --glass-line: rgb(255 255 255 / .85);
+}
+:root[data-theme="light"][data-workspace="claude"] {
+  --bg: #f7f0e6; --sidebar: rgb(255 249 239 / .85);
+  --surface: #fffaf2; --surface-2: #f0e5d5; --surface-3: #e8d8c2;
+  --canvas-rgb: 247 240 230; --panel-rgb: 255 250 242;
+  --text-rgb: 64 44 31; --muted-rgb: 116 92 69; --muted-2: #8b725a;
+  --line-rgb: 117 80 47; --accent-rgb: 157 84 47; --accent-strong: #804022;
+  --on-accent: #fff; --glass: rgb(255 250 240 / .93); --glass-line: rgb(255 255 255 / .85);
+}
+.product-home { --home-codex: #72bea8; --home-claude: #d8a37e; background: radial-gradient(ellipse at 15% 20%,rgb(86 161 141 / .12),transparent 50%),radial-gradient(ellipse at 88% 80%,rgb(193 131 90 / .10),transparent 48%),var(--bg); }
+.product-card.codex-product { --product-color: var(--home-codex); background: linear-gradient(135deg,#294f46,#213d38 55%,#1b2d2e); border-color: rgb(151 210 191 / .25); }
+.product-card.claude-product { --product-color: var(--home-claude); background: linear-gradient(135deg,#64452e,#493829 55%,#302824); border-color: rgb(229 178 128 / .25); }
+.product-card::before, .product-card::after { content: none; }
+.product-card .product-logo { background: rgb(255 255 255 / .075); border-color: rgb(255 255 255 / .15); box-shadow: inset 0 1px 0 rgb(255 255 255 / .09); }
+.product-card .product-copy small, .product-card .product-enter { color: var(--product-color); }
+.product-card:not(:disabled):hover { transform: translateY(-5px); border-color: var(--product-color); box-shadow: 0 24px 55px rgb(var(--shadow-color) / .2); }
+:root[data-theme="light"] .product-home { --home-codex: #276f58; --home-claude: #965825; }
+:root[data-theme="light"] .codex-product { background: linear-gradient(135deg,#d0e9d8,#e2eee3 58%,#f2f5e9); border-color: #bbd9c6; }
+:root[data-theme="light"] .claude-product { background: linear-gradient(135deg,#f1d6ae,#f6e5ca 55%,#fcf3e1); border-color: #e5c59d; }
+:root[data-theme="light"] .product-card .product-logo { background: rgb(255 255 255 / .52); border-color: rgb(255 255 255 / .72); }
+.claude-workspace { --claude: var(--accent); --claude-soft: var(--accent-soft); grid-template-columns: 226px minmax(0,1fr); background: radial-gradient(ellipse at 92% -8%,rgb(var(--accent-rgb) / .085),transparent 44%),var(--bg); }
+.claude-sidebar { margin: 14px 0 14px 14px; top: 14px; height: calc(100dvh - 28px); padding: 18px 10px; border: 1px solid var(--glass-line); border-radius: 24px; background: var(--sidebar); backdrop-filter: blur(24px); }
+.claude-platform, .claude-sidebar nav > button { border-color: var(--border); background: var(--accent-soft); }
+.claude-platform > span, .claude-sidebar nav button > span { background: var(--accent-soft); }
+.claude-sidebar nav i { background: var(--accent); }
+.claude-safety { border-color: var(--border-soft); background: transparent; }
+.claude-workspace { --claude-strong: var(--accent-strong); --claude-on-accent: var(--on-accent); }
+.button.claude-primary { background: var(--claude); border-color: transparent; color: var(--claude-on-accent); box-shadow: 0 4px 16px rgb(var(--accent-rgb) / .14); }
+.button.claude-primary:hover:not(:disabled) { background: var(--claude-strong); }
+.claude-boundary { background: var(--accent-soft); border-color: var(--border); }
+.claude-runtime-card { background: var(--surface); border-color: var(--border); border-radius: 20px; }
+.claude-profile-form input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+:root[data-theme="light"] .codex-product .product-logo { background: #2e6756; border-color: rgb(255 255 255 / .42); }
+@media (max-width: 880px) { .claude-workspace { display: block; } .claude-sidebar { position: static; margin: 12px; width: auto; min-width: 0; height: auto; } .claude-sidebar nav, .claude-safety { display: none; } .claude-platform { margin: 12px 4px 0; } }
+@media (prefers-reduced-motion: reduce) { .product-card:not(:disabled):hover { transform: none; } }

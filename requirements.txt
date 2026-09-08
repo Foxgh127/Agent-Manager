@@ -1,0 +1,6 @@
+tomlkit==0.15.1
+pywebview==6.2.1
+pyinstaller==6.21.0
+Pillow==12.3.0
+pystray==0.19.5
+defusedxml==0.7.1

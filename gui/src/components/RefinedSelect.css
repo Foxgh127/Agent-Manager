@@ -1,0 +1,296 @@
+.refined-select {
+  min-width: 0;
+  max-width: 100%;
+  display: inline-flex;
+  color: var(--text);
+  font: inherit;
+}
+
+.refined-select--key {
+  width: auto;
+}
+
+.refined-select--route {
+  width: 100%;
+}
+.refined-select--group { width: auto; }
+.refined-select--field { width: 100%; }
+.refined-select--group .refined-select-trigger { min-height: 29px; padding: 4px 9px; border-radius: 9px; border-color: color-mix(in srgb,var(--select-tone) 32%,transparent); color: var(--text); background: color-mix(in srgb,var(--select-tone) 11%,transparent); gap: 6px; }
+.refined-select--group .refined-select-value strong { font-size: 11px; font-weight: 600; max-width: 120px; }
+.refined-select--field .refined-select-trigger { grid-template-columns: minmax(0,1fr) auto; width: 100%; min-height: 42px; padding: 10px 12px; border-radius: 12px; }
+.refined-select-dot { display: inline-block; flex: 0 0 6px; width: 6px; height: 6px; border-radius: 50%; background: var(--select-tone,var(--accent)); }
+.refined-select-option-label .refined-select-dot { margin-right: 8px; vertical-align: 1px; }
+.refined-select-tone-green { --select-tone: #48d497; }
+.refined-select-tone-amber { --select-tone: #e9b85e; }
+.refined-select-tone-blue { --select-tone: #63a6fb; }
+.refined-select-tone-violet { --select-tone: #a18df0; }
+.refined-select-tone-cyan { --select-tone: #4bc9d6; }
+.refined-select-tone-rose { --select-tone: #ea7f9c; }
+.refined-select-tone-slate { --select-tone: #8a9a96; }
+
+.refined-select-trigger {
+  min-width: 0;
+  max-width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  color: var(--text);
+  background: var(--surface-2, var(--surface));
+  box-shadow: inset 0 1px 0 var(--glass-highlight, transparent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--motion-fast, 160ms) ease,
+    background var(--motion-fast, 160ms) ease,
+    box-shadow var(--motion-fast, 160ms) ease;
+}
+
+.refined-select--key .refined-select-trigger {
+  width: auto;
+  min-height: 30px;
+  max-width: min(168px, 100%);
+  padding: 4px 8px 4px 9px;
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--accent-soft, var(--glass));
+}
+
+.refined-select--route .refined-select-trigger {
+  width: 100%;
+  min-height: 42px;
+  padding: 7px 10px;
+  border-radius: 17px;
+}
+
+.refined-select-trigger:hover:not(:disabled),
+.refined-select.is-open .refined-select-trigger {
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+  background: color-mix(in srgb, var(--surface-2, var(--surface)) 92%, var(--accent) 8%);
+}
+
+.refined-select-trigger:focus-visible {
+  outline: 0;
+  border-color: color-mix(in srgb, var(--accent) 62%, transparent);
+  box-shadow: 0 0 0 3px var(--accent-soft), inset 0 1px 0 var(--glass-highlight, transparent);
+}
+
+.refined-select-trigger:disabled {
+  cursor: not-allowed;
+  opacity: .46;
+}
+
+.refined-select-leading,
+.refined-select-chevron {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.refined-select--key .refined-select-leading {
+  color: currentColor;
+}
+
+.refined-select-chevron {
+  transition: transform var(--motion-fast, 160ms) var(--ease-out, ease);
+}
+
+.refined-select.is-open .refined-select-chevron {
+  transform: rotate(180deg);
+}
+
+.refined-select-value {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.refined-select-value strong,
+.refined-select-value small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.refined-select-value strong {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.refined-select--key .refined-select-value strong {
+  font-size: 13px;
+}
+
+.refined-select-value small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.refined-select-menu {
+  position: fixed;
+  z-index: 210;
+  overflow: hidden;
+  padding: 5px;
+  border: 1px solid var(--glass-line, var(--border));
+  border-radius: 20px;
+  color: var(--text);
+  background: var(--glass, var(--surface));
+  box-shadow: var(--shadow-float, 0 18px 48px rgb(0 0 0 / .22));
+  backdrop-filter: blur(24px) saturate(115%);
+  font-family: var(--font-ui, inherit);
+  animation: refined-select-enter var(--motion-fast, 160ms) var(--ease-out, ease) both;
+}
+
+.refined-select-menu[data-placement="top"] {
+  transform-origin: center bottom;
+}
+
+.refined-select-menu[data-placement="bottom"] {
+  transform-origin: center top;
+}
+
+.refined-select-listbox {
+  position: relative;
+  max-height: max(0px, calc(var(--refined-select-max-height, 320px) - 12px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.refined-select-option {
+  min-width: 0;
+  min-height: 43px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px 7px 7px;
+  border-radius: 10px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  transition: color var(--motion-fast, 160ms) ease,
+    background var(--motion-fast, 160ms) ease;
+}
+
+.refined-select-option.is-active {
+  background: var(--surface-2, rgb(var(--accent-rgb) / .08));
+}
+
+.refined-select-option.is-selected {
+  color: var(--accent);
+  background: var(--accent-soft, rgb(var(--accent-rgb) / .09));
+}
+
+.refined-select-option.is-selected.is-active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.refined-select-option.is-disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: .48;
+}
+
+.refined-select-check {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--accent);
+}
+
+.refined-select-option.is-selected .refined-select-check {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.refined-select-option-label,
+.refined-select-option small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.refined-select-option-label {
+  font-size: 12px;
+  font-weight: 570;
+  line-height: 1.35;
+}
+
+.refined-select-option small {
+  max-width: min(42vw, 170px);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: right;
+}
+
+.refined-select-empty {
+  padding: 16px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+@keyframes refined-select-enter {
+  from { opacity: 0; transform: translateY(-3px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.refined-select-menu[data-placement="top"] {
+  animation-name: refined-select-enter-top;
+}
+
+@keyframes refined-select-enter-top {
+  from { opacity: 0; transform: translateY(3px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (max-width: 440px) {
+  .refined-select-option {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+
+  .refined-select-option small {
+    grid-column: 2;
+    max-width: 100%;
+    text-align: left;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .refined-select-trigger,
+  .refined-select-chevron,
+  .refined-select-option {
+    transition: none;
+  }
+
+  .refined-select-menu {
+    animation: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .refined-select-menu { backdrop-filter: none; background: var(--surface-2); }
+}
+@supports not (backdrop-filter: blur(10px)) {
+  .refined-select-menu { background: var(--surface-2); }
+}
+
+@media (forced-colors: active) {
+  .refined-select-trigger,
+  .refined-select-menu {
+    border-color: ButtonText;
+  }
+
+  .refined-select-option.is-active,
+  .refined-select-option.is-selected {
+    outline: 1px solid Highlight;
+    outline-offset: -1px;
+  }
+}

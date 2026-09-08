@@ -1,0 +1,27 @@
+.account-grid [data-card-id] { position: relative; }
+.account-card-dragging, .account-card-dragging * { cursor: grabbing !important; user-select: none !important; }
+.account-grid .card-drag-placeholder { opacity: .18; outline: 2px dashed var(--accent, #698de4); outline-offset: -3px; transition: opacity 140ms ease; }
+.account-grid .card-drag-reveal { opacity: 1 !important; transition: none !important; }
+.account-grid .card-drag-placeholder, .account-grid .card-drag-reveal { transform: none !important; }
+body .card-drag-overlay {
+  position: fixed !important; inset: 0 auto auto 0 !important; z-index: 10000 !important;
+  margin: 0 !important; pointer-events: none !important; box-sizing: border-box; opacity: .96;
+  transform: translate3d(var(--card-drag-x, 0px), var(--card-drag-y, 0px), 0) scale(var(--card-drag-scale, 1));
+  transform-origin: top left; transition: box-shadow 160ms ease;
+  box-shadow: 0 24px 65px #0004, 0 0 0 2px var(--accent, #698de4) !important; will-change: transform;
+}
+body .card-drag-overlay.card-drag-docked { transition: transform 140ms cubic-bezier(.2,.8,.2,1), box-shadow 160ms ease; }
+[data-card-group-drop].card-drop-active, [data-card-pool-drop].card-drop-active {
+  outline: 2px solid var(--accent, #698de4) !important; outline-offset: 3px;
+  background: color-mix(in srgb, var(--accent, #698de4) 18%, transparent) !important;
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent, #698de4) 10%, transparent);
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+.card-drop-saving { animation: card-target-wait 900ms ease-in-out infinite alternate; }
+.card-drop-accepted { animation: card-target-receive 260ms ease-out; }
+@keyframes card-target-wait { to { box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent, #698de4) 18%, transparent); } }
+@keyframes card-target-receive { 50% { box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent, #698de4) 24%, transparent); } }
+@media (prefers-reduced-motion: reduce) {
+  .account-grid .card-drag-placeholder, body .card-drag-overlay, body .card-drag-overlay.card-drag-docked, .card-drop-active { transition: none !important; }
+  .card-drop-saving, .card-drop-accepted { animation: none; }
+}

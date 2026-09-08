@@ -1,0 +1,10 @@
+.quota-estimate { margin: -1px 0 12px; padding: 10px 11px; border: 1px solid var(--border-soft); border-radius: 13px; background: rgb(var(--canvas-rgb) / .07); color: var(--text); }
+.quota-estimate > p { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px; font-size: 11px; }
+.quota-estimate > p > span { font-weight: 650; }
+.quota-estimate small { color: var(--muted); font-size: 10px; }
+.quota-estimate-values { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.quota-estimate-values > span { min-width: 0; display: grid; gap: 3px; }
+.quota-estimate-values strong { font-size: 14px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.quota-estimate details { margin-top: 7px; color: var(--muted); font-size: 10px; }
+.quota-estimate summary { cursor: pointer; width: fit-content; }
+.quota-estimate details p { margin: 8px 0 0; line-height: 1.6; }

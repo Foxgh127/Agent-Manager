@@ -1,0 +1,6 @@
+{
+  "channel": "stable",
+  "kind": "github",
+  "assetName": "AgentManager-{version}.exe",
+  "repository": "Foxgh127/Agent-Manager"
+}

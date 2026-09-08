@@ -1,0 +1,25 @@
+# Local secrets, runtime data, caches and personal validation artifacts
+__pycache__/
+.pytest_cache/
+.coverage
+.ruff_cache/
+*.py[cod]
+.env
+.env.*
+!.env.example
+auth.json
+**/auth.json
+*secrets*.json
+*.log
+*.pem
+*.key
+*.pfx
+*.sqlite*
+*.db
+node_modules/
+gui/dist/
+work/
+audit/
+release/
+.codex/
+.vscode/

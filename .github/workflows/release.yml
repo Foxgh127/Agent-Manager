@@ -1,0 +1,53 @@
+name: Build and publish Agent Manager
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+concurrency:
+  group: agent-manager-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check whether this version is already published
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content gui/package.json -Raw | ConvertFrom-Json).version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Expected a stable x.y.z version.' }
+          $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed.' }
+          $exists = @($releases | Where-Object { $_.tag_name -eq "v$version" }).Count -gt 0
+          "publish=$((-not $exists).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+      - name: Install build and test dependencies
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          npm ci --ignore-scripts --prefix gui
+      - name: Verify release behavior
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          python -m pytest -q test_app_update_service_v912.py test_app_update_state_v913.py test_app_update_install_v913.py test_desktop_updates_v913.py test_codex_labels_policy_v913.py test_balance_labels_integration_v913.py test_shutdown_recovery_v913.py test_relay_balance_v913.py test_release_promotion.py
+          if ($LASTEXITCODE -ne 0) { throw 'Backend checks failed.' }
+          npm test --prefix gui
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend checks failed.' }
+      - name: Build, verify and publish the EXE
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./publish_release.ps1 -Repository $env:GITHUB_REPOSITORY -Build -Publish -NotesFile ./docs/release-notes.md

@@ -1,0 +1,18 @@
+.pool-protocols { margin: 0 24px 18px; border: 1px solid var(--border-soft); border-radius: 18px; background: var(--accent-soft); overflow: hidden; }
+.pool-protocols > summary { display: flex; align-items: center; gap: 12px; padding: 15px 18px; list-style: none; cursor: pointer; color: var(--accent); }
+.pool-protocols > summary::-webkit-details-marker { display: none; }
+.pool-protocols summary > span { flex: 1; display: grid; gap: 4px; }
+.pool-protocols summary strong { color: var(--text); font-size: 13px; }
+.pool-protocols summary small { color: var(--muted); font-size: 11px; }
+.pool-protocols summary > svg:last-child { transition: transform 180ms ease; }
+.pool-protocols[open] summary > svg:last-child { transform: rotate(180deg); }
+.pool-protocol-body { padding: 0 18px 15px; }
+.pool-protocol-table { border-radius: 12px; background: var(--surface); overflow: hidden; }
+.pool-protocol-table > div { display: grid; grid-template-columns: minmax(180px,1.8fr) minmax(75px,1fr) minmax(75px,1fr); gap: 12px; align-items: center; padding: 12px; border-top: 1px solid var(--border-soft); font-size: 12px; }
+.pool-protocol-table > .pool-protocol-heading { border-top: 0; color: var(--muted); font-size: 11px; }
+.pool-protocol-table [role=cell]:first-child { display: grid; gap: 4px; }
+.pool-protocol-table code { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.pool-protocol-table .unavailable { color: var(--muted-2); }
+.pool-protocol-body > p { margin: 12px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+@media (max-width: 640px) { .pool-protocols { margin-inline: 14px; } .pool-protocol-table > div { grid-template-columns: minmax(100px,1.7fr) 66px 60px; gap: 7px; padding: 10px; } }
+@media (prefers-reduced-motion: reduce) { .pool-protocols summary > svg:last-child { transition: none; } }

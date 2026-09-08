@@ -1,0 +1,16 @@
+Agent Manager 9.13.0
+
+仅供个人练手、学习与测试；代码、界面、提示词和文档工作全部由 Codex 完成。
+非 OpenAI/Anthropic 官方产品。
+
+把 EXE 放入自己可写的固定文件夹运行。Windows 需要 WebView2 Runtime。
+设置 → 版本与维护：检查 Agent Manager、Codex Desktop 与 CLI。
+本软件更新源内置为 https://github.com/Foxgh127/Agent-Manager/releases ，无需配置。
+一键更新会关闭 Codex、恢复原始配置并重启管理器；有正在处理的任务时请先完成任务。
+
+普通关闭窗口（未启用托盘）和彻底退出会恢复原始 Codex 配置。
+启用托盘时关闭窗口继续运行。
+高级“仅退出软件”会保留 Codex/临时配置但停止网关；下次启动管理器继续恢复。
+恢复冲突或进程无法关闭时会保留管理器和恢复记录，不能视为已退出。
+
+源码与发布说明： https://github.com/Foxgh127/Agent-Manager
