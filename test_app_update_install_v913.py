@@ -27,7 +27,7 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="installer-'quoted-[literal]-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.target = self.root / "install 'folder' [one]" / "AgentManager.exe"
         self.target.parent.mkdir()
         self.target.write_bytes(b"old fake executable - never executed")

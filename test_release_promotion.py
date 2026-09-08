@@ -30,7 +30,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_versioned_handoff_promotes_exact_bytes_then_canonical_cleans_fallbacks(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             canonical = root / "AgentManager.exe"
             versioned = root / "AgentManager-5.7.0.exe"
             legacy = root / "CodexAgentManager-5.6.0.exe"
@@ -60,7 +60,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_unmanaged_executable_name_never_modifies_neighbors(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             current = root / "helper.exe"
             canonical = root / "AgentManager.exe"
             current.write_bytes(b"helper")
@@ -75,7 +75,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_versioned_handoff_retries_transient_canonical_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             canonical = root / "AgentManager.exe"
             versioned = root / "AgentManager-5.7.0.exe"
             canonical.write_bytes(b"old")
@@ -104,7 +104,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_restart_prefers_canonical_after_promoted_copy_matches_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             canonical = root / "AgentManager.exe"
             versioned = root / "AgentManager-5.7.0.exe"
             canonical.write_bytes(b"same-release")
@@ -127,7 +127,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_handoff_can_wait_for_ui_readiness_beyond_eight_seconds(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             current = root / "AgentManager-8.0.0.exe"
             canonical = root / "AgentManager.exe"
             current.write_bytes(b"new-release")
@@ -172,7 +172,7 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_canonical_cleanup_retries_transient_fallback_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             canonical = root / "AgentManager.exe"
             fallback = root / "AgentManager-5.7.0.exe"
             canonical.write_bytes(b"canonical")
