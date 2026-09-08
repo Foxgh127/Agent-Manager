@@ -1,6 +1,6 @@
 # Codex 显示名称与子代理调度策略
 
-核对日期：2026-09-09。实现位于 `agent_manager_core.py`；本次仅修改生成逻辑，没有写入真实 Codex 配置或重启 Codex。
+核对日期：2026-09-09。实现位于 `src/agent_manager/core/`；本次仅修改生成逻辑，没有写入真实 Codex 配置或重启 Codex。
 
 ## 显示名称与路由身份
 

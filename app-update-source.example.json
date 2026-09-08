@@ -1,6 +1,0 @@
-{
-  "kind": "github",
-  "repository": "OWNER/RELEASE-REPOSITORY",
-  "assetName": "AgentManager-{version}.exe",
-  "channel": "stable"
-}

@@ -17,7 +17,7 @@ auth.json
 *.sqlite*
 *.db
 node_modules/
-gui/dist/
+frontend/dist/
 work/
 artifacts/
 dist/
@@ -27,3 +27,6 @@ audit/
 release/
 .codex/
 .vscode/
+
+frontend/.preview/
+src/agent_manager/resources/ui/

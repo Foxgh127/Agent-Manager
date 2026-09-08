@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-agent-manager"
+dynamic = ["version"]
+description = "Personal learning project: a local Codex and API account workbench, developed with Codex."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["tomlkit==0.15.1", "pywebview==6.2.1", "Pillow==12.3.0", "pystray==0.19.5", "defusedxml==0.7.1", "tzdata==2026.2"]
+
+[project.optional-dependencies]
+build = ["pyinstaller==6.21.0"]
+test = ["pytest==9.1.1"]
+
+[project.scripts]
+agent-manager = "agent_manager.application:main"
+agent-manager-config = "agent_manager.core:main"
+
+[project.urls]
+Repository = "https://github.com/Foxgh127/Agent-Manager"
+Issues = "https://github.com/Foxgh127/Agent-Manager/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_manager._version.VERSION"}
+
+[tool.setuptools.package-data]
+agent_manager = ["resources/**/*", "resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+norecursedirs = [".git", ".venv", "node_modules", "artifacts", "dist", "work", "audit"]
