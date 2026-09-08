@@ -14,8 +14,6 @@ jobs:
     runs-on: windows-latest
     env:
       PYTHONUTF8: '1'
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -29,6 +27,11 @@ jobs:
       - uses: actions/setup-node@v7.0.0
         with:
           node-version: '24'
+      - name: Use canonical temporary paths
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
       - name: Install and build UI
         shell: pwsh
         run: |
@@ -52,8 +55,6 @@ jobs:
     runs-on: windows-latest
     env:
       PYTHONUTF8: '1'
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     timeout-minutes: 20
     permissions:
       contents: write

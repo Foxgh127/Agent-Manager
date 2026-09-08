@@ -10,10 +10,12 @@ parser=argparse.ArgumentParser()
 parser.add_argument('--apply',action='store_true')
 parser.add_argument('--dependencies',action='store_true')
 parser.add_argument('--legacy-release',action='store_true')
+parser.add_argument('--generated-only',action='store_true',help='Only reproducible build/UI outputs; keep legacy archives and installed executables.')
 args=parser.parse_args()
 targets=['audit','work','artifacts/build','artifacts/publish','__pycache__','.pytest_cache','.ruff_cache','.coverage','frontend/.preview','frontend/work']
+if args.generated_only:targets=['artifacts/build','artifacts/publish','.pytest_cache','.ruff_cache','.coverage','frontend/.preview','frontend/work']
 if args.dependencies:targets+=['frontend/node_modules','frontend/dist','src/agent_manager/resources/ui']
-if args.legacy_release:targets+=['release']
+if args.legacy_release and not args.generated_only:targets+=['release']
 
 def direct(path):
     if not path.absolute().is_relative_to(ROOT):return False
