@@ -11,11 +11,14 @@ parser.add_argument('--apply',action='store_true')
 parser.add_argument('--dependencies',action='store_true')
 parser.add_argument('--legacy-release',action='store_true')
 parser.add_argument('--generated-only',action='store_true',help='Only reproducible build/UI outputs; keep legacy archives and installed executables.')
+parser.add_argument('--archives-only',action='store_true',help='Only retired audit/work directories; never remove installed executables or dependencies.')
 args=parser.parse_args()
+if args.generated_only and args.archives_only:parser.error('choose one cleanup scope')
 targets=['audit','work','artifacts/build','artifacts/publish','__pycache__','.pytest_cache','.ruff_cache','.coverage','frontend/.preview','frontend/work']
 if args.generated_only:targets=['artifacts/build','artifacts/publish','.pytest_cache','.ruff_cache','.coverage','frontend/.preview','frontend/work']
-if args.dependencies:targets+=['frontend/node_modules','frontend/dist','src/agent_manager/resources/ui']
-if args.legacy_release and not args.generated_only:targets+=['release']
+if args.archives_only:targets=['audit','work']
+if args.dependencies and not args.archives_only:targets+=['frontend/node_modules','frontend/dist','src/agent_manager/resources/ui']
+if args.legacy_release and not (args.generated_only or args.archives_only):targets+=['release']
 
 def direct(path):
     if not path.absolute().is_relative_to(ROOT):return False
@@ -59,6 +62,11 @@ if args.apply:
     for path in sorted(folders,key=lambda p:len(p.parts),reverse=True):
         try:
             if direct(path):path.rmdir() # Empty directories only; never recurse here.
+        except OSError:pass
+    for relative in ('design-system/agent-manager', 'design-system'):
+        path=ROOT/relative
+        try:
+            if direct(path):path.rmdir()  # Only remove the retired directory when empty.
         except OSError:pass
     summary['removedFiles']=removed
 print(json.dumps(summary,ensure_ascii=False,indent=2))
