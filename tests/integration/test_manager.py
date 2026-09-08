@@ -27,11 +27,19 @@ import agent_manager.gateway.service as web2api
 
 class AgentManagerTests(unittest.TestCase):
     def setUp(self):
-        # Configuration tests exercise the same registry synchronization used
-        # by the packaged application.  Always restore the reserved gateway
-        # variable so a successful test run can never poison the developer's
-        # real Codex environment or manufacture a later overlay conflict.
-        self.original_aggregate_environment = core._read_user_environment(core.AGGREGATE_ENV_KEY)
+        # Configuration and switch tests must never read or synchronize the
+        # developer's persisted gateway/provider credentials.
+        self.environment = {}
+        self.enterContext(patch.object(
+            core, "_read_user_environment", side_effect=lambda name: self.environment.get(name)
+        ))
+        self.enterContext(patch.object(
+            core, "_sync_user_environment",
+            side_effect=lambda name, value: self.environment.__setitem__(name, value),
+        ))
+        self.enterContext(patch.object(
+            core, "_remove_user_environment", side_effect=lambda name: self.environment.pop(name, None)
+        ))
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / ".codex"
         self.originals = {}
@@ -73,13 +81,19 @@ class AgentManagerTests(unittest.TestCase):
         self.model_patch.stop()
         for name, value in self.originals.items():
             setattr(core, name, value)
-        current_aggregate_environment = core._read_user_environment(core.AGGREGATE_ENV_KEY)
-        if current_aggregate_environment != self.original_aggregate_environment:
-            if self.original_aggregate_environment is None:
-                core._remove_user_environment(core.AGGREGATE_ENV_KEY)
-            else:
-                core._sync_user_environment(core.AGGREGATE_ENV_KEY, self.original_aggregate_environment)
         self.temp.cleanup()
+
+    def use_native_catalog_fixture(self):
+        # Switching still applies and rolls back real configuration files. Only
+        # the native catalog discovery boundary is supplied by this fixture.
+        self.enterContext(patch.object(core, "_raw_local_model_catalog", return_value={
+            "models": [{
+                "slug": "gpt-test-old",
+                "display_name": "Test",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "medium", "description": "Medium"}],
+            }]
+        }))
 
     @staticmethod
     def jwt(payload):
@@ -1155,6 +1169,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertEqual(core.load_provider_key("private_gateway"), secret)
 
     def test_main_profiles_agents_and_import_round_trip(self):
+        self.enterContext(patch.object(core, "codex_version", return_value="codex-cli 0.144.0"))
         core.ensure_state()
         core.save_main_profile(
             {"id": "deep", "name": "Deep", "provider": "openai", "model": "gpt-deep", "effort": "max"}
@@ -1509,6 +1524,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertFalse(catalog["models"][0]["prefer_websockets"])
 
     def test_synced_astra_catalog_does_not_inherit_unsupported_ultra_effort(self):
+        self.enterContext(patch.object(core, "codex_version", return_value="codex-cli 0.144.0"))
         settings = core._initial_settings()
         record = {
             "key": "account:test::gpt-6-astra",
@@ -3014,6 +3030,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertEqual(core.SECRETS_FILE.read_bytes(), secret_before)
 
     def test_switch_and_launch_closes_before_switching_and_reopening(self):
+        self.use_native_catalog_fixture()
         settings = core._initial_settings()
         settings["accounts"] = [{"id": "target-account", "label": "Target"}]
         calls = []
@@ -3184,6 +3201,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertIn("原账号与配置未改变", detail)
 
     def test_switch_and_launch_readiness_failure_does_not_restart_loop(self):
+        self.use_native_catalog_fixture()
         settings = core._initial_settings()
         settings["accounts"] = [{"id": "target-account", "label": "target@example.test"}]
         calls = []
@@ -3956,8 +3974,11 @@ class AgentManagerTests(unittest.TestCase):
         self.assertNotIn('os.environ["CODEX_CLI_PATH"]', source)
 
     def test_environment_writer_rejects_codex_cli_path_even_through_dynamic_key(self):
+        # Exercise the actual writer's preflight guard, before any registry I/O.
+        from agent_manager.core.overlay import _sync_user_environment
+
         with self.assertRaisesRegex(core.ManagerError, "禁止写入 CODEX_CLI_PATH"):
-            core._sync_user_environment("codex_cli_path", r"C:\npm\codex.cmd")
+            _sync_user_environment("codex_cli_path", r"C:\npm\codex.cmd")
 
     def test_provider_cannot_use_codex_cli_path_as_its_api_key_environment(self):
         with self.assertRaisesRegex(core.ManagerError, "Codex 保留项"):
@@ -6050,6 +6071,7 @@ class AgentManagerTests(unittest.TestCase):
             self.assertEqual(core.load_provider_key("rotating_probe"), "sk-after")
 
     def test_provider_switch_uses_isolated_provider_auth_and_preserves_official_login(self):
+        self.use_native_catalog_fixture()
         environment = {}
         original_auth = b'{"auth_mode":"chatgpt","tokens":{"access_token":"official-token"}}'
         (self.root / "auth.json").write_bytes(original_auth)
@@ -6409,6 +6431,7 @@ class AgentManagerTests(unittest.TestCase):
         )
 
     def test_provider_to_official_clears_overrides_preserves_sessions_and_is_idempotent(self):
+        self.use_native_catalog_fixture()
         environment = {}
         calls = []
         with (
@@ -6505,6 +6528,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertIsNotNone(repeated["launch"])
 
     def test_provider_config_route_is_restored_with_runtime_overlay(self):
+        self.use_native_catalog_fixture()
         environment = {}
         original_auth = b'{"auth_mode":"apikey","OPENAI_API_KEY":"official-before"}'
         (self.root / "auth.json").write_bytes(original_auth)
@@ -6556,6 +6580,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertNotIn("OVERLAY_RELAY_KEY", environment)
 
     def test_provider_failure_restores_exact_snapshot_and_closes_failed_runtime_once(self):
+        self.use_native_catalog_fixture()
         environment = {}
         calls = []
         (self.root / "auth.json").write_text('{"OPENAI_API_KEY":"official-before-provider"}', encoding="utf-8")
@@ -7601,6 +7626,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertEqual(vpn_config["model_catalog_json"], str(core.MODEL_CATALOG_FILE))
 
     def test_astra_reasoning_metadata_is_known_before_local_catalog_refresh(self):
+        self.enterContext(patch.object(core, "codex_version", return_value="codex-cli 0.144.0"))
         metadata = core._model_reasoning_metadata(
             "gpt-6-astra",
             core._reasoning_capabilities([]),
@@ -8476,6 +8502,11 @@ class AgentManagerTests(unittest.TestCase):
         self.assertEqual(len([item for item in model_ids if item.startswith("cam-agent-")]), 4)
 
     def test_activate_web2api_starts_service_before_closing_and_relaunching_codex(self):
+        workspace = Path(self.temp.name) / "workspace"
+        workspace.mkdir()
+        self.enterContext(patch.dict(core.os.environ, {"CODEX_WORKSPACE_PATH": str(workspace)}))
+        self.enterContext(patch.object(core, "_detect_codex_windows_app", return_value=None))
+        self.enterContext(patch.object(core, "_codex_cli_override_diagnosis", return_value={}))
         settings = core._initial_settings()
         settings["web2api"]["accountIds"] = ["pool-account"]
         calls = []

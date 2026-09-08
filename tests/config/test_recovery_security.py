@@ -265,8 +265,14 @@ class RecoverySecurityTests(unittest.TestCase):
             os.symlink(outside, core.CONFIG_FILE)
         except OSError as exc:
             self.skipTest(f"symbolic links unavailable: {exc}")
-        with self.assertRaisesRegex(core.ManagerError, "符号链接|目录联接"):
-            recovery.create()
+        real_open = Path.open
+        def guarded_open(path, *args, **kwargs):
+            if path.resolve() == outside.resolve():
+                raise AssertionError("must not read the external target")
+            return real_open(path, *args, **kwargs)
+        with patch.object(Path, "open", guarded_open):
+            with self.assertRaisesRegex(core.ManagerError, "符号链接|目录联接|超出 Codex"):
+                recovery.create()
         self.assertEqual(outside.read_text(encoding="utf-8"), 'secret = "outside"\n')
 
 

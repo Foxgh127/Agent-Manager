@@ -104,16 +104,18 @@ class CodexMaintenanceServiceTests(unittest.TestCase):
 
     def test_delete_rejects_nested_symlink_before_quarantine(self):
         skill = self.create_skill()
+        with patch.object(core, "codex_app_server_request", side_effect=core.ManagerError("offline")):
+            record = maintenance.list_skills(cwd=self.root, force=True)["skills"][0]
         link = skill.parent / "linked"
         try:
             link.symlink_to(self.root, target_is_directory=True)
         except (OSError, NotImplementedError):
             self.skipTest("当前 Windows 策略不允许创建测试符号链接")
-        with patch.object(core, "codex_app_server_request", side_effect=core.ManagerError("offline")):
-            record = maintenance.list_skills(cwd=self.root, force=True)["skills"][0]
+        with patch.object(maintenance, "_find_skill", return_value=record):
             with self.assertRaisesRegex(core.ManagerError, "符号链接"):
                 maintenance.delete_skill(record["id"], record["fingerprint"], cwd=self.root)
         self.assertTrue(skill.is_file())
+
 
     def test_inventory_bounds_abnormal_skill_tree_without_freezing_other_skills(self):
         abnormal = self.create_skill("large")

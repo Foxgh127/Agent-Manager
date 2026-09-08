@@ -63,7 +63,7 @@ if args.apply:
         try:
             if direct(path):path.rmdir() # Empty directories only; never recurse here.
         except OSError:pass
-    for relative in ('design-system/agent-manager', 'design-system'):
+    for relative in ('design-system/agent-manager/pages', 'design-system/agent-manager', 'design-system'):
         path=ROOT/relative
         try:
             if direct(path):path.rmdir()  # Only remove the retired directory when empty.

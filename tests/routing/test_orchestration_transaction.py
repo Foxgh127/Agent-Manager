@@ -35,6 +35,18 @@ class OrchestrationTransactionTests(unittest.TestCase):
             setattr(core, name, value)
         self.environment = {}
         self.patchers = [
+            # This transaction fixture deliberately routes max from the account
+            # while the local model advertises low. Supply the compatible
+            # runtime separately so validation still intersects both sources.
+            patch.object(core, "codex_version", return_value="codex-cli 0.144.0"),
+            patch.object(core, "_raw_local_model_catalog", return_value={
+                "models": [{
+                    "slug": "gpt-account",
+                    "display_name": "Account model",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [{"effort": "low", "description": "Low"}],
+                }]
+            }),
             patch.object(
                 core,
                 "local_model_catalog",
