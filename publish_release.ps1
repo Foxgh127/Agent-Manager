@@ -74,14 +74,31 @@ if (-not $Publish) { Write-Host "Nothing uploaded. Review these files, then add 
 
 $privacy = & gh api "repos/$Repository" --jq '.private'
 if ($LASTEXITCODE -ne 0 -or $privacy.Trim() -ne "false") { throw "An existing public release repository is required." }
-# Never overwrite a public version. Failed validation leaves a draft only.
+# Public versions are immutable. A failed draft can be rebuilt and retried.
 if (-not $TargetRef) {
     $TargetRef = & git -C $publishProject rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw "Commit the release source before publishing." }
 }
-& gh release create $publishTag $assetPath $shaPath $jsonPath --repo $Repository --target $TargetRef --draft --title "Agent Manager $publishVersion" --notes-file $bodyPath
-if ($LASTEXITCODE -ne 0) { throw "Draft release creation/upload failed." }
-$remoteText = & gh api "repos/$Repository/releases/tags/$publishTag"
+$releaseList = & gh api "repos/$Repository/releases?per_page=100"
+if ($LASTEXITCODE -ne 0) { throw "Release lookup failed." }
+$existing = @(($releaseList | ConvertFrom-Json) | Where-Object { $_.tag_name -eq $publishTag })
+if ($existing.Count -gt 1) { throw "Ambiguous release version." }
+if ($existing.Count -eq 1) {
+    if (-not $existing[0].draft) { throw "This version is already public; increase the version number." }
+    & gh release upload $publishTag $assetPath $shaPath $jsonPath --repo $Repository --clobber
+    if ($LASTEXITCODE -ne 0) { throw "Draft asset upload failed." }
+    & gh release edit $publishTag --repo $Repository --target $TargetRef --title "Agent Manager $publishVersion" --notes-file $bodyPath
+    if ($LASTEXITCODE -ne 0) { throw "Draft metadata update failed." }
+    $releaseId = $existing[0].id
+} else {
+    & gh release create $publishTag $assetPath $shaPath $jsonPath --repo $Repository --target $TargetRef --draft --title "Agent Manager $publishVersion" --notes-file $bodyPath
+    if ($LASTEXITCODE -ne 0) { throw "Draft release creation/upload failed." }
+    $releaseId = & gh release view $publishTag --repo $Repository --json databaseId --jq '.databaseId'
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve the draft release ID." }
+}
+# GitHub does not create the git tag for a new draft until publication; the
+# /releases/tags endpoint therefore cannot be used to verify draft uploads.
+$remoteText = & gh api "repos/$Repository/releases/$releaseId"
 if ($LASTEXITCODE -ne 0) { throw "Could not verify uploaded release; it remains a draft." }
 $remote = $remoteText | ConvertFrom-Json
 $uploaded = @($remote.assets | Where-Object { $_.name -eq $assetName })

@@ -31,7 +31,7 @@ jobs:
           if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Expected a stable x.y.z version.' }
           $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed.' }
-          $exists = @($releases | Where-Object { $_.tag_name -eq "v$version" }).Count -gt 0
+          $exists = @($releases | Where-Object { $_.tag_name -eq "v$version" -and -not $_.draft }).Count -gt 0
           "publish=$((-not $exists).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
       - name: Install build and test dependencies
         if: steps.version.outputs.publish == 'true'
