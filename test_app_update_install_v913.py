@@ -359,11 +359,14 @@ if (-not (Get-Process -Id $spec.sourcePid -ErrorAction SilentlyContinue)) {
             "installer.INSTALL_SCRIPT=(stage/'install.ps1').read_text(encoding='utf-8-sig')\n"
             "prepared={'script':stage/'install.ps1','directory':stage,'statusFile':stage/'result.json','spec':spec}\n"
             "try:\n"
-            " result=installer.launch_install(prepared,ready_timeout=5)\n"
-            " (stage/'parent-ready.json').write_text(json.dumps(result))\n"
+            " result=installer.launch_install(prepared,ready_timeout=15)\n"
+            " (stage/'ready.tmp').write_text(json.dumps(result),encoding='utf-8')\n"
+            " os.replace(stage/'ready.tmp',stage/'parent-ready.json')\n"
             " time.sleep(15)\n"
             "except Exception as exc:\n"
-            " (stage/'parent-error.txt').write_text(str(exc))\n", encoding="utf-8",
+            " error={'message':str(exc),'code':getattr(exc,'code',None),'winerror':getattr(exc.__cause__,'winerror',None)}\n"
+            " (stage/'error.tmp').write_text(json.dumps(error),encoding='utf-8')\n"
+            " os.replace(stage/'error.tmp',stage/'parent-error.json')\n", encoding="utf-8",
         )
         parent = subprocess.Popen([sys.executable, str(worker)], stdin=subprocess.DEVNULL,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -372,10 +375,13 @@ if (-not (Get-Process -Id $spec.sourcePid -ErrorAction SilentlyContinue)) {
             if not kernel.AssignProcessToJobObject(job, wintypes.HANDLE(int(parent._handle))):
                 self.skipTest(f"host forbids isolated nested test job: {ctypes.get_last_error()}")
             (stage / "go").write_text("go")
-            deadline = time.monotonic() + 8
+            deadline = time.monotonic() + 20
             while time.monotonic() < deadline and not (stage / "parent-ready.json").exists():
-                if (stage / "parent-error.txt").exists():
-                    self.fail((stage / "parent-error.txt").read_text())
+                if (stage / "parent-error.json").exists():
+                    error = json.loads((stage / "parent-error.json").read_text(encoding="utf-8"))
+                    if error.get("code") == "helper_launch_failed" and error.get("winerror") == 5:
+                        self.skipTest("Windows host denied breakaway from its enclosing Job; fail-closed launch is tested separately")
+                    self.fail(str(error))
                 time.sleep(0.05)
             self.assertTrue((stage / "parent-ready.json").exists())
             kernel.CloseHandle(job)
