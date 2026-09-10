@@ -317,6 +317,9 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                 if path == "/api/state":
                     self._json({"ok": True, **self.server.runtime.state(), "trayStatus": self.server.tray_status()})
                     return
+                if path == "/api/application/location":
+                    self._json({"ok": True, "location": _app.application_location_status(self.server)})
+                    return
                 if path == "/api/app-lifecycle":
                     self._json(
                         {
@@ -572,6 +575,23 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
             return
         self._mutation_registered = True
         try:
+            if path.startswith("/api/application/location/"):
+                payload = self._read_json(optional=True)
+                if path == "/api/application/location/select":
+                    self._json({"ok": True, **_app.select_application_directory(self.server)})
+                elif path == "/api/application/location/move":
+                    directory = payload.get("directory")
+                    if not isinstance(directory, str) or not directory.strip():
+                        raise _app.core.ManagerError("请选择目标文件夹。")
+                    result = _app.prepare_application_relocation(self.server, directory)
+                    self._json({"ok": True, "result": result,
+                        "message": result.get("message") or "正在移动程序并重启管理器。"})
+                elif path == "/api/application/location/shortcut":
+                    result = _app.create_application_shortcut(self.server)
+                    self._json({"ok": True, "result": result, "message": "桌面快捷方式已创建。"})
+                else:
+                    raise _app.core.ManagerError("应用位置操作不存在。")
+                return
             if path.startswith("/api/app-update/"):
                 service = self.server.runtime.get_app_updates()
                 payload = self._read_json(optional=True)

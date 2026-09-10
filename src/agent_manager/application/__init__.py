@@ -155,6 +155,14 @@ from .discovery import (
     request_existing_quick_restart,
     _read_runtime_file,
 )
+from .location import (
+    application_location_status,
+    assert_application_location_idle,
+    select_application_directory,
+    prepare_application_relocation,
+    create_application_shortcut,
+    finish_application_location_handoff,
+)
 from .lifecycle import (
     _read_shutdown_status,
     open_existing_runtime,

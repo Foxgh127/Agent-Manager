@@ -14,6 +14,7 @@ import RecoveryPanel from "./components/RecoveryPanel.jsx";
 import ConfigRecoveryPanel from "./components/ConfigRecoveryPanel.jsx";
 import AppUpdatePanel from "./components/AppUpdatePanel.jsx";
 import UpdateAction from "./components/UpdateAction.jsx";
+import ApplicationLocationPanel from "./components/ApplicationLocationPanel.jsx";
 import { loadAppUpdate } from "./appUpdateResource.js";
 import RelayOriginNotice from "./components/RelayOriginNotice.jsx";
 import SessionSyncModal from "./components/SessionSyncModal.jsx";
@@ -10800,40 +10801,6 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
               <p>窗口关闭与后台运行</p>
             </div>
           </header>
-          <div className="setting-row static">
-            <div>
-              <strong>子代理临时配置</strong>
-              <small>
-                {data.configurationSession?.error ||
-                  data.configurationSession?.message ||
-                  "窗口就绪后自动应用。正在运行的 Codex 任务保持不变，新配置在下次启动时生效。"}
-              </small>
-            </div>
-            <span
-              className={cx(
-                "status-pill",
-                data.configurationSession?.active ? "success" : "warning",
-              )}
-            >
-              {data.configurationSession?.active ? (
-                <>
-                  <Check size={13} />
-                  {data.configurationSession?.externalSelectionPreserved ? "沿用当前配置" : "已临时应用"}
-                </>
-              ) : (
-                "未应用"
-              )}
-            </span>
-            {data.configurationSession?.status === "error" && <button className="button secondary compact" disabled={busy} onClick={async () => {
-              setBusy(true);
-              try {
-                const result = await api("/api/configuration-session/retry", { method: "POST", body: "{}" });
-                await reload();
-                if (!result.configurationSession?.active) throw new Error(result.configurationSession?.error || "配置仍未应用，请稍后重试");
-                notify("临时配置已恢复，现有 Codex 任务保持运行");
-              } catch (error) { notify(error.message, "error"); } finally { setBusy(false); }
-            }}>重试应用</button>}
-          </div>
           <label className="setting-row">
             <div>
               <strong>关闭后最小化到系统托盘</strong>
@@ -10841,40 +10808,6 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
             </div>
             <Switch checked={closeToTray} onChange={saveBehavior} />
           </label>
-          {closeToTray && (
-            <div className="setting-row static">
-              <div>
-                <strong>托盘运行状态</strong>
-                <small>
-                  {data.trayStatus?.error ||
-                    (data.trayStatus?.ready
-                      ? "关闭主窗口后可从托盘恢复。"
-                      : "正在初始化托盘图标。")}
-                </small>
-              </div>
-              <span
-                className={cx(
-                  "status-pill",
-                  data.trayStatus?.ready
-                    ? "success"
-                    : data.trayStatus?.error
-                      ? "warning"
-                      : "neutral",
-                )}
-              >
-                {data.trayStatus?.ready ? (
-                  <>
-                    <Check size={13} />
-                    已就绪
-                  </>
-                ) : data.trayStatus?.error ? (
-                  "异常"
-                ) : (
-                  "初始化"
-                )}
-              </span>
-            </div>
-          )}
           <label className="setting-row">
             <div>
               <strong>账号额度自动刷新</strong>
@@ -10921,17 +10854,8 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
               <option value={168}>每周</option>
             </select>
           </label>
-          <div className="setting-row static">
-            <div>
-              <strong>静默运行外部命令</strong>
-              <small>OAuth、Codex 探测和应用启动均使用无控制台窗口模式。</small>
-            </div>
-            <span className="status-pill success">
-              <Check size={13} />
-              已启用
-            </span>
-          </div>
         </section>
+        <ApplicationLocationPanel api={api} notify={notify} disabled={busy} />
         <UpdateEmergencyPanel data={data} reload={reload} notify={notify} confirm={confirm} />
         <RecoveryPanel api={api} notify={notify} confirm={confirm} onRestored={reload} gatewayRunning={data.web2apiStatus.running} />
         <section className="settings-card danger-zone full">

@@ -27,7 +27,8 @@ for name in ('agent_manager.core','agent_manager.application','agent_manager.con
              'agent_manager.accounts.import_formats','agent_manager.gateway.service','agent_manager.gateway.scheduling',
              'agent_manager.usage.pricing','agent_manager.usage.capacity','agent_manager.usage.request_metadata',
              'agent_manager.integrations.radar_monitor','agent_manager.integrations.reset_history',
-             'agent_manager.updates.installer','agent_manager.platform.notifications'):
+             'agent_manager.updates.installer','agent_manager.updates.cleanup','agent_manager.updates.location',
+             'agent_manager.application.location','agent_manager.platform.notifications'):
     require(name in archive.open_embedded_archive('PYZ.pyz').toc,'Missing packaged module: '+name)
 with tempfile.TemporaryDirectory(prefix='Agent Manager 中文 path ') as temporary:
     folder=Path(temporary).resolve(); relocated=folder/'Agent Manager.exe';shutil.copy2(exe,relocated)

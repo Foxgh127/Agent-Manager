@@ -36,6 +36,7 @@ import re
 import socket
 import ssl
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -505,6 +506,7 @@ class AppUpdateService:
         self._installation_expected_id = None
         self._installation_verified = None
         self._installation_probe_at = 0.0
+        self._cleanup_at = 0.0
         try:
             cache = _read_json(self.cache_path, MAX_METADATA_BYTES)
             if isinstance(cache, dict):
@@ -555,6 +557,7 @@ class AppUpdateService:
 
     def status(self):
         self._read_installation_result()
+        self._cleanup_verified_installations()
         try:
             source, origin = self._source()
             config_error = ""
@@ -949,9 +952,30 @@ class AppUpdateService:
         return {key: result[key] for key in ("state", "code", "message", "detail", "backup", "restart",
                 "version", "at", "verification", "previousState") if key in result}
 
+    def _cleanup_verified_installations(self):
+        if not self.install_supported or time.monotonic() - self._cleanup_at < 30.0:
+            return
+        if not self._operation.acquire(blocking=False):
+            return
+        try:
+            self._cleanup_at = time.monotonic()
+            with self._lock:
+                download = dict(self._download)
+                installation = dict(self._installation)
+            from agent_manager.updates.cleanup import cleanup_verified_updates
+            # Current/ready downloads are still user-visible actionable assets.
+            protected = [download.get("path")] if download.get("state") in {"ready", "downloading"} else []
+            if getattr(sys, "frozen", False):
+                protected.append(sys.executable)
+            active_id = self._installation_expected_id if installation.get("state") in {"waiting_for_exit", "installed"} else None
+            cleanup_verified_updates(self.config_path.parent / "app-update-install",
+                                     protected_paths=protected, active_install_id=active_id)
+        finally:
+            self._operation.release()
+
     def _reconcile_installation_result(self, path, result):
         """Keep helper evidence intact; a later live proof supersedes its timeout."""
-        if not self.install_supported or result.get("state") not in {"installed", "failed"}:
+        if not self.install_supported or result.get("state") not in {"installed", "failed", "complete"}:
             return result
         try:
             spec = _read_json(path.with_name("install.json"), 65536)
@@ -990,6 +1014,10 @@ class AppUpdateService:
                 return result
             with self._lock:
                 self._installation_verified = (fingerprint, proof)
+        from agent_manager.updates.cleanup import confirm_cleanup
+        confirm_cleanup(path.parent, spec, proof)
+        if result.get("state") == "complete":
+            return result
         return {**result, "state": "complete", "code": "update_ready_reconciled",
                 "message": "更新已完成，已确认当前版本的窗口和服务就绪。",
                 "detail": str(result.get("message") or "")[:1000], "previousState": result["state"],

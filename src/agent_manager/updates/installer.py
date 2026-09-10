@@ -172,6 +172,8 @@ def prepare_install(service, *, target, state_dir, shutdown_status, source_pid, 
         "sourceParentPid": os.getppid() if source_pid == os.getpid() else 0,
         "shutdownStatus": str(shutdown_status), "runtimeFile": str(runtime_file), "state": "prepared",
     }
+    from agent_manager.updates.cleanup import prepare_cleanup
+    prepare_cleanup(stage, spec, source)
     _atomic_json(stage / "install.json", spec)
     script = stage / "install.ps1"
     script.write_text(INSTALL_SCRIPT, encoding="utf-8-sig")
@@ -243,7 +245,9 @@ function Assert-Regular([string]$path) {
 function Read-Json([string]$path) {
     Assert-Regular $path
     if ((Get-Item -LiteralPath $path).Length -gt 65536) { throw 'Oversized update metadata.' }
-    return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json)
+    # _atomic_json emits BOMless UTF-8. Windows PowerShell 5 defaults to the
+    # ANSI code page, which silently corrupts non-English profile/EXE paths.
+    return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 function Save-Result([string]$state, [string]$message, $restart = $null, [string]$code = '', [string]$detail = '') {
     $result = @{state=$state; message=$message; version=$script:installSpec.version;
@@ -421,6 +425,90 @@ function Start-VerifiedManager([int]$timeoutSeconds = 180) {
     $script:readinessTimedOut = $true
     throw 'Started manager did not publish a verified ready window and service.'
 }
+function Write-CleanupReceipt {
+    $authorityPath = Join-Path $script:helperRoot 'cleanup-authority.json'
+    if (-not [IO.File]::Exists($authorityPath)) { return $null }
+    $keyPath = Join-Path ([IO.Path]::GetDirectoryName($script:helperRoot)) '.cleanup-key'
+    Assert-Regular $keyPath
+    if ((Get-Item -LiteralPath $keyPath).Length -ne 32) { throw 'Invalid cleanup key.' }
+    $key = [IO.File]::ReadAllBytes($keyPath)
+    if ($key.Length -ne 32) { throw 'Invalid cleanup key.' }
+    $envelope = Read-Json $authorityPath
+    $bytes = [Convert]::FromBase64String([string]$envelope.payload)
+    $hmac = New-Object Security.Cryptography.HMACSHA256
+    try {
+        $hmac.Key = $key
+        $signature = ([BitConverter]::ToString($hmac.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+        if ($signature -cne [string]$envelope.signature) { throw 'Changed cleanup authority.' }
+        $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if ($value.state -cne 'prepared' -or $value.schemaVersion -ne 1 -or
+            $value.installId -cne $script:installSpec.installId -or
+            $value.target -cne $script:installSpec.target -or
+            $value.sha256 -cne $script:installSpec.sha256 -or $value.size -ne $script:installSpec.size) {
+            throw 'Cleanup authority does not match this installation.'
+        }
+        Assert-Hash $script:installTarget $value.sha256 $value.size
+        $value.state = 'complete'
+        $value | Add-Member -NotePropertyName ready -NotePropertyValue $true
+        $value | Add-Member -NotePropertyName verifiedSha256 -NotePropertyValue $value.sha256
+        $value | Add-Member -NotePropertyName verifiedAt -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
+        Assert-Regular $script:resultFile
+        $resultAlgorithm = [Security.Cryptography.SHA256]::Create()
+        try { $resultDigest = ([BitConverter]::ToString($resultAlgorithm.ComputeHash([IO.File]::ReadAllBytes($script:resultFile)))).Replace('-', '').ToLowerInvariant() }
+        finally { $resultAlgorithm.Dispose() }
+        $value | Add-Member -NotePropertyName resultSha256 -NotePropertyValue $resultDigest
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($value | ConvertTo-Json -Depth 8 -Compress))
+        $signature = ([BitConverter]::ToString($hmac.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+        $signed = @{payload=[Convert]::ToBase64String($bytes); signature=$signature} | ConvertTo-Json -Compress
+        $receipt = Join-Path $script:helperRoot 'cleanup-receipt.json'
+        $temporary = Join-Path $script:helperRoot ('.cleanup-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        [IO.File]::WriteAllText($temporary, $signed, (New-Object Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($receipt)) { [IO.File]::Replace($temporary, $receipt, [NullString]::Value) }
+        else { [IO.File]::Move($temporary, $receipt) }
+        return $value
+    } finally { $hmac.Dispose() }
+}
+function Remove-CompletedInstallFiles($receipt) {
+    if ($null -eq $receipt) { return }
+    # Hash and request deletion through the same exclusive handle; never
+    # replace a path-based hash check with a later, racy Delete(path).
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using Microsoft.Win32.SafeHandles;
+public static class AgentManagerCleanup {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, ref int value, uint length);
+    public static bool DeleteVerified(string path, string expected, long size) {
+        using (var handle = CreateFile(path, 0x80010000, 0, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero)) {
+            if (handle.IsInvalid) return false;
+            using (var stream = new FileStream(handle, FileAccess.Read))
+            using (var sha = SHA256.Create()) {
+                if (stream.Length != size || BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant() != expected) return false;
+                int delete = 1;
+                return SetFileInformationByHandle(handle, 4, ref delete, 4);
+            }
+        }
+    }
+}
+'@
+    foreach ($file in $receipt.files) {
+        # The download cache is collected by the new service under its
+        # operation lock, preserving any current or in-flight download.
+        if ($file.role -ceq 'backup') { $expectedPath = $script:backup }
+        elseif ($file.role -ceq 'staged') { $expectedPath = $script:installSpec.source }
+        else { continue }
+        try {
+            if ($file.path -cne $expectedPath -or $file.path -ieq $script:installTarget) { continue }
+            Assert-Regular ([string]$file.path)
+            $null = [AgentManagerCleanup]::DeleteVerified([string]$file.path, [string]$file.sha256, [long]$file.size)
+        } catch { } # A lock or changed file is retried from the signed receipt.
+    }
+}
 function Invoke-Install {
     $script:installSpec = $null; $script:backup = $null; $script:launchedProcess = $null
     $script:readinessTimedOut = $false; $script:readinessReason = $null; $script:restartStartedAt = $null
@@ -446,7 +534,8 @@ function Invoke-Install {
         Assert-Hash $script:installTarget $spec.originalSha256 $spec.originalSize
         $targetParent = [IO.Path]::GetDirectoryName($script:installTarget)
         $sibling = Join-Path $targetParent ('.agent-manager-new-' + [Guid]::NewGuid().ToString('N') + '.exe')
-        $script:backup = Join-Path $targetParent ('.agent-manager-old-' + [Guid]::NewGuid().ToString('N') + '.exe')
+        $script:backup = Join-Path $targetParent ('.agent-manager-old-' + $spec.installId + '.exe')
+        if ([IO.File]::Exists($script:backup)) { throw 'Update backup already exists; recovery file retained.' }
         Assert-Regular $installSource
         $sourceLock = [IO.File]::Open($installSource, 'Open', 'Read', 'Read')
         try {
@@ -464,6 +553,8 @@ function Invoke-Install {
         $restart = Start-VerifiedManager
         Assert-Hash $script:installTarget $spec.sha256 $spec.size
         Save-Result 'complete' '更新已完成，窗口和服务已就绪。' $restart 'update_ready'
+        # Cleanup cannot turn an already verified installation into a rollback.
+        try { $receipt = Write-CleanupReceipt; Remove-CompletedInstallFiles $receipt } catch { }
     } catch {
         $failure = $_.Exception.Message
         if ($replaced) {

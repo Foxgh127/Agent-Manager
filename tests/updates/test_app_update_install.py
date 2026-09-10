@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import agent_manager.updates.installer as installer
+from agent_manager.updates.cleanup import cleanup_verified_updates
 from agent_manager.updates.service import UpdateError
 
 
@@ -27,8 +28,9 @@ class InstallTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="installer-'quoted-[literal]-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name).resolve()
-        self.target = self.root / "install 'folder' [one]" / "AgentManager.exe"
+        self.root = Path(temporary.name).resolve() / "用户 资料 & '配置' [中文]"
+        self.root.mkdir()
+        self.target = self.root / "安装 'folder' & [one]" / "管理器 & '程序' [二].exe"
         self.target.parent.mkdir()
         self.target.write_bytes(b"old fake executable - never executed")
         self.source = self.root / "download.exe"
@@ -46,7 +48,7 @@ class InstallTests(unittest.TestCase):
                 raise UpdateError("hash mismatch", "hash_mismatch")
             return path
         self.service._verify_file.side_effect = verify
-        self.arguments = dict(target=self.target, state_dir=self.root / "state", shutdown_status=self.root / "shutdown.json",
+        self.arguments = dict(target=self.target, state_dir=self.root / "状态 & '记录' [三]", shutdown_status=self.root / "shutdown.json",
                               source_pid=12345, source_nonce="source_nonce_123456789")
 
     def prepare(self):
@@ -147,15 +149,60 @@ class InstallTests(unittest.TestCase):
                 installer.launch_install(prepared)
         popen.assert_not_called()
 
-    def test_powershell_replaces_atomically_at_literal_paths_and_keeps_backup(self):
+    def test_powershell_replaces_atomically_at_unicode_literal_paths_and_cleans_verified_files(self):
         self.prepare()
         result = self.run_powershell()
         self.assertEqual(result["state"], "complete", result)
         self.assertTrue(result["restart"]["simulated"])
         self.assertEqual(self.target.read_bytes(), self.updated)
-        self.assertEqual(Path(result["backup"]).read_bytes(), self.original)
+        self.assertFalse(Path(result["backup"]).exists())
         self.assertEqual(Path(result["backup"]).parent, self.target.parent)
+        self.assertFalse(Path(self.prepared["spec"]["source"]).exists())
+        self.assertTrue(self.source.exists())  # service lock governs cached downloads
+        self.assertTrue((self.prepared["directory"] / "cleanup-receipt.json").exists())
         self.assertEqual(list(self.target.parent.glob(".agent-manager-new-*.exe")), [])
+
+    def test_real_ps5_utf8_metadata_and_unicode_profile_environment(self):
+        self.prepare()
+        result = self.run_powershell("""
+if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Test requires real Windows PowerShell 5.' }
+$script:installSpec = Read-Json (Join-Path $PSScriptRoot 'install.json')
+$script:installTarget = $script:installSpec.target
+$script:resultFile = Join-Path $PSScriptRoot 'result.json'
+$profilePath = [IO.Path]::GetDirectoryName([string]$script:installSpec.shutdownStatus)
+$env:USERPROFILE = $profilePath
+$env:APPDATA = $profilePath
+$env:LOCALAPPDATA = $profilePath
+function Read-PersistentEnvironment([string]$scope) { return @{} }
+$info = New-ManagerStartInfo
+if ($info.FileName -cne $script:installSpec.target -or
+    $info.EnvironmentVariables['USERPROFILE'] -cne $profilePath -or
+    $info.EnvironmentVariables['APPDATA'] -cne $profilePath -or
+    $info.EnvironmentVariables['LOCALAPPDATA'] -cne $profilePath) { throw 'Unicode profile path changed.' }
+Assert-Hash $info.FileName $script:installSpec.originalSha256 $script:installSpec.originalSize
+Save-Result 'unicode-paths' $info.FileName
+""", invoke=False)
+        self.assertEqual(result["state"], "unicode-paths")
+        self.assertEqual(result["message"], str(self.target))
+
+    def test_powershell_signed_receipt_retries_locked_backup_and_download_in_python(self):
+        self.prepare()
+        result = self.run_powershell("""
+function Start-VerifiedManager {
+    $script:retainedTestLock = [IO.File]::Open($script:backup, 'Open', 'Read', 'Read')
+    return @{ready=$true; simulated=$true}
+}
+""")
+        self.assertEqual(result["state"], "complete", result)
+        self.assertTrue(Path(result["backup"]).exists())
+        self.assertFalse(Path(self.prepared["spec"]["source"]).exists())
+        # The test PowerShell process has exited and released its lock. Python
+        # validates its HMAC/UTF-8 receipt and removes the exact remaining files.
+        removed = cleanup_verified_updates(self.prepared["directory"].parent)
+        self.assertEqual(removed["removed"], 2, removed)
+        self.assertFalse(Path(result["backup"]).exists())
+        self.assertFalse(self.source.exists())
+        self.assertEqual(self.target.read_bytes(), self.updated)
 
     def test_powershell_rejects_shutdown_identity_freshness_and_restore_failures(self):
         changes = [

@@ -120,6 +120,10 @@ def _mark_ui_ready(server: _app.ManagerServer) -> None:
     except Exception:
         server.ui_ready.clear()
         raise
+    if getattr(_app.sys, "frozen", False) and not getattr(server, "_location_handoff_checked", False):
+        server._location_handoff_checked = True
+        _app.threading.Thread(target=_app.finish_application_location_handoff,
+            args=(server,), name="app-location-startup", daemon=True).start()
 
 
 
@@ -686,6 +690,7 @@ def prepare_application_update(server):
     if not service._operation.acquire(blocking=False):
         raise _app.core.ManagerError("更新正在处理，请勿重复操作。")
     try:
+        _app.assert_application_location_idle(server)
         if not service.status().get("canInstall"):
             raise _app.core.ManagerError("请先成功检查、下载并校验更新，并使用 Windows EXE 版本安装。")
         from agent_manager.updates.installer import prepare_install, launch_install
