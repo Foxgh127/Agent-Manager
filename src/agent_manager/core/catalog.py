@@ -684,6 +684,13 @@ def web2api_pool_model_records(
                 "slug": model_id,
                 "displayName": model_id,
                 "sourceName": "本地反代 API 号池",
+                # Only explicitly enrolled, available Providers with this exact
+                # model ID may share a Provider pool. Private aliases remain
+                # dedicated; OAuth and API identities are never mixed here.
+                **({"poolCandidates": [dict(candidate) for candidate in records
+                    if candidate.get("sourceKind") == "provider"
+                    and str(candidate.get("id") or "") == model_id]}
+                   if item.get("sourceKind") == "provider" else {}),
             }
         )
     return result
@@ -903,6 +910,14 @@ def build_synced_model_catalog(settings: dict | None = None) -> tuple[dict, list
                 item["support_verbosity"] = record["supportsVerbosity"]
                 if record["supportsVerbosity"] and record.get("defaultVerbosity"):
                     item["default_verbosity"] = record["defaultVerbosity"]
+        # Codex clamps config.model_context_window to max_context_window
+        # before reserving effective_context_window_percent. A stale 872K
+        # ceiling otherwise silently turns an explicit Astra 1M into 828.4K.
+        # Only verified official models may extend that ceiling; source-owned
+        # relay limits and the native default/headroom remain untouched.
+        context_ceiling = _core._managed_context_catalog_ceiling(record, tuning)
+        if context_ceiling and context_ceiling > int(item.get("max_context_window") or 0):
+            item["max_context_window"] = context_ceiling
         # For official-account models, WebSocket preference is model catalog
         # metadata rather than a partial [model_providers.openai] override.
         # The latter is invalid because a custom provider table requires the

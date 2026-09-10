@@ -226,10 +226,30 @@ def _configuration_status_locked(settings: dict | None = None) -> dict:
     strategy_active = agents_text == _core.build_agents_file(settings)
     workspace = settings.get("modelWorkspace", _core._default_model_workspace())
     selected_records = _core.selected_model_records(settings)
+    context_active = config.get("model_context_window") == expected.get("model_context_window")
+    tuning = _core._normalize_runtime_tuning(settings.get("runtimeTuning"))
+    expected_ceilings = {
+        str(record.get("slug") or record.get("id")): ceiling
+        for record in selected_records
+        if (ceiling := _core._managed_context_catalog_ceiling(record, tuning))
+    }
+    if expected_ceilings and config.get("model_catalog_json") == str(_core.MODEL_CATALOG_FILE):
+        actual_catalog = _core.read_json(_core.MODEL_CATALOG_FILE, {})
+        catalog_items = actual_catalog.get("models") if isinstance(actual_catalog, dict) else None
+        actual_models = {
+            str(item.get("slug")): item for item in catalog_items
+            if isinstance(item, dict)
+        } if isinstance(catalog_items, list) else {}
+        for slug, ceiling in expected_ceilings.items():
+            current_max = actual_models.get(slug, {}).get("max_context_window")
+            if isinstance(current_max, bool) or not isinstance(current_max, int) or current_max < ceiling:
+                context_active = False
+                break
     return {
         "mainActive": main_active,
         "strategyActive": strategy_active,
-        "fullyApplied": main_active and strategy_active,
+        "contextActive": context_active,
+        "fullyApplied": main_active and strategy_active and context_active,
         "mode": workspace.get("mode", "independent"),
         "activeSourceId": str(next((item["sourceId"] for item in selected_records), workspace.get("activeSourceId") or "")),
         "modelCount": len(selected_records),

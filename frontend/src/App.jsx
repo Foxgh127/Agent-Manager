@@ -18,6 +18,7 @@ import SessionSyncModal from "./components/SessionSyncModal.jsx";
 import SessionRepairPanel from "./components/SessionRepairPanel.jsx";
 import AccountReauthModal from "./components/AccountReauthModal.jsx";
 import { quotaIsCurrent } from "./quotaFreshness.js";
+import { contextBudget } from "./contextBudget.js";
 import { createConfirmationQueue } from "./confirmationQueue.js";
 import { usageSourceKey, usageSourceLabels } from "./usageViewModel.js";
 import { applyDashboardMoveResult } from "./dashboardMove.js";
@@ -3292,7 +3293,7 @@ function AddAccountModal({
   return (
     <Modal
       title="添加账号"
-      description="一次选择分组，导入后自动识别模型、额度与有效期"
+      description="先识别凭据与来源，再验证可用模型；额度信息以来源支持为准"
       onClose={onClose}
       wide
     >
@@ -3677,22 +3678,21 @@ function AddAccountModal({
             {tab === "json" && (
               <div className="import-panel">
                 <label className="field">
-                  <span>粘贴 Token / JSON / Web Session</span>
+                  <span>粘贴账号、Token 或 API 配置</span>
                   <textarea
                     className="json-input"
                     value={jsonText}
                     onChange={(event) => setJsonText(event.target.value)}
                     placeholder={
-                      '可混合粘贴多个账号：\n{ "tokens": { ... } }\nat-... Personal Access Token\nBearer eyJ...\ntoken=...\naccount_id=...\n\n支持 JSON 数组、连续 JSON、NDJSON、代码块、嵌套/重复编码 JSON 和本软件导出包。'
+                      '可混合粘贴多个账号：\n{ "tokens": { ... } }\n{ "type": "codex", "access_token": "...", "account_id": "..." }\n\nAPI 配置示例：\nbase_url=https://api.example.com/v1\napi_key=sk-...\n\n也支持 JSON 数组、NDJSON、嵌套导出包与网页会话。'
                     }
                   />
                 </label>
                 <p className="helper">
                   <Sparkles size={15} />
-                  自动忽略 JSON 外的说明文字，识别 Codex auth.json、CPA、
-                  Sub2API、9Router、AxonHub、Web Session、Agent Identity、
-                  <code>at-</code> Personal Access Token 与导出包；浏览器
-                  sessionToken 不会被错误当作可刷新的 OAuth Token。
+                  支持官方账号导出、API 地址与 Key、常见批量 JSON 和网页会话。
+                  明确来源的短期 OAuth Token 可用于反代；无刷新凭据时，过期后需重新登录。
+                  预览会分别标明凭据类型、可用范围和需要补充的信息。
                 </p>
                 <button
                   className="button primary full"
@@ -4184,13 +4184,13 @@ function AccountEditModal({ item, groups, onClose, onDone, notify, onReauthentic
 const poolStrategyLabels = {
   ordered: {
     name: "顺序消耗",
-    hint: "严格按列表从上到下尝试，失败或不可用时才切换下一个",
+    hint: "优先列表前面的来源；已有会话保持身份，只在允许安全回退时尝试下一来源",
   },
   quota_first: {
     name: "额度优先",
-    hint: "优先选择剩余额度更充足、最近使用更少的账号",
+    hint: "优先较空闲的账号，同等负载下参考周剩余额度；已有会话保持原来源",
   },
-  round_robin: { name: "轮询均衡", hint: "每个请求轮换起始账号，让调用更均匀" },
+  round_robin: { name: "轮询均衡", hint: "按模型轮转并优先较空闲来源；同一会话保持原来源" },
 };
 
 function ApiPoolCard({ data, onOpen }) {
@@ -7375,8 +7375,16 @@ function OrchestrationView({
   const compactRatio = contextCurrentValue && compactCurrentValue
     ? Math.min(100, Math.max(0, (compactCurrentValue / contextCurrentValue) * 100))
     : 0;
+  const expectedContextBudget = contextBudget({
+    requested: runtimeTuning.modelContextWindow,
+    defaultWindow: modelContextDefault,
+    nativeMax: modelContextMax,
+    referenceMax: modelContextReferenceMax,
+    inputReferenceMax: configDocument?.common?.modelInputReferenceMax,
+    effectivePercent: configDocument?.common?.modelContextEffectivePercent,
+  });
   const contextCurrentLabel = contextCurrentValue
-    ? `${formatTokenCount(contextCurrentValue)} 总容量 · ${compactCurrentValue ? `${formatTokenCount(compactCurrentValue)} 开始整理` : "压缩跟随模型"}`
+    ? `${formatTokenCount(contextCurrentValue)} 设置${expectedContextBudget.usable != null ? ` · 预计可用 ${formatTokenCount(expectedContextBudget.usable)}` : ""} · ${compactCurrentValue ? `${formatTokenCount(compactCurrentValue)} 压缩设置` : "压缩跟随模型"}`
     : "总容量与压缩点均跟随模型";
   const webSearchCurrentLabel = {
     "": "Codex 默认（按任务决定）",
@@ -7699,13 +7707,16 @@ function OrchestrationView({
               <span className="runtime-quick-icon"><Gauge size={18} /></span>
               <span className="runtime-quick-copy">
                 <strong>上下文与自动压缩</strong>
-                <small>{modelContextReferenceMax >= 1000000 ? "支持选择 1M 扩展容量；模型默认值与压缩点仍可分别设置。" : "上下文是总容量，压缩点必须位于容量以内；拿不准时两项都跟随模型。"}</small>
+                <small>{expectedContextBudget.usable != null
+                  ? `${configDocument?.common?.modelInputReferenceMax ? `模型总上下文 ${formatTokenCount(modelContextReferenceMax)}，最大输入 ${formatTokenCount(configDocument.common.modelInputReferenceMax)}；` : ""}Codex 另预留 ${expectedContextBudget.reservedPercent}%。设置值受输入上限约束，保存同步后需让 Codex 重新加载配置。`
+                  : "上下文是总容量；当前来源未提供可用比例，Codex 实际容量以运行时报告为准。"}</small>
+                {expectedContextBudget.capped && <small>当前设置超过已知输入范围；预计按 {formatTokenCount(expectedContextBudget.total)} 输入窗口生效。</small>}
               </span>
               <span className="runtime-current-state"><em>当前</em><strong>{contextCurrentLabel}</strong></span>
               <div className="runtime-linked-controls">
                 <div className="runtime-control-field runtime-slider-field">
                   <span className="runtime-control-label">
-                    <span>上下文总容量</span>
+                    <span>上下文窗口设置</span>
                     <em>{runtimeTuning.modelContextWindow ? "自定义" : "跟随模型"}</em>
                   </span>
                   <DiscreteSlider stops={contextSliderStops} selectedIndex={contextSliderIndex} onSelect={stop => updateContextWindow(stop?.value || 0)} ariaLabel="按档位选择 Codex 上下文总容量" markPrefix="将上下文总容量设为" valueText={contextSliderStops[contextSliderIndex]?.label || formatTokenCount(contextCurrentValue)}>

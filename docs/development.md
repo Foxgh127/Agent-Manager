@@ -23,9 +23,11 @@ npm test --prefix frontend
 
 `dist/` 放可分发文件，`artifacts/build/` 放可再生成的构建缓存。构建必须在前端成功并确认资源存在后进行；不停止用户正在使用的进程。标准文件被占用时输出明确的版本文件。
 
+未发布的修复使用 `./scripts/build.ps1 -LocalBuild`，输出 `dist/AgentManager-local.exe` 和独立校验文件；产品版本不变，既有正式 EXE 与 SHA256.txt 不被替换。
+
 ## 发布
 
-修改版本源及 `docs/release-notes.md`，提交到 `main`。GitHub Actions 验证后执行：
+只有用户明确要求“发布”时才修改版本源、整理发行说明并发布。普通修复、构建和继续工作均不构成发布授权。推送和 PR 运行检查；正式发布必须手动触发工作流且 `publish=true`。需要由本机发布时，在获得同一发布授权并完成验证后执行：
 
 ```powershell
 ./scripts/publish.ps1 -Repository Foxgh127/Agent-Manager -Build -Publish -NotesFile docs/release-notes.md

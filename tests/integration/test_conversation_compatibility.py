@@ -155,10 +155,15 @@ def test_compatible_history_passes_unchanged_without_speculative_cleanup(setup, 
 
 @pytest.mark.parametrize("kind", ["provider", "account"])
 @pytest.mark.parametrize("failure", ["again", "quota", "capacity", "other400", "transport"])
-def test_failure_does_not_loop_or_spill_opaque_history_to_other_identity(setup, monkeypatch, kind, failure):
+@pytest.mark.parametrize("binding", ["unbound", "dedicated"])
+def test_failure_does_not_loop_or_spill_opaque_history_to_other_identity(setup, monkeypatch, kind, failure, binding):
     route = {"id": "native-model", "sourceKind": kind, "sourceRecordId": "first"}
-    # Account pool, including two identities, to prove failure never spills.
-    monkeypatch.setattr(core, "resolve_model_route", lambda *args, **kw: route if kind == "provider" else None)
+    if binding == "unbound":
+        route = ({**route, "poolCandidates": [dict(route), {**route, "sourceRecordId": "second"}]}
+                 if kind == "provider" else None)
+    # Unknown multi-identity history is rejected before transmitting anything;
+    # dedicated routes still exercise same-identity compatibility retry/failure.
+    monkeypatch.setattr(core, "resolve_model_route", lambda *args, **kw: route)
     value = history()
     value["model"] = "native-model"
     seen = []
@@ -174,10 +179,19 @@ def test_failure_does_not_loop_or_spill_opaque_history_to_other_identity(setup, 
             raise rejection("invalid_request_error")
         raise rejection()
     monkeypatch.setattr(core, "_open_same_origin_request", opened)
-    with pytest.raises(gateway.GatewayError):
+    before = deepcopy(value)
+    with pytest.raises(gateway.GatewayError) as caught:
         setup.stream("/v1/responses", value)
-    assert len(seen) == (2 if failure == "again" else 1)
-    assert len({item["Authorization"] for item in seen}) == 1
+    assert value == before
+    if binding == "unbound":
+        assert caught.value.status == 409
+        assert seen == []
+    else:
+        assert caught.value.status == {"again": 400, "quota": 429, "capacity": 503,
+                                       "other400": 400, "transport": 502}[failure]
+        assert len(seen) == (2 if failure == "again" else 1)
+        assert len({item["Authorization"] for item in seen}) == 1
+    assert not setup.scheduler.inflight
 
 
 def test_sse_failure_after_output_never_replays(setup, monkeypatch):

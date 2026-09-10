@@ -369,7 +369,7 @@ print(json.dumps({'before':before, 'after':after}))
         estimate._path().write_text('{bad-json', encoding='utf-8')
         result = self.observe(0, 90, 1000)
         self.assertEqual(result['reason'], 'insufficient_intervals')
-        self.assertEqual(json.loads(estimate._path().read_text())['schemaVersion'], 1)
+        self.assertEqual(json.loads(estimate._path().read_text())['schemaVersion'], estimate.SCHEMA)
 
     def test_persistence_survives_independent_calls_and_bounds_account_count(self):
         with patch.object(estimate, 'MAX_ACCOUNTS', 3):

@@ -337,7 +337,7 @@ def _agent_identity_from_auth(auth: dict) -> str | dict | None:
 
 
 def _auth_bytes_support_codex(auth_bytes: bytes) -> bool:
-    """Check whether an imported ChatGPT payload has persistent Codex OAuth material.
+    """Check structural Codex credential support, not remote validity or renewal.
 
     Browser Web Session exports commonly contain an access token that can read
     quota/catalog endpoints but is rejected by the Codex responses endpoint.
@@ -378,6 +378,18 @@ def _auth_bytes_support_codex(auth_bytes: bytes) -> bool:
     id_token = str(tokens.get("id_token") or "").strip()
     refresh_token = str(tokens.get("refresh_token") or "").strip()
     access_token = str(tokens.get("access_token") or "").strip()
+    metadata = auth.get("session_meta") if isinstance(auth.get("session_meta"), dict) else {}
+    if metadata.get("credentialKind") == "web_session":
+        return False
+    if metadata.get("credentialKind") == "oauth_access_token":
+        # The input normalizer only sets this for explicit Codex/OAuth input.
+        # Bare JWTs and browser sessions must not acquire this capability.
+        claims = _core._jwt_payload(access_token)
+        client_id = _core._token_client_id(access_token)
+        return bool(
+            claims and tokens.get("account_id")
+            and (not client_id or client_id == _core.CODEX_OAUTH_CLIENT_ID)
+        )
     if not id_token or not refresh_token:
         return False
     if refresh_token.casefold() in {

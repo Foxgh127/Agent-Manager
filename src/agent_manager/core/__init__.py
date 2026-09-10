@@ -813,6 +813,9 @@ from .subscription import (
     _fetch_chatgpt_subscription_status,
 )
 from .model_metadata import (
+    _official_context_reference_max,
+    _official_input_reference_max,
+    _managed_context_catalog_ceiling,
     _bounded_model_id,
     _model_entries,
     _model_id_from_entry,

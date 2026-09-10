@@ -5437,14 +5437,16 @@ class AgentManagerTests(unittest.TestCase):
 
     def test_import_parse_errors_never_echo_credentials(self):
         secret = "sk-sensitive-import-value-123456789"
-        with self.assertRaises(core.ManagerError) as captured:
-            core.preview_codex_accounts_batch(
-                {
-                    "groupId": "official",
-                    "items": [{"authJson": f"{{ broken: '{secret}' }}"}],
-                }
-            )
-        self.assertNotIn(secret, str(captured.exception))
+        preview = core.preview_codex_accounts_batch(
+            {
+                "groupId": "official",
+                "items": [{"authJson": f"{{ broken: '{secret}' }}"}],
+            }
+        )
+        self.assertEqual(preview["valid"], 0)
+        self.assertFalse(preview["items"][0]["valid"])
+        self.assertTrue(preview["items"][0]["error"])
+        self.assertNotIn(secret, json.dumps(preview))
 
     def test_single_account_export_is_directly_reimportable(self):
         with (

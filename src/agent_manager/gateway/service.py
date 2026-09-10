@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import errno
@@ -28,6 +28,9 @@ import uuid
 from zoneinfo import ZoneInfo
 
 import agent_manager.core as core
+from agent_manager._version import VERSION as MANAGER_VERSION
+from .scheduling import Scheduler, LeasedResponse, SessionStateError, session_key
+from agent_manager.usage.request_metadata import IDENTITY_FIELDS, observe_metadata, enrich_context, safe_metadata
 
 
 UPSTREAM_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -69,7 +72,7 @@ SAFE_CLIENT_IDENTITY_HEADERS = (
     "X-OpenAI-Actor-Authorization",
     CODEX_RESPONSES_LITE_HEADER,
 )
-USAGE_STATS_SCHEMA_VERSION = 5
+USAGE_STATS_SCHEMA_VERSION = 6
 USAGE_TIMEZONE_NAME = "Asia/Shanghai"
 USAGE_TIMEZONE = ZoneInfo(USAGE_TIMEZONE_NAME)
 USAGE_STATS_FILE_NAME = "web2api-usage.json"
@@ -398,10 +401,12 @@ class _SSEUsageCapture:
         self.credits_usable: bool | None = None
         self.retry_after_seconds: float | None = None
         self.response_id: str | None = None
+        self.billing_metadata: dict = {}
 
     def observe_event(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
+        self.billing_metadata = observe_metadata(self.billing_metadata, event)
         usage = _payload_usage(event)
         if usage:
             self.usage = usage
@@ -460,7 +465,7 @@ class _SSEUsageCapture:
         sequence_number = event.get("sequence_number")
         if isinstance(sequence_number, int) and not isinstance(sequence_number, bool):
             self.last_sequence_number = sequence_number
-        if event_type in {
+        if event_type.endswith(".delta") or event_type in {
             "response.output_text.delta",
             "response.function_call_arguments.delta",
             "response.custom_tool_call_input.delta",
@@ -550,6 +555,7 @@ def _inspect_usage_body(
         payload = json.loads(body)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None, False
+    capture.observe_event(payload)
     return _payload_usage(payload), _payload_failed(payload)
 
 
@@ -629,6 +635,7 @@ class UsageStatsStore:
                 "routeKey",
                 "requestClassification",
                 "agentRole",
+                *IDENTITY_FIELDS,
             )
         }
         encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -637,6 +644,7 @@ class UsageStatsStore:
     @staticmethod
     def _safe_route(raw_route: dict) -> dict:
         route = {
+            **safe_metadata(raw_route),
             "source": _bounded_text(raw_route.get("source"), 80, "unclassified"),
             "sourceKind": _bounded_text(raw_route.get("sourceKind"), 80, "unknown"),
             "sourceRecordId": _bounded_text(raw_route.get("sourceRecordId"), 200),
@@ -676,7 +684,7 @@ class UsageStatsStore:
         document = _empty_usage_document()
         if not isinstance(payload, dict) or not isinstance(payload.get("days"), dict):
             return document
-        if (payload.get("schemaVersion") == USAGE_STATS_SCHEMA_VERSION
+        if (payload.get("schemaVersion") in {5, USAGE_STATS_SCHEMA_VERSION}
                 and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("counterGeneration") or ""))):
             document["counterGeneration"] = payload["counterGeneration"]
         for day, raw_day in payload["days"].items():
@@ -3923,6 +3931,7 @@ class Web2APIManager:
         self.server: GatewayServer | None = None
         self.thread: threading.Thread | None = None
         self.round_robin_index = 0
+        self.scheduler = Scheduler(self.lock, Path(core.STATE_DIR) / "gateway-sessions.json")
         self.started_at: str | None = None
         self.last_error: str | None = None
         self.request_count = 0
@@ -3939,6 +3948,18 @@ class Web2APIManager:
         self.active_request_count = 0
         self.rejected_request_count = 0
         self.client_cancelled_count = 0
+
+    def _session_binding(self, key: str) -> dict | None:
+        try:
+            return self.scheduler.bound(key)
+        except SessionStateError as exc:
+            raise GatewayError("本地会话绑定存储不可用，已停止会话路由以保护原身份。", 503) from exc
+
+    def _bind_session(self, key: str, kind: str, identity: str, fingerprint: str = "") -> bool:
+        try:
+            return self.scheduler.bind(key, kind, identity, fingerprint)
+        except SessionStateError as exc:
+            raise GatewayError("本地会话绑定无法安全保存，已停止请求以保护原身份。", 503) from exc
 
     def _account_cooldown_remaining(
         self,
@@ -3972,10 +3993,11 @@ class Web2APIManager:
             if advertised is None
             else advertised
         )
-        delay = min(
-            UPSTREAM_COOLDOWN_MAX_SECONDS,
-            max(UPSTREAM_COOLDOWN_MIN_SECONDS, delay),
-        )
+        # An explicit upstream deadline is authoritative, including waits over
+        # five minutes. Only locally invented backoff is capped.
+        delay = max(UPSTREAM_COOLDOWN_MIN_SECONDS, delay)
+        if advertised is None:
+            delay = min(UPSTREAM_COOLDOWN_MAX_SECONDS, delay)
         now = time.monotonic()
         key = (str(account.get("id") or ""), str(model))
         with self.lock:
@@ -4253,6 +4275,13 @@ class Web2APIManager:
         route_kind = str((route or {}).get("sourceKind") or "")
         route_id = str((route or {}).get("sourceRecordId") or "")
         if identity_kind == "provider":
+            if route_kind == "provider" and isinstance((route or {}).get("poolCandidates"), list):
+                original = next((item for item in route["poolCandidates"]
+                                 if str(item.get("sourceRecordId") or "") == identity_id), None)
+                if original is not None:
+                    route.update(original)
+                    route.pop("poolCandidates", None)
+                    route_id = identity_id
             if route_kind != "provider" or route_id != identity_id:
                 self._forget_response_binding(previous_response_id)
                 raise GatewayError(
@@ -4421,7 +4450,7 @@ class Web2APIManager:
                     failed = True
             observer.finish()
             self._record_usage(
-                context,
+                enrich_context(context, observer),
                 observer.usage,
                 failed=(
                     observer.failed
@@ -4443,7 +4472,9 @@ class Web2APIManager:
             quota_exhausted = capture.quota_exhausted
             should_cool = capture.rate_limited or (
                 quota_exhausted
-                and _codex_credits_usable(headers, account, capture) is not True
+                and (_codex_credits_usable(headers, account, capture) is not True
+                     or _retry_after_seconds(headers) is not None
+                     or capture.retry_after_seconds is not None)
             )
             if should_cool and not capture.capacity_limited:
                 cooldown_headers = dict(headers)
@@ -4806,7 +4837,13 @@ class Web2APIManager:
                 continue
             if not core._account_codex_compatible(account):
                 continue
-            if requested_model and requested_model not in {str(item) for item in account.get("models", [])}:
+            invalid_reason = core.account_invalid_reason(account)
+            if invalid_reason and (invalid_reason != "Token 已过期" or account.get("refreshCapable") is False):
+                continue
+            models = {str(item) for item in account.get("models", [])}
+            if requested_model and not models:
+                models = {str(item.get("id") or "") for item in core.local_model_catalog() if isinstance(item, dict)}
+            if requested_model and requested_model not in models:
                 continue
             accounts.append(account)
         if not accounts:
@@ -4828,6 +4865,8 @@ class Web2APIManager:
                 if (
                     cooldown
                     and "quota" in str(cooldown.get("reason") or "").casefold()
+                    and cooldown.get("source") == "local"
+                    and cooldown.get("advertisedRetryAfter") is not True
                     and _credits_usable_from_account(account) is True
                 ):
                     self.account_cooldowns.pop(key, None)
@@ -4866,16 +4905,9 @@ class Web2APIManager:
             error.route_account = account
             raise error
         accounts = healthy
-        if config.get("routing") == "round_robin":
-            with self.lock:
-                start = self.round_robin_index % len(accounts)
-                self.round_robin_index += 1
-            return accounts[start:] + accounts[:start]
-        if config.get("routing") == "ordered":
-            return accounts
-        return sorted(
-            accounts,
-            key=lambda item: (-_quota_score(item), self.account_last_used.get(str(item.get("id")), 0.0)),
+        return self.scheduler.order(
+            accounts, kind="account", model=requested_model,
+            policy=str(config.get("routing") or "ordered"), score=_quota_score,
         )
 
     def _remember_quota(self, account: dict, headers: dict[str, str]) -> None:
@@ -4916,6 +4948,70 @@ class Web2APIManager:
         }
 
     def _open_upstream(
+        self, payload: dict, allowed_ids: set[str] | None = None, *,
+        access_scope: str = "public", responses_lite: bool = False,
+        expected_identity: str = "", session_key_value: str = "",
+    ) -> tuple[Any, dict, dict[str, str]]:
+        model = str(payload.get("model") or "")
+        tried = set()
+        last_error = None
+        strict = bool(session_key_value or expected_identity or _response_session_affine(payload) or _has_opaque_history(payload))
+        while True:
+            with self.lock:
+                selected_ids = allowed_ids
+                bound = self._session_binding(session_key_value)
+                if bound:
+                    if bound["kind"] != "account" or (allowed_ids is not None and bound["id"] not in allowed_ids):
+                        raise GatewayError("当前会话绑定的来源与模型路由不一致。", 409)
+                    selected_ids = {bound["id"]}
+                    expected_identity = expected_identity or bound["fingerprint"]
+                try:
+                    accounts = self._accounts(selected_ids, model, access_scope=access_scope,
+                                              session_affine=(_response_session_affine(payload) or
+                                                  (_has_opaque_history(payload) and not bound)))
+                except GatewayError as exc:
+                    if bound and exc.status == 503:
+                        raise GatewayError("当前会话绑定的账号已移除、失效或不再允许使用。", 409) from exc
+                    if last_error is not None:
+                        raise last_error
+                    raise
+                accounts = [item for item in accounts if str(item["id"]) not in tried]
+                if not accounts:
+                    raise last_error or GatewayError("没有可用的账号候选。", 503)
+                account = accounts[0]
+                account_id = str(account["id"])
+                if not self._bind_session(session_key_value, "account", account_id):
+                    raise GatewayError("会话身份绑定发生冲突。", 409)
+                release = self.scheduler.acquire("account", account_id)
+            tried.add(account_id)
+            cleanup = ExitStack()
+            cleanup.callback(release)
+            try:
+                response, actual, headers = self._open_upstream_once(
+                    payload, {account_id}, access_scope=access_scope,
+                    responses_lite=responses_lite,
+                    **({"session_key_value": session_key_value} if session_key_value else {}),
+                    **({"expected_identity": expected_identity} if expected_identity else {}),
+                )
+                leased = LeasedResponse(response, release)
+                cleanup.pop_all()
+                cleanup.callback(leased.close)
+                fingerprint = str(getattr(response, "_gateway_identity_fingerprint", ""))
+                if not self._bind_session(session_key_value, "account", account_id, fingerprint):
+                    raise GatewayError("会话的账号身份已改变，已拒绝跨身份续轮。", 409)
+                cleanup.pop_all()
+                return leased, actual, headers
+            except GatewayError as exc:
+                last_error = exc
+                if getattr(exc, "transient_capacity", False):
+                    self._cooldown_account(account, model, exc.headers, reason="upstream_capacity")
+                    raise
+                if strict or (exc.status not in {401, 403, 429} and not getattr(exc, "preflight_unavailable", False)):
+                    raise
+            finally:
+                cleanup.close()
+
+    def _open_upstream_once(
         self,
         payload: dict,
         allowed_ids: set[str] | None = None,
@@ -4923,6 +5019,7 @@ class Web2APIManager:
         access_scope: str = "public",
         responses_lite: bool = False,
         expected_identity: str = "",
+        session_key_value: str = "",
     ) -> tuple[Any, dict, dict[str, str]]:
         retry_error: GatewayError | None = None
         last_attempt_account: dict | None = None
@@ -4936,6 +5033,8 @@ class Web2APIManager:
             access_scope=access_scope,
             session_affine=session_affine,
         ):
+            if allowed_ids is not None and str(account.get("id")) not in allowed_ids:
+                continue
             last_attempt_account = account
             refresh_after_401 = False
             rejected_access_token = ""
@@ -4958,6 +5057,8 @@ class Web2APIManager:
                     if not access_token or not workspace_account_id:
                         raise core.ManagerError("账号凭据不完整，无法访问 Codex Responses。")
                     fingerprint = _oauth_binding_fingerprint(credentials)
+                    if not self._bind_session(session_key_value, "account", account_id, fingerprint):
+                        raise GatewayError("会话的账号身份已改变，已拒绝跨身份续轮。", 409)
                     if expected_identity and expected_identity != fingerprint:
                         raise GatewayError("原响应的账号身份已改变，已拒绝向新身份续轮。", 409)
                     if replay_identity and replay_identity != fingerprint:
@@ -5027,6 +5128,7 @@ class Web2APIManager:
                         if not (
                             quota_kind == "quota_exhausted"
                             and _codex_credits_usable(headers, account) is True
+                            and _retry_after_seconds(raw_headers) is None
                         ):
                             self._cooldown_account(
                                 account,
@@ -5054,6 +5156,7 @@ class Web2APIManager:
                 except core.ManagerError as exc:
                     detail = core._redact_sensitive_text(exc, limit=240)
                     retry_error = GatewayError(f"账号 {account.get('label')} 不可用：{detail}", 502)
+                    retry_error.preflight_unavailable = True
                     if session_affine or opaque_history:
                         retry_error.route_account = account
                         raise retry_error from exc
@@ -5082,7 +5185,7 @@ class Web2APIManager:
         started_at = time.monotonic()
         try:
             while True:
-                chunk = response.read(8192)
+                chunk = getattr(response, "read1", response.read)(8192)
                 if not chunk:
                     capture.finish()
                     break
@@ -5092,7 +5195,10 @@ class Web2APIManager:
                     raise GatewayError("上游 SSE 事件超过安全限制。", 502)
                 # Any substantive output makes replay unsafe, even when the
                 # same read also contains a later capacity failure.
-                if capture.semantic_output:
+                if capture.semantic_output or (capture.usage and any(capture.usage.values())):
+                    # Reported work may already be billable even when no text
+                    # was emitted. Deliver it through normal usage accounting;
+                    # do not discard those tokens and replay on another source.
                     return _PrefixedResponse(response, bytes(staged)), None
                 if capture.response_terminal:
                     break
@@ -5123,6 +5229,7 @@ class Web2APIManager:
         access_scope: str = "public",
         responses_lite: bool = False,
         expected_identity: str = "",
+        session_key_value: str = "",
     ) -> tuple[Any, dict, dict[str, str]]:
         last_capacity_error: GatewayError | None = None
         for attempt in range(UPSTREAM_CAPACITY_MAX_ATTEMPTS):
@@ -5133,12 +5240,13 @@ class Web2APIManager:
                     access_scope=access_scope,
                     responses_lite=responses_lite,
                     **({"expected_identity": expected_identity} if expected_identity else {}),
+                    **({"session_key_value": session_key_value} if session_key_value else {}),
                 )
             except GatewayError as exc:
                 if getattr(exc, "transient_capacity", False) is not True:
                     raise
                 last_capacity_error = exc
-                if attempt + 1 < UPSTREAM_CAPACITY_MAX_ATTEMPTS and not _has_opaque_history(payload):
+                if attempt + 1 < UPSTREAM_CAPACITY_MAX_ATTEMPTS and not (_has_opaque_history(payload) or _response_session_affine(payload) or session_key_value):
                     continue
                 self.last_error = str(exc)[:500]
                 raise
@@ -5150,7 +5258,8 @@ class Web2APIManager:
             if capacity_error is None and prepared is not None:
                 return prepared, account, headers
             last_capacity_error = capacity_error
-            if attempt + 1 >= UPSTREAM_CAPACITY_MAX_ATTEMPTS or _has_opaque_history(payload):
+            self._cooldown_account(account, str(payload.get("model") or ""), capacity_error.headers, reason="upstream_capacity")
+            if attempt + 1 >= UPSTREAM_CAPACITY_MAX_ATTEMPTS or _has_opaque_history(payload) or _response_session_affine(payload) or session_key_value:
                 self.last_error = str(capacity_error)[:500]
                 raise capacity_error
         error = last_capacity_error or GatewayError("上游模型暂时繁忙，请稍后重试。", 503)
@@ -5168,6 +5277,97 @@ class Web2APIManager:
         return f"{base}{suffix}"
 
     def _open_provider_upstream(
+        self, path: str, payload: dict, route: dict,
+        client_headers: dict[str, str] | None = None, *,
+        expected_identity: str = "", access_scope: str = "public",
+    ) -> Any:
+        candidates = route.get("poolCandidates") or [route]
+        candidates = [dict(item) for item in candidates if isinstance(item, dict)]
+        model = str(route.get("id") or payload.get("model") or "")
+        key = session_key(access_scope, str(payload.get("model") or ""), client_headers)
+        strict = bool(expected_identity or key or _response_session_affine(payload) or _has_opaque_history(payload))
+        if ((_response_session_affine(payload) or (_has_opaque_history(payload) and not self._session_binding(key)))
+                and not expected_identity and len(candidates) > 1):
+            raise GatewayError("多 Provider 池无法验证续轮或加密历史的原始归属。", 409)
+        tried = set()
+        last_error = None
+        while True:
+            with self.lock:
+                bound = self._session_binding(key)
+                selected = candidates
+                if bound:
+                    selected = [item for item in candidates if bound["kind"] == "provider" and str(item.get("sourceRecordId")) == bound["id"]]
+                    if not selected:
+                        raise GatewayError("当前会话绑定的 Provider 已移除或不再允许使用。", 409)
+                    expected_identity = expected_identity or bound["fingerprint"]
+                available = []
+                cooling = []
+                for item in selected:
+                    identity = str(item["sourceRecordId"])
+                    if identity in tried:
+                        continue
+                    delay = self._account_cooldown_remaining("provider:" + identity, model)
+                    if delay > 0:
+                        cooling.append(delay)
+                    else:
+                        available.append(item)
+                if not available:
+                    if last_error:
+                        raise last_error
+                    if cooling:
+                        raise GatewayError("可用 Provider 均在上游冷却中。", 429,
+                                           headers={"Retry-After": str(max(1, math.ceil(min(cooling))))})
+                    raise GatewayError("没有可用的 Provider 候选。", 503)
+                policy = str(core.load_settings().get("web2api", {}).get("routing") or "ordered")
+                ordered = self.scheduler.order(available, kind="provider", model=model, policy=policy,
+                                               identity=lambda item: str(item["sourceRecordId"]))
+                chosen = ordered[0]
+                identity = str(chosen["sourceRecordId"])
+                if not self._bind_session(key, "provider", identity):
+                    raise GatewayError("会话身份绑定发生冲突。", 409)
+                release = self.scheduler.acquire("provider", identity)
+            tried.add(identity)
+            cleanup = ExitStack()
+            cleanup.callback(release)
+            try:
+                response = self._open_provider_upstream_once(
+                    path, payload, chosen, client_headers,
+                    **({"session_key_value": key} if key else {}),
+                    **({"expected_identity": expected_identity} if expected_identity else {}))
+                leased = LeasedResponse(response, release)
+                cleanup.pop_all()
+                cleanup.callback(leased.close)
+                # Probe Responses only. Chat providers have their own event
+                # protocol; a 200 body is never blindly replayed across them.
+                if path == "/v1/responses" and "text/event-stream" in str(response.headers.get("Content-Type", "")).lower():
+                    prepared, capacity_error = self._probe_capacity_before_output(leased, {"id": "provider:" + identity}, _safe_response_headers(response.headers))
+                    if capacity_error is not None:
+                        raise capacity_error
+                    response = prepared
+                else:
+                    response = leased
+                fingerprint = str(getattr(response, "_gateway_identity_fingerprint", ""))
+                if not self._bind_session(key, "provider", identity, fingerprint):
+                    raise GatewayError("会话的 Provider 身份已改变，已拒绝跨身份续轮。", 409)
+                route.update(chosen)
+                cleanup.pop_all()
+                return response
+            except GatewayError as exc:
+                last_error = exc
+                capacity = bool(getattr(exc, "transient_capacity", False))
+                if exc.status == 429 or capacity:
+                    self._cooldown_account({"id": "provider:" + identity}, model, exc.headers,
+                                           reason="upstream_capacity" if capacity else "upstream_http_429")
+                if strict or (exc.status not in {401, 403, 429} and not capacity):
+                    raise
+            except core.ManagerError as exc:
+                last_error = GatewayError("Provider 凭据不可用，请检查来源配置。", 503)
+                if strict:
+                    raise last_error from exc
+            finally:
+                cleanup.close()
+
+    def _open_provider_upstream_once(
         self,
         path: str,
         payload: dict,
@@ -5175,11 +5375,14 @@ class Web2APIManager:
         client_headers: dict[str, str] | None = None,
         *,
         expected_identity: str = "",
+        session_key_value: str = "",
     ) -> Any:
         provider = core.provider_by_id(str(route["sourceRecordId"]))
         key = core.load_provider_key(provider["id"], required=True)
         base_url = core._provider_runtime_base_url(provider)
         fingerprint = _identity_fingerprint("provider", base_url, key)
+        if not self._bind_session(session_key_value, "provider", str(provider["id"]), fingerprint):
+            raise GatewayError("会话的 Provider 身份已改变，已拒绝跨身份续轮。", 409)
         if expected_identity and expected_identity != fingerprint:
             raise GatewayError("原响应的 Provider 地址或凭据已改变，已拒绝跨身份续轮。", 409)
         forwarded = json.loads(json.dumps(payload))
@@ -5192,7 +5395,7 @@ class Web2APIManager:
                 identity_headers[name] = value
         identity_headers.setdefault(
             "User-Agent",
-            f"Codex-Agent-Manager/{core._codex_client_version()}",
+            f"AgentManager/{MANAGER_VERSION}",
         )
         request = Request(
             self._provider_url(
@@ -5462,6 +5665,7 @@ class Web2APIManager:
         access_scope: str = "public",
         responses_lite: bool = False,
         expected_identity: str = "",
+        session_key_value: str = "",
     ) -> bytes | dict:
         response, account, headers = self._open_upstream_with_capacity_retry(
             payload,
@@ -5469,6 +5673,7 @@ class Web2APIManager:
             access_scope=access_scope,
             responses_lite=responses_lite,
             **({"expected_identity": expected_identity} if expected_identity else {}),
+                    **({"session_key_value": session_key_value} if session_key_value else {}),
         )
         with response:
             body = _read_limited(response)
@@ -5793,6 +5998,7 @@ class Web2APIManager:
         if path not in {"/v1/responses", "/v1/chat/completions"}:
             raise GatewayError("接口不存在。", 404)
         requested_model = str(payload.get("model") or "")
+        request_session_key = session_key(access_scope, requested_model, client_headers)
         route = core.resolve_model_route(requested_model, access_scope=access_scope)
         binding = self._resolve_response_binding(
             payload,
@@ -5809,6 +6015,7 @@ class Web2APIManager:
             )
             try:
                 response = self._open_provider_upstream(path, payload, route, client_headers,
+                    **({"access_scope": access_scope} if client_headers else {}),
                     **({"expected_identity": binding["identityFingerprint"]} if binding and binding.get("identityFingerprint") else {}))
             except Exception as exc:
                 self._record_usage(context, None, failed=True)
@@ -5817,6 +6024,8 @@ class Web2APIManager:
                     payload.get("previous_response_id"),
                     exc,
                 )
+            context = self._usage_route_context(payload, requested_model, route=route,
+                                                provider_id=str(route.get("sourceRecordId") or ""))
             self.request_count += 1
             content_type = response.headers.get("Content-Type", "text/event-stream; charset=utf-8")
             if path == "/v1/responses" and "application/json" in content_type.casefold():
@@ -5832,6 +6041,9 @@ class Web2APIManager:
                 capture,
                 observe_output=False,
             )
+            chunks = self._cooldown_after_rate_limited_stream(
+                chunks, capture, {"id": "provider:" + str(route.get("sourceRecordId") or "")},
+                str(route.get("id") or requested_model), _safe_response_headers(response.headers))
             if path == "/v1/responses":
                 chunks = self._bind_successful_response_stream(
                     chunks,
@@ -5873,6 +6085,7 @@ class Web2APIManager:
                 allowed_ids,
                 access_scope=access_scope,
                 responses_lite=responses_lite,
+                **({"session_key_value": request_session_key} if request_session_key else {}),
                 **({"expected_identity": binding["identityFingerprint"]} if binding and binding.get("identityFingerprint") else {}),
             )
         except Exception as exc:
@@ -5979,12 +6192,16 @@ class Web2APIManager:
             try:
                 result = self._upstream(_responses_input(native), include_headers=True,
                     access_scope=access_scope,
+                    **({"session_key_value": session_key(access_scope, model, client_headers)}
+                       if session_key(access_scope, model, client_headers) else {}),
                     **({"allowed_ids": allowed_ids} if allowed_ids is not None else {}),
                     **({"expected_identity": binding["identityFingerprint"]} if binding and binding.get("identityFingerprint") else {}))
                 if not isinstance(result, dict):
                     result = {"body": result, "headers": {}}
                 context = self._usage_route_context(payload, model, route=route, account=result.get("account"))
-                usage, _failed = _inspect_usage_body(result["body"])
+                capture = _SSEUsageCapture()
+                usage, _failed = _inspect_usage_body(result["body"], capture)
+                context = enrich_context(context, capture)
                 response = _completed_response(result["body"])
                 output = response.get("output")
                 if not isinstance(output, list) or not any(isinstance(item, dict) and item.get("type") == "compaction" for item in output):
@@ -6002,6 +6219,7 @@ class Web2APIManager:
             return {"status": 200, "contentType": "application/json; charset=utf-8",
                     "headers": result.get("headers", {}), "body": json.dumps(body, ensure_ascii=False).encode("utf-8")}
         response = self._open_provider_upstream(path, payload, route, client_headers,
+                    **({"access_scope": access_scope} if client_headers else {}),
             **({"expected_identity": binding["identityFingerprint"]} if binding and binding.get("identityFingerprint") else {}))
         try:
             body = _read_limited(response)
@@ -6023,7 +6241,7 @@ class Web2APIManager:
             if not isinstance(output, list) or not any(isinstance(item, dict) and item.get("type") == "compaction" for item in output):
                 raise GatewayError("上游未返回有效的压缩上下文。", 502)
             context = self._usage_route_context(payload, model, route=route, provider_id=str(route["sourceRecordId"]))
-            self._record_usage(context, _payload_usage(decoded), failed=status >= 400)
+            self._record_usage(enrich_context(context, decoded), _payload_usage(decoded), failed=status >= 400)
         self.request_count += 1
         return {"status": status, "contentType": "application/json; charset=utf-8", "body": body, "headers": headers}
 
@@ -6049,6 +6267,7 @@ class Web2APIManager:
             raise GatewayError("接口不存在。", 404)
         client_stream = bool(payload.get("stream"))
         requested_model = str(payload.get("model") or "")
+        request_session_key = session_key(access_scope, requested_model, client_headers)
         route = core.resolve_model_route(requested_model, access_scope=access_scope)
         binding = self._resolve_response_binding(
             payload,
@@ -6065,6 +6284,7 @@ class Web2APIManager:
             )
             try:
                 response = self._open_provider_upstream(path, payload, route, client_headers,
+                    **({"access_scope": access_scope} if client_headers else {}),
                     **({"expected_identity": binding["identityFingerprint"]} if binding and binding.get("identityFingerprint") else {}))
             except Exception as exc:
                 self._record_usage(context, None, failed=True)
@@ -6073,6 +6293,8 @@ class Web2APIManager:
                     payload.get("previous_response_id"),
                     exc,
                 )
+            context = self._usage_route_context(payload, requested_model, route=route,
+                                                provider_id=str(route.get("sourceRecordId") or ""))
             try:
                 body = _read_limited(response)
                 content_type = response.headers.get("Content-Type", "application/json; charset=utf-8")
@@ -6086,6 +6308,13 @@ class Web2APIManager:
             self.request_count += 1
             capture = _SSEUsageCapture()
             usage, body_failed = _inspect_usage_body(body, capture)
+            context = enrich_context(context, capture)
+            if capture.rate_limited or capture.quota_exhausted:
+                cooldown_headers = dict(headers)
+                if capture.retry_after_seconds is not None and not _header_value(headers, "retry-after"):
+                    cooldown_headers["retry-after"] = str(capture.retry_after_seconds)
+                self._cooldown_account({"id": "provider:" + str(route.get("sourceRecordId") or "")},
+                                       str(route.get("id") or requested_model), cooldown_headers)
             if path == "/v1/responses" and not client_stream and "text/event-stream" in content_type.casefold():
                 try:
                     body = json.dumps(_completed_response(body), ensure_ascii=False).encode("utf-8")
@@ -6134,6 +6363,7 @@ class Web2APIManager:
                     include_headers=True,
                     access_scope=access_scope,
                     responses_lite=responses_lite,
+                    **({"session_key_value": request_session_key} if request_session_key else {}),
                     **({"expected_identity": binding["identityFingerprint"]} if binding and binding.get("identityFingerprint") else {}),
                 )
                 if allowed_ids is not None
@@ -6142,6 +6372,7 @@ class Web2APIManager:
                     include_headers=True,
                     access_scope=access_scope,
                     responses_lite=responses_lite,
+                    **({"session_key_value": request_session_key} if request_session_key else {}),
                 )
             )
         except Exception as exc:
@@ -6167,6 +6398,7 @@ class Web2APIManager:
         context = self._usage_route_context(payload, requested_model, route=route, account=account)
         capture = _SSEUsageCapture()
         usage, body_failed = _inspect_usage_body(body, capture)
+        context = enrich_context(context, capture)
         if account is not None and capture.rate_limited:
             cooldown_headers = dict(headers)
             if (

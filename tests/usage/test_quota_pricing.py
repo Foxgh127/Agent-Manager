@@ -6,6 +6,11 @@ from agent_manager.usage.pricing import equivalent, snapshot_equivalent
 class QuotaPricingTests(unittest.TestCase):
     def row(self, **changes):
         return {'model': 'gpt-6-astra', 'inputTokens': 1_000_000,
+                'actualModel': changes.get('model', 'gpt-6-astra'),
+                'usageEvidenceVersion': 2, 'serviceTier': 'default', 'contextTier': 'short',
+                'cacheWriteTokens': 0, 'cacheWriteEvidence': 'known',
+                'inputOutputEvidence': 'known', 'cachedInputEvidence': 'known',
+                'reasoningEvidence': 'known', 'requestCount': 5,
                 'cachedInputTokens': 800_000, 'outputTokens': 100_000,
                 'reasoningOutputTokens': 70_000, **changes}
 

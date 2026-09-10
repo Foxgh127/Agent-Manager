@@ -229,6 +229,7 @@ def _identity_from_auth_bytes(auth_bytes: bytes) -> dict:
     )
     return {
         "authMode": auth_mode,
+        "credentialKind": str(session_meta.get("credentialKind") or ("api_key" if api_key else auth_mode)),
         "declaredAuthMode": declared_auth_mode,
         "authContractValid": auth_contract_valid,
         "accountId": account_id,
@@ -238,6 +239,7 @@ def _identity_from_auth_bytes(auth_bytes: bytes) -> dict:
         "tokenExpiresAt": _core._jwt_expiry(access_token) or _core._jwt_expiry(id_token) or _core._session_expiry(session_meta.get("expires")),
         "refreshCapable": bool(
             auth_mode == "chatgpt"
+            and session_meta.get("credentialKind") != "web_session"
             and str(tokens.get("refresh_token") or "").strip()
             and str(tokens.get("refresh_token") or "").strip().casefold()
             not in {"__missing_refresh_token__", "placeholder", "missing", "none", "null", "n/a", "dummy"}
@@ -324,12 +326,24 @@ def _import_credential_string(
     paths: tuple[tuple[str, ...], ...],
     label: str,
 ) -> str:
-    value = _core._import_value(payloads, paths)
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        raise _core.ManagerError(f"{label} 必须是字符串。")
-    return value.strip()
+    values = set()
+    for payload in payloads:
+        for path in paths:
+            value = _core._import_value([payload], (path,))
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise _core.ManagerError(f"{label} 必须是字符串。")
+            value = value.strip()
+            if label == "access_token" and value.casefold().startswith("bearer "):
+                value = value[7:].strip()
+            if any(ord(char) < 32 for char in value):
+                raise _core.ManagerError(f"{label} 格式无效。")
+            if value:
+                values.add(value)
+    if len(values) > 1:
+        raise _core.ManagerError(f"{label} 包含相互冲突的值。")
+    return next(iter(values), "")
 
 
 
@@ -361,7 +375,10 @@ def _decode_import_value(value: _core.Any, *, max_layers: int = 4) -> _core.Any:
         if _core.re.fullmatch(r"sk-[A-Za-z0-9_.-]{8,}", raw):
             return {"OPENAI_API_KEY": raw}
         try:
-            decoded = _core.json.loads(raw)
+            from agent_manager.accounts.import_formats import strict_loads, ImportFormatError
+            decoded = strict_loads(raw)
+        except ImportFormatError as exc:
+            raise _core.ManagerError(str(exc)) from None
         except _core.json.JSONDecodeError:
             break
         if decoded == current:
@@ -494,10 +511,13 @@ def _batch_target_group_id(settings: dict, root: dict, document: dict, default: 
 def _provider_export_shaped(payload: _core.Any) -> bool:
     if not isinstance(payload, dict):
         return False
-    contexts = [payload]
-    for key in ("provider", "config", "credentials", "env"):
-        if isinstance(payload.get(key), dict):
-            contexts.append(payload[key])
+    from agent_manager.accounts.import_formats import provider_contexts, ImportFormatError
+    try:
+        contexts = provider_contexts(payload)
+    except ImportFormatError:
+        # Keep malformed wrappers as one candidate. The normalization step
+        # reports this row's error without aborting its sibling batch entries.
+        return True
     raw_key = _core._import_value(
         contexts,
         (
@@ -505,6 +525,8 @@ def _provider_export_shaped(payload: _core.Any) -> bool:
             ("OPENAI_API_KEY",),
             ("apiKey",),
             ("api_key",),
+            ("api-key",),
+            ("openaiApiKey",),
             ("experimental_bearer_token",),
         ),
     )
@@ -515,6 +537,8 @@ def _provider_export_shaped(payload: _core.Any) -> bool:
             ("api_base_url",),
             ("apiBaseUrl",),
             ("baseUrl",),
+            ("baseURL",),
+            ("base-url",),
             ("base_url",),
             ("OPENAI_BASE_URL",),
             ("endpoint",),
@@ -540,10 +564,12 @@ def _provider_export_shaped(payload: _core.Any) -> bool:
 def _provider_from_import_candidate(payload: _core.Any) -> dict | None:
     if not _core._provider_export_shaped(payload):
         return None
-    contexts = [payload]
-    for key_name in ("provider", "config", "credentials", "env"):
-        if isinstance(payload.get(key_name), dict):
-            contexts.append(payload[key_name])
+    from agent_manager.accounts.import_formats import provider_contexts
+    contexts = provider_contexts(payload)
+    if any(_core._import_value(contexts, ((field,), ("tokens", field))) for field in (
+        "access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken", "sessionToken", "session_token",
+    )):
+        raise _core.ManagerError("账号同时包含 API Key 与 OAuth/Web Session 凭据，已拒绝混合导入。")
     key = _core._import_credential_string(
         contexts,
         (
@@ -551,21 +577,26 @@ def _provider_from_import_candidate(payload: _core.Any) -> dict | None:
             ("OPENAI_API_KEY",),
             ("apiKey",),
             ("api_key",),
+            ("api-key",),
+            ("openaiApiKey",),
             ("experimental_bearer_token",),
         ),
         "API Key",
     )
     key = _core._validated_provider_secret(key)
-    base_url = _core._import_string(
+    base_url = _core._import_credential_string(
         contexts,
         (
             ("api_base_url",),
             ("apiBaseUrl",),
             ("baseUrl",),
+            ("baseURL",),
+            ("base-url",),
             ("base_url",),
             ("OPENAI_BASE_URL",),
             ("endpoint",),
         ),
+        "base URL",
     ).rstrip("/")
     provider_mode = _core._import_string(contexts, (("api_provider_mode",), ("providerMode",))).casefold()
     if not base_url and provider_mode in {"", "openai_builtin", "openai"}:
@@ -635,7 +666,7 @@ def _provider_from_import_candidate(payload: _core.Any) -> dict | None:
             contexts,
             (("balanceEndpoint",), ("balance_endpoint",), ("api_balance_endpoint",)),
         ),
-        "importSource": "cockpit_or_openai_compatible",
+        "importSource": "openai_compatible",
     }
 
 
@@ -717,6 +748,12 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
     contexts = [candidate]
     if candidate is not document:
         contexts.append(document)
+    from agent_manager.accounts.import_formats import assert_account_scope, ImportFormatError
+    try:
+        for context in contexts:
+            assert_account_scope(context)
+    except ImportFormatError as exc:
+        raise _core.ManagerError(str(exc)) from None
 
     source_marker = _core._import_string(
         contexts,
@@ -963,6 +1000,8 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
             or _core.now_iso(),
         }
     elif api_key:
+        if not _core._import_value(contexts, (("OPENAI_API_KEY",), ("openai_api_key",), ("openaiApiKey",))):
+            raise _core.ManagerError("通用 API Key 缺少明确的 base URL；请提供 apiKey + baseUrl 或使用官方 OPENAI_API_KEY 格式。")
         canonical = {"auth_mode": "apikey", "OPENAI_API_KEY": api_key}
     else:
         is_personal_access_token = bool(personal_access_token)
@@ -976,7 +1015,7 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
             raise _core.ManagerError("账号中缺少 accessToken；支持 auth.json、CPA、Sub2API、9Router、AxonHub 与 Web Session 导出。")
         access_claims = _core._jwt_payload(access_token)
         id_claims = _core._jwt_payload(id_token)
-        account_id = _core._import_string(
+        account_id = _core._import_credential_string(
             contexts,
             (
                 ("tokens", "account_id"),
@@ -997,6 +1036,7 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
                 ("accountId",),
                 ("account_id",),
             ),
+            "account_id",
         ) or _core._nested_string(
             access_claims,
             [
@@ -1076,7 +1116,26 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
                 ("providerSpecificData", "expiresAt"),
             ),
         )
-        if not id_token and not is_personal_access_token:
+        explicit_oauth = bool(
+            source_type != "web_session"
+            and not session_token
+            and (
+                normalized_auth_mode in {"oauth", "chatgpt", "chatgptauthtokens"}
+                or _core._import_string(contexts, (("type",),)).casefold() == "codex"
+                or isinstance(candidate.get("tokens"), dict) and id_token
+                or complete_native_oauth
+            )
+        )
+        if access_claims and not is_personal_access_token:
+            from agent_manager.accounts.portability import normalize_portable_oauth_auth, PortableAccountError
+            try:
+                normalize_portable_oauth_auth({"tokens": {
+                    "access_token": access_token, "id_token": id_token,
+                    "refresh_token": refresh_token, "account_id": account_id,
+                }})
+            except PortableAccountError as exc:
+                raise _core.ManagerError(str(exc)) from None
+        if not id_token and not is_personal_access_token and not explicit_oauth:
             id_token = _core._synthetic_web_session_id_token(email, account_id, plan, user_id, expires)
             source_type = "web_session"
         session_meta = {
@@ -1102,6 +1161,13 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
         }
         session_meta.update(
             {
+                "credentialKind": (
+                    "personal_access_token" if is_personal_access_token else
+                    "oauth" if explicit_oauth and refresh_token and id_token else
+                    "oauth_access_token" if explicit_oauth else
+                    "web_session" if source_marker in {"web_session", "session", "chatgpt_web_session"} or session_token else
+                    "access_token"
+                ),
                 "email": email or session_meta.get("email") or "",
                 "name": name or session_meta.get("name") or "",
                 "plan": plan or session_meta.get("plan") or "",
@@ -1175,8 +1241,15 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
             if agent_identity:
                 canonical["agent_identity"] = oauth_agent_cache
         session_meta["importFormat"] = _core._detect_import_format(document, candidate, source_type)
+    canonical_meta = canonical.get("session_meta")
+    if isinstance(canonical_meta, dict) and not isinstance(canonical_meta.get("authProvider"), (str, type(None))):
+        canonical_meta.pop("authProvider", None)
     encoded = _core.json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     canonical_tokens = canonical.get("tokens") if isinstance(canonical.get("tokens"), dict) else {}
+    if canonical.get("session_meta", {}).get("credentialKind") == "oauth_access_token":
+        expiry = _core._parsed_datetime(_core._jwt_expiry(str(canonical_tokens.get("access_token") or "")))
+        if expiry and expiry <= _core.datetime.now(_core.timezone.utc):
+            raise _core.ManagerError("OAuth access token 已过期；请提供最新凭据或完整续期凭据。")
     if (
         canonical_tokens.get("access_token")
         and not str(canonical.get("OPENAI_API_KEY") or "").strip()
@@ -1209,7 +1282,8 @@ def _normalize_import_auth_payload(raw: str | dict) -> tuple[bytes, str]:
     # Codex are structurally valid.  This catches exporter drift at the import
     # boundary instead of after the user closes Codex and switches accounts.
     if source_type != "web_session":
-        _core._codex_auth_projection_bytes(encoded)
+        if canonical_tokens.get("id_token") or canonical.get("session_meta", {}).get("credentialKind") != "oauth_access_token":
+            _core._codex_auth_projection_bytes(encoded)
         tokens = canonical.get("tokens") if isinstance(canonical.get("tokens"), dict) else {}
         if identity.get("authMode") == "chatgpt" and all(
             isinstance(tokens.get(key), str) and len(tokens[key].split(".")) == 3

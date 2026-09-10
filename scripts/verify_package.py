@@ -23,7 +23,9 @@ for name in ('version.json','app-update-source.json','ui/index.html','ui/app-ico
     require('agent_manager/resources/'+name in keys,'Missing packaged resource: '+name)
 packaged=json.loads(archive.extract(keys['agent_manager/resources/version.json']))
 require(packaged=={'version':version['VERSION'],'releaseEpoch':version['RELEASE_EPOCH']},'Packaged version differs from source')
-for name in ('agent_manager.core','agent_manager.application','agent_manager.config.backups','agent_manager.accounts.relay','agent_manager.gateway.service'):
+for name in ('agent_manager.core','agent_manager.application','agent_manager.config.backups','agent_manager.accounts.relay',
+             'agent_manager.accounts.import_formats','agent_manager.gateway.service','agent_manager.gateway.scheduling',
+             'agent_manager.usage.pricing','agent_manager.usage.capacity','agent_manager.usage.request_metadata'):
     require(name in archive.open_embedded_archive('PYZ.pyz').toc,'Missing packaged module: '+name)
 with tempfile.TemporaryDirectory(prefix='Agent Manager 中文 path ') as temporary:
     folder=Path(temporary).resolve(); relocated=folder/'Agent Manager.exe';shutil.copy2(exe,relocated)

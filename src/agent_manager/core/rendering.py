@@ -290,8 +290,8 @@ def _use_native_official_model_catalog(settings: dict, records: list[dict]) -> b
 
     Cockpit intentionally avoids writing ``model_catalog_json`` for official
     OAuth accounts.  A manager-generated static catalog is still required for
-    relays, aggregate aliases, curated subsets, and the catalog-level VPN
-    compatibility override.  For a fully selected independent official
+    relays, aggregate aliases, curated subsets, explicit extended context,
+    and the catalog-level VPN compatibility override. For an unmodified official
     account, however, it only freezes staged model rollouts until the next
     manager refresh.
     """
@@ -342,6 +342,10 @@ def _use_native_official_model_catalog(settings: dict, records: list[dict]) -> b
         return False
     tuning = _core._normalize_runtime_tuning(settings.get("runtimeTuning"))
     managed_fields = set(tuning.get("managedFields") or [])
+    # Explicit extended context needs the matching catalog ceiling too.
+    # Resetting the control to model default returns ownership to Codex.
+    if any(_core._managed_context_catalog_ceiling(record, tuning) for record in records):
+        return False
     return not (
         "vpnCompatibility" in managed_fields
         and bool(tuning.get("vpnCompatibility"))

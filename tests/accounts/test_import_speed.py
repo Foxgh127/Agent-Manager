@@ -188,12 +188,14 @@ class ImportSpeedV97Tests(unittest.TestCase):
         self.assertIn("access_token", result["items"][0]["error"])
         bad = self.official()
         bad["version"] = 99
-        with self.assertRaisesRegex(core.ManagerError, "版本不受支持"):
-            core.preview_codex_accounts_batch({"items": [bad]})
+        result = core.preview_codex_accounts_batch({"items": [bad]})
+        self.assertEqual(result["invalid"], 1)
+        self.assertIn("版本不受支持", result["items"][0]["error"])
         relay = self.relay()
         relay["relayAccount"]["dashboardSession"]["origin"] = "https://foreign.example.test"
-        with self.assertRaisesRegex(core.ManagerError, "同一站点"):
-            core.preview_codex_accounts_batch({"items": [relay]})
+        result = core.preview_codex_accounts_batch({"items": [relay]})
+        self.assertEqual(result["invalid"], 1)
+        self.assertIn("同一站点", result["items"][0]["error"])
 
 
 if __name__ == "__main__":

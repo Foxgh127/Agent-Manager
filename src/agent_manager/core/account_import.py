@@ -37,6 +37,7 @@ def _account_record_from_import(settings: dict, payload: dict, identity: dict) -
         "planLabel": _core._normalize_plan_label(identity["plan"]),
         "importFormat": identity.get("importFormat") or (target or {}).get("importFormat") or "",
         "authMode": identity["authMode"],
+        "credentialKind": identity.get("credentialKind") or identity["authMode"],
         "refreshCapable": bool(identity.get("refreshCapable")),
         "tokenExpiresAt": identity.get("tokenExpiresAt"),
         "subscriptionStartedAt": identity.get("subscriptionStartedAt")
@@ -177,6 +178,7 @@ def import_codex_account(payload: dict) -> dict:
 
 
 def _decode_many_json_documents(value: str, item_number: int) -> list[_core.Any]:
+    from agent_manager.accounts.import_formats import strict_loads, unique_pairs, ImportFormatError
     if len(value.encode("utf-8", errors="replace")) > _core.MAX_BATCH_IMPORT_TEXT_BYTES:
         raise _core.ManagerError(f"第 {item_number} 项超过 {_core.MAX_BATCH_IMPORT_TEXT_BYTES // 1_000_000} MB，已拒绝解析。")
     raw = value.strip().lstrip("\ufeff\u200b\u200c\u200d\u2060")
@@ -185,14 +187,22 @@ def _decode_many_json_documents(value: str, item_number: int) -> list[_core.Any]
     # A normal export is already one complete JSON document. Avoid scanning
     # every pretty-printed model row as a possible key/value credential dump.
     try:
-        return [_core._decode_import_value(_core.json.loads(raw))]
+        return [_core._decode_import_value(strict_loads(raw))]
+    except ImportFormatError as exc:
+        raise _core.ManagerError(str(exc)) from None
     except _core.json.JSONDecodeError:
         pass
+    standalone = _core._decode_import_value(raw)
+    if isinstance(standalone, dict):
+        return [standalone]
     # Plain key/value dumps are common in community conversion tools. Only
     # recognize credential-related names so arbitrary prose is never imported.
     key_value: dict[str, str] = {}
     known_keys = {
         "OPENAI_API_KEY",
+        "openai_api_key", "openaiApiKey", "api_key", "apiKey", "api-key",
+        "OPENAI_BASE_URL", "baseUrl", "baseURL", "base_url", "base-url",
+        "api_base_url", "apiBaseUrl", "endpoint", "model", "name",
         "accessToken",
         "access_token",
         "idToken",
@@ -227,19 +237,21 @@ def _decode_many_json_documents(value: str, item_number: int) -> list[_core.Any]
         "taskId",
     }
     for line in raw.splitlines():
-        match = _core.re.match(r"^\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*(?:=|:)\s*(.+?)\s*[,;]?\s*$", line)
+        match = _core.re.match(r"^\s*(?:export\s+)?['\"]?([A-Za-z_][A-Za-z0-9_-]*)['\"]?\s*(?:=|:)\s*(.+?)\s*[,;]?\s*$", line)
         if not match or match.group(1) not in known_keys:
             continue
         parsed_value = match.group(2).strip()
         if len(parsed_value) >= 2 and parsed_value[0] == parsed_value[-1] and parsed_value[0] in {"'", '"'}:
             parsed_value = parsed_value[1:-1]
         if parsed_value:
+            if match.group(1) in key_value and key_value[match.group(1)] != parsed_value:
+                raise _core.ManagerError("文本中同一字段包含冲突值，请拆分为独立账号对象。")
             key_value[match.group(1)] = parsed_value
 
     if key_value and _core._credential_shaped(key_value) and not _core.re.search(r"[\{\[]", raw):
         return [key_value]
 
-    decoder = _core.json.JSONDecoder()
+    decoder = _core.json.JSONDecoder(object_pairs_hook=unique_pairs)
     documents: list[Any] = []
     cursor = 0
     first_error: _core.json.JSONDecodeError | None = None
@@ -305,6 +317,7 @@ def _decode_many_json_documents(value: str, item_number: int) -> list[_core.Any]
 
 def _expand_import_candidates(value: _core.Any) -> list[_core.Any]:
     """Find credential objects inside bounded, arbitrarily named export wrappers."""
+    from agent_manager.accounts.import_formats import NON_ACCOUNT_CONTAINERS, container_name
     nodes = 0
 
     def visit(current: Any, depth: int) -> list[Any]:
@@ -356,7 +369,7 @@ def _expand_import_candidates(value: _core.Any) -> list[_core.Any]:
                     expanded.extend(found)
         if not expanded:
             for key, nested in current.items():
-                if key in visited_keys or not isinstance(nested, (dict, list, str)):
+                if key in visited_keys or container_name(key) in NON_ACCOUNT_CONTAINERS or not isinstance(nested, (dict, list, str)):
                     continue
                 found = visit(nested, depth + 1)
                 if any(
@@ -487,12 +500,20 @@ def _batch_documents(payload: dict) -> list[dict]:
         if isinstance(value, str):
             parse_key = _core.hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
             if parse_key not in parsed_cache:
-                parsed_cache[parse_key] = _core._decode_many_json_documents(value, index + 1)
+                try:
+                    parsed_cache[parse_key] = _core._decode_many_json_documents(value, index + 1)
+                except (_core.ManagerError, ValueError) as exc:
+                    documents.append({"kind": "account", "authJson": {}, "parseError": _core._redact_sensitive_text(exc, limit=320)})
+                    continue
             parsed_documents = parsed_cache[parse_key]
         else:
             parsed_documents = [value]
         for parsed in parsed_documents:
-            candidates = _core._expand_import_candidates(parsed)
+            try:
+                candidates = _core._expand_import_candidates(parsed)
+            except (_core.ManagerError, ValueError) as exc:
+                documents.append({"kind": "account", "authJson": {}, "parseError": _core._redact_sensitive_text(exc, limit=320)})
+                continue
             multiple = len(candidates) > 1 or len(parsed_documents) > 1
             for candidate in candidates:
                 if isinstance(candidate, dict) and isinstance(candidate.get("codex_agent_manager"), dict):
@@ -501,7 +522,8 @@ def _batch_documents(payload: dict) -> list[dict]:
                         hints = portable_account_metadata(candidate)
                         candidate = {**normalize_portable_oauth_auth(candidate), **hints}
                     except PortableAccountError as exc:
-                        raise _core.ManagerError(str(exc)) from exc
+                        documents.append({"kind": "account", "authJson": {}, "parseError": str(exc)})
+                        continue
                 if (
                     isinstance(candidate, dict)
                     and candidate.get("format") == "codex-agent-manager-relay-account"
@@ -510,7 +532,11 @@ def _batch_documents(payload: dict) -> list[dict]:
                         _core.json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode("utf-8")
                     ).hexdigest()
                     if relay_key not in relay_parts_cache:
-                        relay_parts_cache[relay_key] = _core._relay_export_import_parts(candidate)
+                        try:
+                            relay_parts_cache[relay_key] = _core._relay_export_import_parts(candidate)
+                        except (_core.ManagerError, ValueError) as exc:
+                            documents.append({"kind": "account", "authJson": {}, "parseError": _core._redact_sensitive_text(exc, limit=320)})
+                            continue
                     parts = relay_parts_cache[relay_key]
                     documents.append(
                         {
@@ -546,7 +572,11 @@ def _batch_documents(payload: dict) -> list[dict]:
                         raise _core.ManagerError(f"展开后超过 {_core.MAX_BATCH_IMPORT_ACCOUNTS} 个账号，请分批导入。")
                     continue
                 native_export = isinstance(candidate, dict) and candidate.get("format") == "codex-agent-manager-account"
-                imported_provider = None if native_export else _core._provider_from_import_candidate(candidate)
+                try:
+                    imported_provider = None if native_export else _core._provider_from_import_candidate(candidate)
+                except (_core.ManagerError, ValueError) as exc:
+                    documents.append({"kind": "account", "authJson": {}, "parseError": _core._redact_sensitive_text(exc, limit=320)})
+                    continue
                 if imported_provider is not None:
                     documents.append(
                         {
@@ -569,9 +599,11 @@ def _batch_documents(payload: dict) -> list[dict]:
                 imported_models = _core._account_models_from_import_candidate(candidate)
                 if native_export:
                     if candidate.get("version") != 1:
-                        raise _core.ManagerError("账号导出文件版本不受支持。")
+                        documents.append({"kind": "account", "authJson": {}, "parseError": "账号导出文件版本不受支持。"})
+                        continue
                     if not isinstance(candidate.get("authJson"), (dict, str)):
-                        raise _core.ManagerError("账号导出文件缺少 authJson 凭据。")
+                        documents.append({"kind": "account", "authJson": {}, "parseError": "账号导出文件缺少 authJson 凭据。"})
+                        continue
                     # Catalog metadata is retained in the batch record, but is
                     # not credential material and need not enter normalization.
                     wrapped_auth = {key: value for key, value in candidate.items() if key != "models"}
@@ -611,6 +643,8 @@ def _batch_documents(payload: dict) -> list[dict]:
                 )
                 if len(documents) > _core.MAX_BATCH_IMPORT_ACCOUNTS:
                     raise _core.ManagerError(f"展开后超过 {_core.MAX_BATCH_IMPORT_ACCOUNTS} 个账号，请分批导入。")
+    if len(documents) > _core.MAX_BATCH_IMPORT_ACCOUNTS:
+        raise _core.ManagerError(f"展开后超过 {_core.MAX_BATCH_IMPORT_ACCOUNTS} 个账号，请分批导入。")
     return documents
 
 
@@ -621,6 +655,8 @@ def _batch_auth_identity(document: dict, cache: dict) -> tuple[bytes, str, dict]
     Identity alone is deliberately not a cache key: a revoked token and its
     replacement can belong to the same account and must be validated separately.
     """
+    if document.get("parseError"):
+        raise _core.ManagerError(str(document["parseError"]))
     raw = document.get("authJson")
     encoded = (
         raw.encode("utf-8", errors="replace")
@@ -828,6 +864,7 @@ def preview_codex_accounts_batch(payload: dict) -> dict:
                     "name": name,
                     "email": base_url,
                     "sourceType": "api_provider",
+                    "credentialKind": "api_key",
                     "planLabel": "中转站",
                     "modelsCount": len(provider.get("models") or []) if isinstance(provider.get("models"), list) else 0,
                     "duplicate": bool(
@@ -864,7 +901,11 @@ def preview_codex_accounts_batch(payload: dict) -> dict:
                 batch_fingerprints.add(fingerprint)
             web_session = source_type == "web_session"
             free_plan = _core._is_free_plan(identity.get("plan"), _core._normalize_plan_label(identity.get("plan")))
+            short_lived_oauth = identity.get("credentialKind") == "oauth_access_token"
             base_warning = (
+                "OAuth access token 可用于短期反代；未验证远端有效性，缺少续期链时到期后需重新导入。"
+                if short_lived_oauth
+                else
                 "Free Web Session 无 Codex 推理权限，仅导入额度和模型目录。"
                 if web_session and free_plan
                 else "将本地转换为外部 Token 格式，并用无模型调用的授权探测确认是否可用于 Codex。"
@@ -879,6 +920,8 @@ def preview_codex_accounts_batch(payload: dict) -> dict:
                     "email": identity.get("email") or "",
                     "sourceType": source_type,
                     "authMode": identity.get("authMode") or "",
+                    "credentialKind": identity.get("credentialKind") or "",
+                    "refreshCapable": bool(identity.get("refreshCapable")),
                     "planLabel": _core._normalize_plan_label(identity.get("plan")),
                     "importFormat": identity.get("importFormat") or "",
                     "duplicate": _core._find_account_for_identity(settings, identity) is not None,
@@ -888,6 +931,9 @@ def preview_codex_accounts_batch(payload: dict) -> dict:
                     "quotaOnly": web_session,
                     "compatibilityPending": web_session and not free_plan,
                     "capabilityLabel": (
+                        "OAuth access token · 待验证"
+                        if short_lived_oauth
+                        else
                         "Free · 仅额度查询"
                         if web_session and free_plan
                         else "导入后自动检测 Codex 权限"

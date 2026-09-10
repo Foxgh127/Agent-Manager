@@ -1,6 +1,7 @@
 param(
     [string]$OutputDirectory = "dist",
-    [string]$Python = "python"
+    [string]$Python = "python",
+    [switch]$LocalBuild
 )
 $ErrorActionPreference = "Stop"
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -35,15 +36,17 @@ try {
         --hidden-import webview.platforms.edgechromium --hidden-import pystray._win32 `
         (Join-Path $projectRoot 'packaging/entry.py')
     if ($LASTEXITCODE -ne 0) { throw 'EXE build failed.' }
-    $executable = Join-Path $outputRoot 'AgentManager.exe'
+    $executable = Join-Path $outputRoot $(if ($LocalBuild) { 'AgentManager-local.exe' } else { 'AgentManager.exe' })
     try { Copy-Item -LiteralPath (Join-Path $stageRoot 'AgentManager.exe') -Destination $executable -Force }
     catch {
+        if ($LocalBuild) { throw 'The local test EXE is in use. Close it before rebuilding.' }
         $executable = Join-Path $outputRoot "AgentManager-$appVersion.exe"
         Copy-Item -LiteralPath (Join-Path $stageRoot 'AgentManager.exe') -Destination $executable -Force
         Write-Warning 'The standard EXE is in use; the new version was saved alongside it.'
     }
     $hash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
-    [IO.File]::WriteAllText((Join-Path $outputRoot 'SHA256.txt'), "$hash  $([IO.Path]::GetFileName($executable))`n", (New-Object Text.UTF8Encoding($false)))
+    $hashName = if ($LocalBuild) { 'AgentManager-local.sha256' } else { 'SHA256.txt' }
+    [IO.File]::WriteAllText((Join-Path $outputRoot $hashName), "$hash  $([IO.Path]::GetFileName($executable))`n", (New-Object Text.UTF8Encoding($false)))
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/PORTABLE.md') -Destination (Join-Path $outputRoot 'README.txt') -Force
     Write-Host "Built $executable"
     Write-Host "SHA256 $hash"

@@ -51,7 +51,7 @@ import time
 from typing import Any
 
 FILE_NAME = 'quota-estimation-v99.json'
-SCHEMA = 1
+SCHEMA = 2
 MAX_ACCOUNTS = 256
 MAX_SAMPLES = 48
 MAX_HISTORY = 8
@@ -117,7 +117,10 @@ def _history_fields(result: dict, state: dict) -> dict:
                   calibrationStartedAt=state.get('startAt'),
                   windowResetAt=state.get('resetAt'),
                   historyScopeCount=len(history),
-                  workloadScopeKnown=bool(state.get('workloadScope')))
+                  workloadScopeKnown=bool(state.get('workloadScope')),
+                  legacyEvidenceRetained=bool(state.get('legacyEvidenceRetained')),
+                  prunedHistoryCount=state.get('prunedHistoryCount', 0),
+                  prunedSampleCount=state.get('prunedSampleCount', 0))
     if samples:
         result['lastValidSampleAt'] = samples[-1].get('endAt')
     elif archived:
@@ -129,7 +132,7 @@ def _archive(state: dict) -> list:
     history = list(state.get('history') or [])
     if state.get('samples'):
         history.append({key: state.get(key) for key in
-                        ('scope', 'workloadScope', 'resetAt', 'startAt', 'lastAt', 'samples')})
+                        ('scope', 'comparisonScope', 'workloadScope', 'resetAt', 'startAt', 'lastAt', 'samples')})
     return history[-MAX_HISTORY:]
 
 
@@ -181,8 +184,12 @@ def _load(path: Path) -> dict:
         if path.stat().st_size > MAX_FILE_BYTES:
             return {}
         value = json.loads(path.read_text(encoding='utf-8'))
-        if value.get('schemaVersion') != SCHEMA or not isinstance(value.get('accounts'), dict):
+        if value.get('schemaVersion') not in {1, SCHEMA} or not isinstance(value.get('accounts'), dict):
             return {}
+        if value.get('schemaVersion') == 1:
+            for item in value['accounts'].values():
+                if isinstance(item, dict):
+                    item['legacyEvidenceRetained'] = True
         return {key: item for key, item in value['accounts'].items()
                 if isinstance(key, str) and len(key) == 64 and isinstance(item, dict)}
     except (OSError, ValueError, TypeError, AttributeError):
@@ -296,9 +303,11 @@ def _base(reason: str, remaining: float | None = None) -> dict:
         'localCumulativeKTokens': None, 'localCoverageComplete': None,
         'estimatedRemainingTokens': None, 'estimatedTotalTokens': None,
         'rangeMeaning': 'quantization_and_observed_workload_variation_not_confidence_interval',
+        'conditionalTotalUsd': None,
+        'capacityComparison': {'status': 'insufficient_comparable_evidence', 'officialReductionProven': False},
         'assumptions': ['local_capture_complete_for_sample_intervals',
                         'other_device_usage_unknown', 'future_workload_mix_similar',
-                        'model_fast_cache_reasoning_output_weights_unknown',
+                        'subscription_weights_not_published',
                         'official_accounting_delay_unknown'],
     }
 
@@ -418,6 +427,31 @@ def _summary(state: dict, remaining: float, cumulative: float) -> dict:
                                'lower': round(low * max(0, percent - uncertainty), 6),
                                'upper': round(high * min(100, percent + uncertainty), 6)}
             result['usdPriceVersion'] = PRICE_VERSION
+    reference_samples = [dict(item, tokens=(item['conditionalUsd']['lower'] + item['conditionalUsd']['upper']) / 2)
+                         for item in samples if isinstance(item.get('conditionalUsd'), dict)
+                         and item['conditionalUsd'].get('priceVersion') == PRICE_VERSION]
+    if len(reference_samples) >= MIN_SAMPLES:
+        reference_samples, _ = _fit(reference_samples)
+        if len(reference_samples) >= MIN_SAMPLES and sum(item['drop'] for item in reference_samples) >= MIN_DROP_PP:
+            lower_ratios = [item['conditionalUsd']['lower'] / item['drop'] for item in reference_samples]
+            upper_ratios = [item['conditionalUsd']['upper'] / item['drop'] for item in reference_samples]
+            lower_center, upper_center = statistics.median(lower_ratios), statistics.median(upper_ratios)
+            lower_variation = statistics.median(abs(value - lower_center) for value in lower_ratios)
+            upper_variation = statistics.median(abs(value - upper_center) for value in upper_ratios)
+            # Each bound is a sum of immutable request-bucket contributions.
+            # Endpoint quantization widens both sides. No fabricated midpoint.
+            result['conditionalTotalUsd'] = {
+                'lower': round(100 * min(max(0, lower_center - 2.5 * lower_variation), statistics.median(
+                    item['conditionalUsd']['lower'] / (item['drop'] + QUANTIZATION_PP) for item in reference_samples)), 6),
+                'upper': round(100 * max(upper_center + 2.5 * upper_variation, statistics.median(
+                    item['conditionalUsd']['upper'] / (item['drop'] - QUANTIZATION_PP) for item in reference_samples)), 6),
+                'sampleCount': len(reference_samples), 'priceVersion': PRICE_VERSION,
+                'kind': 'conditional_public_tier_range',
+                'assumptions': ['recorded_model_is_served_model', 'only_standard_fast_flex_batch',
+                                'unknown_context_short_or_long', 'unknown_cache_subsets_within_input'],
+            }
+    from agent_manager.usage.capacity import compare_capacity
+    result['capacityComparison'] = compare_capacity(state)
     return result
 
 
@@ -582,7 +616,11 @@ def observe(account: dict, usage_snapshot: dict | None, *, now: float | None = N
                                 previous.get('workloadScope', '') == account.get('calibrationWorkloadScope', '') and
                                 reset_reason in {'local_counter_generation_changed', 'local_counter_decreased', 'coverage_resumed'})
                 state = {'scope': scope, 'coverageEpoch': epoch_hash, 'resetAt': reset_at,
+                         'comparisonScope': _scope(account, usage, weekly, plan, 0, duration),
                          'workloadScope': account.get('calibrationWorkloadScope', ''),
+                         'legacyEvidenceRetained': bool((previous or {}).get('legacyEvidenceRetained')),
+                         'prunedHistoryCount': (previous or {}).get('prunedHistoryCount', 0),
+                         'prunedSampleCount': (previous or {}).get('prunedSampleCount', 0),
                          'startAt': previous['startAt'] if reusable and 'startAt' in previous else remote_at,
                          'startTokens': tokens,
                          'samples': list(previous.get('samples') or []) if reusable else [],
@@ -604,11 +642,16 @@ def observe(account: dict, usage_snapshot: dict | None, *, now: float | None = N
                     if delta > 0:
                         sample = {'tokens': delta, 'drop': drop, 'startAt': state['anchorAt'], 'endAt': remote_at}
                         old_price, new_price = state.get('anchorPricing') or {}, local.get('apiEquivalent') or {}
+                        from agent_manager.usage.capacity import interval_reference
+                        reference = interval_reference(old_price, new_price, delta)
+                        if reference:
+                            sample['conditionalUsd'] = reference
                         if (old_price.get('status') in {'available', 'partial'}
                                 and new_price.get('status') in {'available', 'partial'}
                                 and old_price.get('sourceHistoryComplete') and new_price.get('sourceHistoryComplete')
                                 and old_price.get('priceVersion')
                                 and old_price.get('priceVersion') == new_price.get('priceVersion')
+                                and old_price.get('unpricedFingerprint') == new_price.get('unpricedFingerprint')
                                 and _number(old_price.get('knownUsd')) is not None
                                 and _number(new_price.get('knownUsd')) is not None
                                 and all(price.get('status') != 'partial' or all(key in price for key in ('unpricedTokens', 'invalidRowCount'))
@@ -620,6 +663,10 @@ def observe(account: dict, usage_snapshot: dict | None, *, now: float | None = N
                             usd_delta = (_number(new_price.get('knownUsd')) or 0) - (_number(old_price.get('knownUsd')) or 0)
                             if usd_delta > 0:
                                 sample.update(usd=usd_delta, priceVersion=new_price['priceVersion'])
+                                from agent_manager.usage.capacity import interval_workload
+                                workload = interval_workload(old_price, new_price, delta)
+                                if workload:
+                                    sample['workload'] = workload
                         state['samples'] = (state['samples'] + [
                             sample
                         ])[-MAX_SAMPLES:]

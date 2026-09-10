@@ -384,7 +384,8 @@ class GatewayUpgradeV9Tests(unittest.TestCase):
                 {"model": "gpt-test", "input": "hello"}
             )
 
-        self.assertIs(opened, response)
+        self.assertIs(opened._response, response)
+        opened.close()
         self.assertIs(routed_account, account)
         credentials.assert_called_once_with("refreshable")
         legacy_snapshot.assert_not_called()

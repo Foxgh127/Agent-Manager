@@ -137,7 +137,8 @@ class GatewayResilienceV9Tests(unittest.TestCase):
                 {"model": "gpt-test", "input": "hello"}
             )
 
-        self.assertIs(opened_response, response)
+        self.assertIs(opened_response._response, response)
+        opened_response.close()
         self.assertEqual(account["id"], "second")
         self.assertEqual(
             [item[0] for item in opened],
@@ -172,7 +173,7 @@ class GatewayResilienceV9Tests(unittest.TestCase):
         self.assertEqual([item["id"] for item in recovered_order], ["first", "second"])
         self.assertNotIn(("first", "gpt-test"), manager.account_cooldowns)
 
-    def test_cooldown_is_model_scoped_and_bounded_without_fixed_ten_seconds(self):
+    def test_cooldown_is_model_scoped_and_preserves_advertised_deadline(self):
         manager = web2api.Web2APIManager()
         account = self.account("first")
         with patch.object(web2api.time, "monotonic", return_value=50.0):
@@ -186,7 +187,7 @@ class GatewayResilienceV9Tests(unittest.TestCase):
         )
         self.assertEqual(
             manager.account_cooldowns[("first", "gpt-other")]["delaySeconds"],
-            web2api.UPSTREAM_COOLDOWN_MAX_SECONDS,
+            999999.0,
         )
         self.assertEqual(
             manager.account_cooldowns[("first", "gpt-zero")]["delaySeconds"],
@@ -362,7 +363,8 @@ class GatewayResilienceV9Tests(unittest.TestCase):
                 {"sourceRecordId": "provider-one", "id": "native-model"},
             )
 
-        self.assertIs(opened, response)
+        self.assertIs(opened._response, response)
+        opened.close()
         self.assertEqual(observed, [web2api.UPSTREAM_OPEN_TIMEOUT_SECONDS])
         self.assertEqual(response.timeout, web2api.UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS)
 
@@ -695,7 +697,8 @@ class GatewayResilienceV9Tests(unittest.TestCase):
                 }
             )
 
-        self.assertIs(opened_response, response)
+        self.assertIs(opened_response._response, response)
+        opened_response.close()
         self.assertEqual(account["id"], "first")
         opened.assert_called_once()
 

@@ -1,12 +1,16 @@
 # 本地网关与候选方案
 
-核对日期：2026-09-10。本次只研究和比较，没有接入或替换任何代理引擎，也没有运行收费模型对照实验。
+核对日期：2026-09-10。1.1.0 已参考 CPA 改进独立网关的调度、会话和计量，没有接入或替换为外部代理引擎，也没有运行收费模型对照实验。[当前实现](gateway-design.md)
 
 ## 目前使用什么
 
 Agent Manager 使用自己编写的 Python 网关，入口在 `src/agent_manager/gateway/service.py`，基于标准库 HTTP 服务。官方账号请求转发到 Codex 的 Responses 上游；API 来源转发到所选服务商。账号、模型、会话身份绑定和协议兼容由本项目维护。
 
 它没有内嵌 Sub2API 或 CLIProxyAPI。`accounts/relay.py` 中对 Sub2API、New API 等站点的识别和余额读取，只是连接这些网站的账号接口。
+
+这里的“自写”描述当前运行引擎，不能理解成“从未参考其他项目代码”。本仓库明确记录了 Cockpit 导入解析函数的兼容核对、Sub2API 周期限额语义以及 CPA Usage Keeper 的统计方法参考。现存 git 最早已经是完整程序，缺少更早的开发过程，无法据此断言网关算法最初是否借鉴过某个项目，也没有证据认定整个网关是逐函数移植。
+
+用户提到的 Cockpit 对应 **[jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools)**。它确实内置 CLIProxyAPI sidecar，并在其上添加兼容适配层；v1.3.42 的源码记录 CPA 基线为 v7.2.140。本项目的 `accounts/portability.py` 核对的是它的账号导入函数，不是集成了同一个代理后端。[Cockpit 上游说明](https://github.com/jlcodes99/cockpit-tools/blob/v1.3.42/sidecars/cockpit-cliproxy/UPSTREAM.md)、[依赖声明](https://github.com/jlcodes99/cockpit-tools/blob/v1.3.42/sidecars/cockpit-cliproxy/go.mod)
 
 当前支持 Responses、HTTP/SSE、工具与 Chat Completions 转换。客户端 WebSocket 使用串行 HTTP/SSE 桥接，并非原生上游 WebSocket；不支持其预热、多路复用和生成中 steering 等完整能力。这是现有实现的边界，不能据此声称和官方客户端性能相同。
 
@@ -21,6 +25,19 @@ Agent Manager 使用自己编写的 Python 网关，入口在 `src/agent_manager
 | Codex 官方直连 | 直接使用官方客户端和账号，或正式 API | 适合作为协议和效果比较的基线；账号池与本地自定义路由功能需另外考虑 |
 
 这里按部署方式和本项目需求判断适配程度，没有以星标数量代替质量验证，也没有对候选引擎做性能排名。
+
+## 本项目怎样分发账号池
+
+入口和执行器在 `gateway/service.py`，模型来源合并与解析在 `core/catalog.py`：
+
+1. 校验访问凭据，划定公共池或 Codex 内部路由范围。
+2. 解析模型来源。专属模型别名或可信响应续轮先固定身份；普通 OAuth 池请求再选候选账号。
+3. 筛选池成员、模型兼容性和冷却状态；顺序模式保留来源顺序，轮询与额度模式结合每模型游标和在途负载，已有会话保持原身份。
+4. 获取对应账号凭据，必要时合并刷新，再转发到 Codex Responses 上游。明确的拒绝且请求可安全换号时才尝试下一候选；已开始输出、绑定续轮及不透明历史有更严格限制。
+
+例如 A、B 两个 OAuth 账号都支持模型 M，顺序策略优先 A；A 返回允许换号的限流错误时才可能尝试 B。1.1.0 的同名 Provider 共享模型也可在已加入池的候选中安全回退，但不跨 OAuth/Provider 身份类别，也不改变模型和推理强度。
+
+1.1.0 已增加会话哈希与有界持久绑定、按来源在途负载选择。会话绑定最多 2048 条、闲置一小时；响应 ID 绑定、冷却和游标仍在进程内。全局上游并发上限为 8，没有分布式调度或账号级硬并发限制。[完整边界](gateway-design.md)
 
 ## “降智”和“额度降低”怎样判断
 

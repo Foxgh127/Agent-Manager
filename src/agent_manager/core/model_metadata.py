@@ -2,6 +2,28 @@
 from __future__ import annotations
 from agent_manager import core as _core
 
+_EXTENDED_CONTEXT_MODELS = {"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+
+
+def _official_context_reference_max(model_id: str) -> int:
+    # Verified 2026-09-10: https://developers.openai.com/api/docs/models/gpt-6-astra
+    # This is a total window, before Codex's effective-context headroom.
+    return 1_050_000 if model_id in _EXTENDED_CONTEXT_MODELS else 0
+
+
+def _official_input_reference_max(model_id: str) -> int:
+    # Total context includes up to 128K output; it is not an input allowance.
+    return 922_000 if model_id in _EXTENDED_CONTEXT_MODELS else 0
+
+
+def _managed_context_catalog_ceiling(record: dict, tuning: dict) -> int:
+    """Honor an explicit official-model override without inventing relay limits."""
+    if record.get("sourceKind") != "account" or "modelContextWindow" not in (tuning.get("managedFields") or []):
+        return 0
+    requested = int(tuning.get("modelContextWindow") or 0)
+    reference = _official_input_reference_max(str(record.get("id") or ""))
+    return min(requested, reference) if requested > 0 and reference else 0
+
 
 def _bounded_model_id(value: _core.Any) -> str:
     """Normalize one upstream model identifier before it reaches settings."""

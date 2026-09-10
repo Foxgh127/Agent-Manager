@@ -4,7 +4,7 @@
 
 **个人练手项目，代码、界面、文档和开发工作由 Codex 完成，仅供个人学习与测试。** 本项目不是 OpenAI、Anthropic 或任何中转站的官方产品，不提供生产服务承诺。
 
-一个面向 Windows 的本地 AI 开发工作台：管理 Codex 账号与 API、组织模型和子代理、维护会话与配置。当前正式版本 **1.0.1**。
+一个面向 Windows 的本地 AI 开发工作台：管理 Codex 账号与 API、组织模型和子代理、维护会话与配置。当前版本 **1.1.0**。
 
 [下载安装包](https://github.com/Foxgh127/Agent-Manager/releases/latest) · [版本说明](docs/release-notes.md) · [使用与故障处理](docs/usage.md) · [开发与发布](docs/development.md) · [设计与资料](docs/architecture.md)
 
@@ -14,18 +14,18 @@
 | --- | --- |
 | 账号与 API | 管理自己的官方账号、API Key 和网页登录中转站；选择 Key、线路、模型与本地分组 |
 | 模型与调度 | 设置主模型、按任务难度分配子代理；保留 Codex 原生模式和自定义策略 |
-| 本地网关 | 在已授权来源之间路由请求，处理协议差异、上下文和失败后的恢复 |
+| 本地网关 | 独立 Python 实现；会话固定、在途负载与模型轮询、受控 API 池回退、工具和流式响应 |
 | 会话维护 | 检查会话可见性、同步与恢复索引；保留原始对话和必要的回滚记录 |
 | 配置备份 | 自动保留最近三份不同内容；手动备份、恢复、删除和查看保护原因 |
 | 版本与维护 | 查看 Agent Manager、Codex Desktop 与 CLI 的版本，按系统能力检查并更新 |
-| 用量与估算 | 跨重启保存有效样本，区分输入、缓存和输出的美元等值；样本足够后推算当前额度 |
+| 用量与估算 | 按模型、请求上下文、服务档位和缓存读写估算总额度；记录可比周期的容量变化线索 |
 | 其他工作区 | 保留 Claude 直连配置、雷达、邮箱、2FA 等现有工具 |
 
 1.0.0 保留现有功能，清理历史构建产物、重复文档和废弃脚本。读取旧账号及会话所需的兼容逻辑继续保留，避免整理代码时损坏原有数据。
 
 美元值是模型 API 参考价下的用量等值，不是订阅余额或实际账单。正常重开优先使用已验证缓存，配置激活完成后自动刷新健康状态；主动刷新仍会进行完整检查。[额度与启动说明](docs/usage.md)
 
-本地反代是本项目的 Python 网关。关于 Sub2API、CLIProxyAPI（CPA）和 LiteLLM 的定位、限制与选择依据，见 [方案对比](docs/proxy-comparison.md)；本轮没有更换反代引擎。
+本地反代保持独立实现，参考 CLIProxyAPI 的调度、会话、导入和流式处理方法，未引入其后端服务或运行依赖。[设计与来源](docs/gateway-design.md) · [接入格式](docs/import-formats.md) · [方案对比](docs/proxy-comparison.md)
 
 ## 快速开始
 
@@ -105,7 +105,9 @@ npm test --prefix frontend
 ./scripts/build.ps1
 ```
 
-安装包输出到 `dist/`。项目版本只需修改 `src/agent_manager/_version.py`，同步脚本会生成前端、Windows 文件属性及发布元数据。发布到 `main` 后，GitHub Actions 进行检查、构建、草稿校验和正式发布，无须为客户端填写更新源。
+安装包输出到 `dist/`。本地试用构建使用 `./scripts/build.ps1 -LocalBuild`，生成 `AgentManager-local.exe`，保留正式安装包和产品版本。项目版本来源为 `src/agent_manager/_version.py`。
+
+普通提交只做检查。发行版必须在用户明确要求发布后，手动触发发布工作流并启用 `publish` 输入，再进行构建、草稿校验和正式发布；客户端仍使用内置更新源。
 
 ## 项目结构
 

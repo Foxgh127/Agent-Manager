@@ -134,7 +134,7 @@ class ProxyCockpitV96Tests(unittest.TestCase):
         )
         with (
             patch.object(core, "resolve_model_route", return_value=None),
-            patch.object(manager, "_open_upstream", side_effect=[(failed, account, {}), (succeeded, account, {})]) as opened,
+            patch.object(manager, "_open_upstream", side_effect=[(failed, account, {}), (succeeded, self.account("second"), {})]) as opened,
             patch.object(manager, "_record_usage"),
         ):
             result = manager.stream("/v1/responses", {"model": "gpt-test", "input": "hi", "stream": True})
@@ -145,7 +145,12 @@ class ProxyCockpitV96Tests(unittest.TestCase):
         self.assertIn(b"kept", body)
         self.assertNotIn(b"discarded", body)
         self.assertNotIn(b"at capacity", body)
-        self.assertFalse(manager.account_cooldowns)
+        self.assertTrue(succeeded.was_closed)
+        cooldown = manager.account_cooldowns[("first", "gpt-test")]
+        self.assertEqual(cooldown["reason"], "upstream_capacity")
+        self.assertEqual(cooldown["delaySeconds"], web2api.UPSTREAM_COOLDOWN_DEFAULT_SECONDS)
+        self.assertGreater(manager._account_cooldown_remaining("first", "gpt-test"), 0)
+        self.assertNotIn(("second", "gpt-test"), manager.account_cooldowns)
 
     def test_capacity_after_semantic_output_is_never_replayed(self):
         manager = web2api.Web2APIManager()
@@ -172,7 +177,7 @@ class ProxyCockpitV96Tests(unittest.TestCase):
         self.assertIn(b"server_is_overloaded", body)
         self.assertFalse(manager.account_cooldowns)
 
-    def test_capacity_retry_budget_returns_503_without_account_cooldown(self):
+    def test_capacity_retry_budget_returns_503_with_distinct_capacity_cooldown(self):
         manager = web2api.Web2APIManager()
         account = self.account("first")
         capacity = sse(
@@ -180,14 +185,18 @@ class ProxyCockpitV96Tests(unittest.TestCase):
             {"type": "response.failed", "response": {"error": {"code": "slow_down", "message": "busy"}}},
         )
         responses = [FakeResponse(capacity), FakeResponse(capacity)]
-        with patch.object(manager, "_open_upstream", side_effect=[(item, account, {}) for item in responses]) as opened:
+        with patch.object(manager, "_open_upstream", side_effect=[
+            (item, self.account(identity), {}) for item, identity in zip(responses, ("first", "second"))
+        ]) as opened:
             with self.assertRaises(web2api.GatewayError) as raised:
                 manager._open_upstream_with_capacity_retry({"model": "gpt-test", "input": "hi"})
         self.assertEqual(opened.call_count, web2api.UPSTREAM_CAPACITY_MAX_ATTEMPTS)
         self.assertEqual(raised.exception.status, 503)
         self.assertEqual(json.loads(raised.exception.body)["error"]["code"], "server_error")
         self.assertTrue(all(item.was_closed for item in responses))
-        self.assertFalse(manager.account_cooldowns)
+        self.assertEqual(set(manager.account_cooldowns), {("first", "gpt-test"), ("second", "gpt-test")})
+        self.assertTrue(all(item["reason"] == "upstream_capacity" for item in manager.account_cooldowns.values()))
+        self.assertTrue(all(item["source"] == "remote" and not item["recoverable"] for item in manager.account_cooldowns.values()))
 
     def test_capacity_503_does_not_invalidate_a_verified_response_binding(self):
         manager = web2api.Web2APIManager()
@@ -215,31 +224,40 @@ class ProxyCockpitV96Tests(unittest.TestCase):
         body = b'{"error":{"type":"invalid_request_error","message":"Selected model is at capacity"}}'
         attempts = [http_error(429, body), http_error(503, body)]
         with (
-            patch.object(manager, "_accounts", return_value=[account]),
-            patch.object(core, "_account_chatgpt_credentials", return_value={"accessToken": "token", "accountId": "workspace"}),
+            patch.object(core, "load_settings", return_value=self.settings(account, self.account("second"))),
+            patch.object(core, "_account_chatgpt_credentials", side_effect=lambda identity: {
+                "accessToken": "token-" + identity, "accountId": "workspace-" + identity}) as credentials,
             patch.object(core, "_open_same_origin_request", side_effect=attempts) as opened,
             self.assertRaises(web2api.GatewayError) as raised,
         ):
             manager._open_upstream_with_capacity_retry({"model": "gpt-test", "input": "hi"})
         self.assertEqual(opened.call_count, 2)
         self.assertEqual(raised.exception.status, 503)
-        self.assertFalse(manager.account_cooldowns)
+        self.assertEqual(credentials.call_args_list, [call("first"), call("second")])
+        self.assertEqual(set(manager.account_cooldowns), {("first", "gpt-test"), ("second", "gpt-test")})
+        self.assertTrue(all(item["reason"] == "upstream_capacity" for item in manager.account_cooldowns.values()))
+        self.assertFalse(manager.scheduler.inflight)
 
-    def test_quota_zero_with_positive_or_unlimited_credits_remains_eligible(self):
+    def test_positive_or_unlimited_credits_do_not_bypass_remote_wait(self):
         for credits in ({"hasCredits": True, "balance": "3.5"}, {"unlimited": True, "balance": "0"}):
-            manager = web2api.Web2APIManager()
-            account = self.account("first", remaining=0, credits=credits)
-            manager.account_cooldowns[("first", "gpt-test")] = {
-                "until": time.monotonic() + 60,
-                "reason": "upstream_quota_exhausted",
-                "source": "remote",
-                "recoverable": False,
-            }
-            with patch.object(core, "load_settings", return_value=self.settings(account)):
-                selected = manager._accounts(requested_model="gpt-test")
-            self.assertEqual([item["id"] for item in selected], ["first"])
-            self.assertNotIn(("first", "gpt-test"), manager.account_cooldowns)
-            self.assertGreater(web2api._quota_score(account), 0)
+            with self.subTest(credits=credits):
+                manager = web2api.Web2APIManager()
+                account = self.account("first", remaining=0, credits=credits)
+                now = time.monotonic()
+                record = {"until": now + 60, "reason": "upstream_quota_exhausted",
+                          "source": "remote", "recoverable": False, "advertisedRetryAfter": True}
+                manager.account_cooldowns[("first", "gpt-test")] = record
+                with patch.object(core, "load_settings", return_value=self.settings(account)):
+                    with self.assertRaises(web2api.GatewayError) as raised:
+                        manager._accounts(requested_model="gpt-test")
+                    self.assertEqual(raised.exception.status, 429)
+                    self.assertGreaterEqual(int(raised.exception.headers["Retry-After"]), 59)
+                    self.assertIs(manager.account_cooldowns[("first", "gpt-test")], record)
+                    with patch.object(web2api.time, "monotonic", return_value=now + 61):
+                        selected = manager._accounts(requested_model="gpt-test")
+                self.assertEqual([item["id"] for item in selected], ["first"])
+                self.assertNotIn(("first", "gpt-test"), manager.account_cooldowns)
+                self.assertGreater(web2api._quota_score(account), 0)
 
     def test_confirmed_quota_without_credits_keeps_remote_cooldown(self):
         manager = web2api.Web2APIManager()
@@ -257,24 +275,33 @@ class ProxyCockpitV96Tests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 429)
         self.assertIn(("first", "gpt-test"), manager.account_cooldowns)
 
-    def test_usage_limit_with_usable_credit_headers_does_not_cool_account(self):
-        manager = web2api.Web2APIManager()
-        account = self.account("first", remaining=0)
-        error_headers = headers(
-            Content_Type="application/json",
-            Retry_After="30",
-            X_Codex_Credits_Has_Credits="true",
-            X_Codex_Credits_Balance="5",
-        )
-        error = http_error(429, b'{"error":{"type":"usage_limit_reached"}}', error_headers)
-        with (
-            patch.object(manager, "_accounts", return_value=[account]),
-            patch.object(core, "_account_chatgpt_credentials", return_value={"accessToken": "token", "accountId": "workspace"}),
-            patch.object(core, "_open_same_origin_request", side_effect=error),
-            self.assertRaises(web2api.GatewayError),
-        ):
-            manager._open_upstream({"model": "gpt-test", "input": "hi"})
-        self.assertFalse(manager.account_cooldowns)
+    def test_usable_credit_headers_honor_remote_retry_after_when_advertised(self):
+        for retry_after in (None, "30"):
+            with self.subTest(retry_after=retry_after):
+                manager = web2api.Web2APIManager()
+                account = self.account("first", remaining=0)
+                error_headers = headers(Content_Type="application/json",
+                                        X_Codex_Credits_Has_Credits="true", X_Codex_Credits_Balance="5")
+                if retry_after is not None:
+                    error_headers["Retry-After"] = retry_after
+                error = http_error(429, b'{"error":{"type":"usage_limit_reached"}}', error_headers)
+                with (
+                    patch.object(manager, "_accounts", return_value=[account]),
+                    patch.object(core, "_account_chatgpt_credentials", return_value={"accessToken": "token", "accountId": "workspace"}),
+                    patch.object(core, "_open_same_origin_request", side_effect=error),
+                    self.assertRaises(web2api.GatewayError) as raised,
+                ):
+                    manager._open_upstream({"model": "gpt-test", "input": "hi"})
+                self.assertEqual(raised.exception.status, 429)
+                if retry_after is None:
+                    self.assertFalse(manager.account_cooldowns)
+                else:
+                    record = manager.account_cooldowns[("first", "gpt-test")]
+                    self.assertEqual(record["reason"], "upstream_quota_exhausted")
+                    self.assertEqual(record["delaySeconds"], 30)
+                    self.assertTrue(record["advertisedRetryAfter"])
+                    self.assertEqual(record["source"], "remote")
+                self.assertFalse(manager.scheduler.inflight)
 
     def test_only_explicit_local_recoverable_cooldowns_are_auto_recovered(self):
         accounts = [self.account("first"), self.account("second")]
@@ -362,8 +389,13 @@ class ProxyCockpitV96Tests(unittest.TestCase):
             patch.object(core, "_open_same_origin_request", side_effect=open_request),
         ):
             opened, routed, _ = manager._open_upstream({"model": "gpt-test", "input": "hi"})
-        self.assertIs(opened, response)
+        self.assertIs(opened._response, response)
         self.assertIs(routed, account)
+        self.assertEqual(manager.scheduler.inflight, {("account", "first"): 1})
+        opened.close()
+        opened.close()
+        self.assertTrue(response.was_closed)
+        self.assertFalse(manager.scheduler.inflight)
         self.assertEqual(observed[1].get_header("Authorization"), "Bearer new-token")
         for request in observed:
             self.assertEqual(request.get_header("Version"), "0.153.4")

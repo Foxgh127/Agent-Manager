@@ -15,14 +15,16 @@ def _codex_model_context_metadata(
         "modelContextMax": 0,
         "modelContextEffectivePercent": 0,
         "modelContextReferenceMax": 0,
+        "modelInputReferenceMax": 0,
     }
     if not model_id:
         return metadata
-    if provider_id in {"", "openai"} and model_id == "gpt-6-astra":
+    if provider_id in {"", "openai"} and _core._official_context_reference_max(model_id):
         # API specification, kept separate from the native Codex catalog's
         # input-budget hints; never lend this limit to a third-party host.
-        metadata["modelContextReferenceMax"] = 1_050_000
-        metadata["modelContextReferenceUrl"] = "https://developers.openai.com/api/docs/models/gpt-6-astra"
+        metadata["modelContextReferenceMax"] = _core._official_context_reference_max(model_id)
+        metadata["modelInputReferenceMax"] = _core._official_input_reference_max(model_id)
+        metadata["modelContextReferenceUrl"] = f"https://developers.openai.com/api/docs/models/{model_id}"
 
     def positive_integer(record: dict, key: str) -> int:
         value = record.get(key, 0)
@@ -48,9 +50,19 @@ def _codex_model_context_metadata(
             except _core.ManagerError:
                 routed = None
             if isinstance(routed, dict):
-                if routed.get("sourceKind") == "account" and routed.get("id") == "gpt-6-astra":
-                    metadata["modelContextReferenceMax"] = 1_050_000
-                    metadata["modelContextReferenceUrl"] = "https://developers.openai.com/api/docs/models/gpt-6-astra"
+                if routed.get("sourceKind") == "account" and routed.get("id"):
+                    # A routed official alias may carry only reasoning metadata.
+                    # Recover exact native context hints, never a relay template.
+                    native = _core._codex_model_context_metadata(str(routed["id"]), provider_id="openai")
+                    metadata.update({key: value for key, value in native.items() if key != "modelId"})
+                    for source_key, target_key in (
+                        ("contextWindow", "modelContextDefault"),
+                        ("maxContextWindow", "modelContextMax"),
+                        ("effectiveContextWindowPercent", "modelContextEffectivePercent"),
+                    ):
+                        if value := positive_integer(routed, source_key):
+                            metadata[target_key] = value
+                    return metadata
                 return apply_record(
                     routed,
                     ("contextWindow", "maxContextWindow", "effectiveContextWindowPercent"),
