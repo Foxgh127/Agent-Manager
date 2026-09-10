@@ -64,7 +64,12 @@ if (-not $publishStage.StartsWith($publishProject.TrimEnd('\') + '\', [StringCom
 New-Item -ItemType Directory -Path $publishStage -Force | Out-Null
 $assetPath = Join-Path $publishStage $assetName
 Copy-Item -LiteralPath $builtPath -Destination $assetPath -Force
-$notes = if ($NotesFile) { Get-Content -LiteralPath $NotesFile -Raw -Encoding UTF8 } else { "Agent Manager $publishVersion" }
+$bodyPath = Join-Path $publishStage "release-notes.md"
+if ($NotesFile) {
+    & python (Join-Path $publishProject 'scripts/release_notes.py') --version $publishVersion --input $NotesFile --output $bodyPath
+    if ($LASTEXITCODE -ne 0) { throw 'Release notes do not match the requested version.' }
+    $notes = Get-Content -LiteralPath $bodyPath -Raw -Encoding UTF8
+} else { $notes = "Agent Manager $publishVersion" }
 $assetSize = (Get-Item -LiteralPath $assetPath).Length
 $releaseManifest = @{schemaVersion=1; appId="openai-agent-manager"; version=$publishVersion; channel="stable"; releaseEpoch=$releaseEpoch;
     publishedAt=[DateTime]::UtcNow.ToString("o"); releaseNotes=$notes;

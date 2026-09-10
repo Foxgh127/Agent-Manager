@@ -29,6 +29,8 @@ npm test --prefix frontend
 
 只有用户明确要求“发布”时才修改版本源、整理发行说明并发布。普通修复、构建和继续工作均不构成发布授权。推送和 PR 运行检查；正式发布必须手动触发工作流且 `publish=true`。需要由本机发布时，在获得同一发布授权并完成验证后执行：
 
+版本号严格使用用户指定值，不自行递增。`docs/release-notes.md` 只写当次变化；发布脚本校验标题版本，拒绝缺失/重复的版本段落，且不会把旧版说明复制到新发行版。
+
 ```powershell
 ./scripts/publish.ps1 -Repository Foxgh127/Agent-Manager -Build -Publish -NotesFile docs/release-notes.md
 ```

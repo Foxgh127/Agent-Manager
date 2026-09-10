@@ -39,7 +39,8 @@ class ManagerRuntime:
         self.radar_monitor_stop = _app.threading.Event()
         self.radar_monitor_wake = _app.threading.Event()
         self.radar_monitor_thread: _app.threading.Thread | None = None
-        self.radar_alert_notifier = None
+        from agent_manager.platform.notifications import notify_radar_alert
+        self.radar_alert_notifier = notify_radar_alert
         self.radar_monitor_status = {
             "status": "waiting",
             "lastCheckedAt": None,
@@ -622,12 +623,28 @@ class ManagerRuntime:
 
     def set_radar_alert_notifier(self, notifier) -> None:
         self.radar_alert_notifier = notifier if callable(notifier) else None
+        # A running monitor replays its bounded pending queue after registration.
+        if not self._closed and not self._restart_prepared:
+            self.radar_monitor_wake.set()
+
+    def _deliver_radar_alert(self, alert=None, *, stop=None) -> None:
+        if self._closed or self._restart_prepared or (stop is not None and stop.is_set()):
+            return
+        if hasattr(self.radar, "_state"):
+            from agent_manager.integrations.radar_monitor import deliver_pending_alert
+            status = deliver_pending_alert(self.radar, self.radar_alert_notifier, alert=alert, stop=stop)
+            self.radar_monitor_status.update(status)
+        elif isinstance(alert, dict) and callable(self.radar_alert_notifier):
+            self.radar_alert_notifier(alert)
 
     def _run_radar_monitor(self, stop=None, wake=None) -> None:
         stop = stop if stop is not None else self.radar_monitor_stop
         wake = wake if wake is not None else self.radar_monitor_wake
+        first_check = True
+        retry_wait = 0.0
         while not stop.is_set():
             try:
+                self._deliver_radar_alert(stop=stop)
                 current = self.radar.monitor_status()
                 self.radar_monitor_status.update({
                     "status": "waiting",
@@ -636,7 +653,13 @@ class ManagerRuntime:
                     "lastResult": current.get("lastResult") or "尚未检查",
                     "lastError": current.get("lastError"),
                 })
-                wait_seconds = max(0.1, self.radar.seconds_until_next_monitor())
+                wait_seconds = 0.1 if first_check else max(0.1, self.radar.seconds_until_next_monitor())
+                if hasattr(self.radar, "_state") and callable(self.radar_alert_notifier):
+                    from agent_manager.integrations.radar_monitor import seconds_until_pending_delivery
+                    delivery_wait = seconds_until_pending_delivery(self.radar)
+                    if delivery_wait is not None:
+                        wait_seconds = min(wait_seconds, max(0.1, delivery_wait))
+                wait_seconds = max(wait_seconds, retry_wait)
             except Exception as exc:
                 self.radar_monitor_status.update({"status": "error", "lastError": _app.core._redact_sensitive_text(exc, limit=300)})
                 wait_seconds = 300.0
@@ -646,9 +669,11 @@ class ManagerRuntime:
                 return
             if woke:
                 continue
+            first_check = False
             try:
                 self.radar_monitor_status["status"] = "checking"
                 result = self.radar.run_monitor()
+                retry_wait = 60.0 if result.get("suppressed") == "in-flight" else 0.0
                 if stop.is_set():
                     return
                 state = result.get("state") if isinstance(result.get("state"), dict) else {}
@@ -659,16 +684,14 @@ class ManagerRuntime:
                     "lastResult": state.get("lastResult") or "无预警",
                     "lastError": state.get("lastError"),
                 })
-                if result.get("newAlert") and isinstance(result.get("alert"), dict) and callable(self.radar_alert_notifier):
-                    try:
-                        self.radar_alert_notifier(result["alert"])
-                    except Exception:
-                        pass
+                if result.get("newAlert") and isinstance(result.get("alert"), dict):
+                    self._deliver_radar_alert(result["alert"], stop=stop)
             except Exception as exc:
                 self.radar_monitor_status.update({"status": "error", "lastError": _app.core._redact_sensitive_text(exc, limit=300)})
+                retry_wait = 300.0
 
     def _start_radar_monitor(self) -> None:
-        """Run the public-source hourly monitor only after explicit opt-in."""
+        """Start the public-source hourly monitor according to the saved setting."""
         enabled = _app.core.load_settings().get("appBehavior", {}).get("radarMonitoring") is True
         if not enabled or self._closed or self._restart_prepared:
             self._stop_radar_monitor()
@@ -679,6 +702,10 @@ class ManagerRuntime:
             return
         self.radar_monitor_stop = _app.threading.Event()
         self.radar_monitor_wake = _app.threading.Event()
+        if hasattr(getattr(self, "radar", None), "_lock"):
+            from agent_manager.integrations.radar_monitor import begin_monitoring
+            self.radar._monitor_wake_callback = self.radar_monitor_wake.set
+            begin_monitoring(self.radar)
         self.radar_monitor_thread = _app.threading.Thread(target=self._run_radar_monitor, args=(self.radar_monitor_stop, self.radar_monitor_wake), name="radar-hourly-monitor", daemon=True)
         self.radar_monitor_thread.start()
 
@@ -689,11 +716,8 @@ class ManagerRuntime:
             lastCheckedAt=state.get("lastSuccessAt") or state.get("lastRunAt"),
             lastResult=state.get("lastResult") or "尚未完成检查", lastError=state.get("lastError"),
         )
-        if result.get("newAlert") and isinstance(result.get("alert"), dict) and callable(self.radar_alert_notifier):
-            try:
-                self.radar_alert_notifier(result["alert"])
-            except Exception:
-                pass
+        if result.get("newAlert") and isinstance(result.get("alert"), dict):
+            self._deliver_radar_alert(result["alert"])
         return result
 
     def _stop_radar_monitor(self) -> None:

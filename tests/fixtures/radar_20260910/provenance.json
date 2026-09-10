@@ -1,0 +1,9 @@
+{
+  "retrievedAt": "2026-09-10T07:33:13Z",
+  "sources": {
+    "software.json": "https://codexradar.com/api/intelligence-efficiency-metrics",
+    "visual.json": "https://codexradar.com/api/visual-spatial-reasoning",
+    "cards.html": "https://codexradar.com/"
+  },
+  "reduction": "visual history removed; cards.html contains verbatim quota and monthly markup with captured container timestamp"
+}

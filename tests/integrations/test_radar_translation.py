@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import agent_manager.integrations.radar as radar
@@ -176,6 +177,7 @@ class RadarTranslationV9Tests(unittest.TestCase):
             _Response(status=304),
             _Response(status=304),
             _Response(status=304),
+            _Response(status=304),
             _Response(translation),
         ])
         calls = []
@@ -195,12 +197,13 @@ class RadarTranslationV9Tests(unittest.TestCase):
             "source": {"url": radar.PUBLIC_FORECAST_URL, "format": "json", "degraded": False},
         }
 
-        result = service.get_reset_radar(refresh=True)
+        with patch.object(service, '_fetch_status_incidents', return_value=([], False)):
+            result = service.get_reset_radar(refresh=True)
 
         repaired = result["data"]["forecastSignals"]["latestSignal"]
         self.assertEqual(repaired["translationState"], "complete")
         self.assertEqual(repaired["titleZh"], "缓存中的标题现在已有中文译文。")
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertTrue(calls[-1].startswith(radar.PUBLIC_TRANSLATE_URL))
 
     def test_reset_summary_rss_and_status_updates_expose_field_state(self):

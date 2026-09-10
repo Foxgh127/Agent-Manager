@@ -1,6 +1,6 @@
 # 独立网关设计
 
-1.1.0 继续运行 Python HTTP/SSE 网关，未引入 CPA 或 Sub2API sidecar。来源凭据、配置和模型路由使用本项目结构；不通过更换产品名称、降低模型或修改推理强度来声称兼容。
+Agent Manager 运行 Python HTTP/SSE 网关，未引入 CPA 或 Sub2API sidecar。来源凭据、配置和模型路由使用本项目结构；不通过更换产品名称、降低模型或修改推理强度来声称兼容。
 
 ## 选择和会话
 

@@ -204,22 +204,22 @@ function ScoreHistoryDetails({ entries, formatDate }) {
 function ResetEventHistory({ entries, formatDate }) {
   return (
     <section className="reset-radar-event-history" aria-labelledby="reset-event-history-title">
-      <header><h4 id="reset-event-history-title">历史硬重置与赠送重置卡</h4><span>{entries.length} 条公开记录</span></header>
+      <header><h4 id="reset-event-history-title">历史重置与重置卡</h4><span>{entries.length} 条公开记录</span></header>
       <p>以下时间均为北京时间。发生时间与帖子发布时间分别记录；未公布的时刻不做推算。</p>
       {!entries.length ? <p className="reset-radar-empty">暂无可核验的已完成事件，刷新后自动保存公开记录。</p> : (
         <ol>{entries.map((event, index) => {
           const url = safeRadarUrl(event.url);
           return <li key={event.eventId || `${event.publishedAt}-${index}`}>
             <div className="reset-radar-event-type">
-              <strong>{event.resetType === "reset-card" ? "赠送重置卡" : "硬重置"}</strong>
-              <small>{event.confirmation === "official-post-mirror" ? "官方帖子转录" : "公开来源已报告"}</small>
+              <strong>{event.resetType === "reset-card" ? "重置卡" : "硬重置"}{event.aggregate ? ` · 月度统计 ${event.reportedCount ?? event.count ?? "—"} 次` : ""}</strong>
+              <small>{event.discrepancy ? "来源口径存在差异" : event.aggregate ? "来源汇总，非逐次时间记录" : event.confirmation === "official-post-mirror" ? "官方帖子转录" : "公开来源已报告"}</small>
             </div>
             <h5><LocalizedInline record={event} field="title" fallback="公开重置事件" /></h5>
             <dl>
               <div><dt>发生时间</dt><dd>{formatResetOccurrence(event)}</dd></div>
               <div><dt>帖子发布</dt><dd>{event.publishedAt ? formatResetOccurrence({ occurredAt: event.publishedAt, occurrencePrecision: "second" }) : "发布时间未公布"}</dd></div>
-              <div><dt>本机首次发现</dt><dd>{event.discoveredAt ? formatResetOccurrence({ occurredAt: event.discoveredAt, occurrencePrecision: "second" }) : "发现时间未记录"}</dd></div>
             </dl>
+            {event.discrepancy && <p>来源月表统计 {event.reportedCount ?? event.count} 次，说明文字记为 {event.noteCount ?? "未知"} 次；各次日期尚待核对。</p>}
             {url && <a href={url} target="_blank" rel="noreferrer">核对来源<ExternalLink size={12} aria-hidden="true" /></a>}
           </li>;
         })}</ol>
@@ -258,7 +258,7 @@ export default function ResetRadarPanel({
   const sourceUrls = (Array.isArray(alert?.sourceUrls) ? alert.sourceUrls : [])
     .map(safeRadarUrl)
     .filter(Boolean);
-  const hoursSinceReset = Number(model.prediction?.hoursSinceReset);
+  const delivery = monitor.alertDeliveries?.[alert?.signature];
   const retryTranslation = onRetryTranslation || onRefresh;
 
   return (
@@ -306,11 +306,12 @@ export default function ResetRadarPanel({
             </dl>
           )}
         </div>
-        <div className="reset-radar-score" aria-label={`社区重置信号分 ${percentageText(model.score)}`}>
-          <span>社区信号分</span>
-          <strong>{percentageText(model.score)}</strong>
-          <i aria-hidden="true"><b style={{ width: `${model.score ?? 0}%` }} /></i>
-          <small>满分 100，非发生概率或官方承诺</small>
+        <div className="reset-radar-score" aria-label={`综合证据分 ${percentageText(model.assessment?.score ?? model.score)}`}>
+          <span>{model.assessment ? "综合证据分" : "社区信号分"}</span>
+          <strong>{percentageText(model.assessment?.score ?? model.score)}</strong>
+          <i aria-hidden="true"><b style={{ width: `${model.assessment?.score ?? model.score ?? 0}%` }} /></i>
+          <small>{model.assessment ? `${model.assessment.label}级 · 非发生概率` : "满分 100，非发生概率或官方承诺"}</small>
+          {model.assessment && model.score !== null && <small>第三方原始分：{percentageText(model.score)}</small>}
         </div>
         <div className="reset-radar-next">
           <small>下一步</small>
@@ -334,8 +335,8 @@ export default function ResetRadarPanel({
         <div className="reset-radar-monitor-heading">
           <Clock3 size={17} aria-hidden="true" />
           <div>
-            <h4 id="reset-radar-monitor-title">{monitoringEnabled ? "北京时间整点监测" : "检查记录"}</h4>
-            <p>{monitoringEnabled ? plainText(monitor.schedule, "每天 08:00—23:00，每个整点") : "当前按需刷新，不会在后台周期轮询。"}</p>
+            <h4 id="reset-radar-monitor-title">{monitoringEnabled ? "每小时后台监测" : "检查记录"}</h4>
+            <p>{monitoringEnabled ? "启动立即检查，运行期间每小时更新，全天有效" : "当前按需刷新，不会在后台周期轮询。"}</p>
           </div>
           {typeof onToggleMonitoring === "function" && (
             <label className="reset-radar-switch">
@@ -359,11 +360,11 @@ export default function ResetRadarPanel({
           {monitoringEnabled && <span>下次 {formatRadarDate(monitor.nextCheckAt, formatDate)}</span>}
         </div>
         {monitoringEnabled && <p className="reset-radar-monitor-note">
-          {monitor.catchupFromMidnight
-            ? "已补查今日 00:00—08:00 的新增公开信息。"
-            : "后台检查可发出通知；高分社区预测单独标记，重复信号不反复通知。"}
+          新信号或等级提升时发送 Windows 通知；同一信号不会反复提醒。
         </p>}
         {!monitoringEnabled && <p className="reset-radar-monitor-note">手动刷新会评估当前来源并更新检查记录；后台关闭期间不会主动检查或推送通知。</p>}
+        {delivery?.state === "pending" && delivery.attempts > 0 && <p className="reset-radar-monitor-note">Windows 通知待重试，已尝试 {delivery.attempts}/3 次。</p>}
+        {delivery?.state === "failed" && <p className="reset-radar-monitor-note">Windows 通知提交失败，请检查系统通知设置。</p>}
         {typeof onCheckNow === "function" && (
           <button type="button" className="reset-radar-action" onClick={onCheckNow} disabled={busy}>
             {checking ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <RefreshCw size={15} aria-hidden="true" />}
@@ -418,8 +419,8 @@ export default function ResetRadarPanel({
 
       <ResetEventHistory entries={model.resetHistory} formatDate={formatDate} />
 
-      {Number.isFinite(hoursSinceReset) && (
-        <p className="reset-radar-footnote">距来源记录的上次重置约 {Math.max(0, Math.round(hoursSinceReset))} 小时。</p>
+      {model.latestResetEvent && (
+        <p className="reset-radar-footnote">最近公开重置记录：{formatResetOccurrence(model.latestResetEvent)}。</p>
       )}
 
       <footer className="reset-radar-footer">

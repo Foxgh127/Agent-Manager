@@ -543,7 +543,7 @@ def _migrate_settings(settings: dict) -> tuple[dict, bool]:
         app_behavior = _core._default_app_behavior()
         normalized["appBehavior"] = app_behavior
     app_behavior["closeToTray"] = bool(app_behavior.get("closeToTray", False))
-    app_behavior["radarMonitoring"] = app_behavior.get("radarMonitoring") is True
+    app_behavior["radarMonitoring"] = app_behavior.get("radarMonitoring", True) is True
     if app_behavior.get("appearance") not in {"light", "dark", "system"}:
         app_behavior["appearance"] = "system"
     app_behavior["usageRange"] = _core._normalize_usage_range(app_behavior.get("usageRange"))

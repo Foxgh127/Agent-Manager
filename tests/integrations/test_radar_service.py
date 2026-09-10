@@ -319,12 +319,12 @@ class RadarParserTests(unittest.TestCase):
         self.assertNotIn("items", empty)
         self.assertNotIn("comparisons", empty)
 
-    def test_composite_metrics_match_public_geometric_mean_and_weighting(self):
+    def test_composite_metrics_match_public_weighted_mean_and_dynamic_models(self):
         parsed = radar.parse_composite_intelligence_metrics(metrics_bytes(), visual_metrics_bytes())
         point = parsed["items"][0]
-        self.assertEqual(len(parsed["items"]), 1)
+        self.assertEqual(len(parsed["items"]), 2)
         self.assertEqual(point["label"], "Sol ultra")
-        self.assertAlmostEqual(point["iq"], 105.04, places=2)
+        self.assertAlmostEqual(point["iq"], 105.76, places=2)
         self.assertEqual(point["sampleCount"], 100)
         self.assertEqual(point["cost"], "$21.27")
         self.assertEqual(point["duration"], "48分钟")
@@ -495,11 +495,11 @@ class RadarParserTests(unittest.TestCase):
         self.assertIsNone(parsed["posts"][0]["url"])
         self.assertIsNone(parsed["resetEvents"][0]["url"])
 
-    def test_beijing_monitor_schedule_skips_overnight(self):
+    def test_monitor_schedule_starts_immediately_and_runs_overnight(self):
         before_window = datetime(2026, 8, 10, 23, 30, tzinfo=timezone.utc)  # 07:30 Beijing
-        self.assertEqual(radar.next_monitor_time(before_window), datetime(2026, 8, 11, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(radar.next_monitor_time(before_window), before_window)
         after_window = datetime(2026, 8, 11, 15, 30, tzinfo=timezone.utc)  # 23:30 Beijing
-        self.assertEqual(radar.next_monitor_time(after_window), datetime(2026, 8, 12, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(radar.next_monitor_time(after_window, after_window.isoformat()), datetime(2026, 8, 11, 16, 30, tzinfo=timezone.utc))
 
 
 class RadarServiceTests(unittest.TestCase):
@@ -514,10 +514,12 @@ class RadarServiceTests(unittest.TestCase):
     def snapshot_responses(self):
         return [
             FakeResponse(summary_bytes(), headers={"ETag": '"summary-1"'}),
+            FakeResponse(b"<html></html>"),
             FakeResponse(metrics_bytes(), headers={"ETag": '"metrics-1"'}),
             FakeResponse(visual_metrics_bytes(), headers={"ETag": '"visual-1"'}),
             FakeResponse(RSS, headers={"ETag": '"feed-1"'}),
             FakeResponse(forecast_bytes(), headers={"ETag": '"forecast-1"'}),
+            FakeResponse(b'{"incidents": []}'),
         ]
 
     def test_startup_refreshes_once_and_caches_normalized_data(self):
@@ -525,7 +527,7 @@ class RadarServiceTests(unittest.TestCase):
         service = radar.RadarService(self.cache, opener=opener, clock=self.clock)
         first = service.get_snapshot(startup=True)
         second = service.get_snapshot(startup=True)
-        self.assertEqual(len(opener.calls), 5)
+        self.assertEqual(len(opener.calls), 7)
         self.assertEqual(first["intelligence"]["data"]["items"][0]["label"], "Sol ultra")
         self.assertEqual(first["quota"]["data"]["tiers"][0]["estimated7d"], "$1,000.00")
         self.assertEqual(first["reset"]["data"]["events"][0]["source"], "public-rss")
@@ -584,7 +586,7 @@ class RadarServiceTests(unittest.TestCase):
 
         self.assertTrue(result["available"])
         self.assertTrue(result["stale"])
-        self.assertEqual(result["data"]["mode"], "composite-geomean")
+        self.assertEqual(result["data"]["mode"], "composite-weighted-mean")
         self.assertEqual(result["data"]["items"][0]["iq"], previous_iq)
 
     def test_radar_rejects_downgrade_or_private_redirect_targets(self):
@@ -607,30 +609,30 @@ class RadarServiceTests(unittest.TestCase):
         service.get_snapshot(startup=True)
         service.get_snapshot()
 
-        self.assertEqual(len(opener.calls), 5)
+        self.assertEqual(len(opener.calls), 7)
 
     def test_quota_attempt_is_capped_to_once_per_week(self):
-        opener = QueueOpener([FakeResponse(summary_bytes(1)), FakeResponse(summary_bytes(2))])
+        opener = QueueOpener([FakeResponse(summary_bytes(1)), FakeResponse(b"<html></html>"), FakeResponse(summary_bytes(2)), FakeResponse(b"<html></html>")])
         service = radar.RadarService(self.cache, opener=opener, clock=self.clock)
         first = service.get_quota(refresh=True)
         self.clock.value += timedelta(days=6)
         suppressed = service.get_quota(refresh=True)
         self.clock.value += timedelta(days=2)
         refreshed = service.get_quota(refresh=True)
-        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(len(opener.calls), 4)
         self.assertTrue(first["available"])
         self.assertEqual(suppressed["refreshSuppressed"], "weekly-cadence")
         self.assertFalse(refreshed["cached"])
 
     def test_forced_quota_refresh_bypasses_weekly_background_cadence(self):
-        opener = QueueOpener([FakeResponse(summary_bytes(1)), FakeResponse(summary_bytes(2))])
+        opener = QueueOpener([FakeResponse(summary_bytes(1)), FakeResponse(b"<html></html>"), FakeResponse(summary_bytes(2)), FakeResponse(b"<html></html>")])
         service = radar.RadarService(self.cache, opener=opener, clock=self.clock)
         service.get_quota(refresh=True)
         self.clock.value += timedelta(minutes=5)
 
         refreshed = service.get_quota(refresh=True, force=True)
 
-        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(len(opener.calls), 4)
         self.assertTrue(refreshed["available"])
         self.assertIsNone(refreshed["refreshSuppressed"])
 
@@ -684,18 +686,18 @@ class RadarServiceTests(unittest.TestCase):
         self.assertTrue(result["needsManualRefresh"])
         self.assertEqual(opener.calls, [])
 
-    def test_hourly_monitor_catches_up_at_eight_and_deduplicates_slot(self):
-        opener = QueueOpener([FakeResponse(forecast_bytes()), FakeResponse(status_bytes())])
+    def test_hourly_monitor_refreshes_all_reset_sources_once(self):
+        opener = QueueOpener([FakeResponse(summary_bytes()), FakeResponse(b'<html></html>'), FakeResponse(RSS), FakeResponse(forecast_bytes()), FakeResponse(status_bytes())])
         service = radar.RadarService(self.cache, opener=opener, clock=self.clock)
         first = service.run_monitor()
         second = service.run_monitor()
         self.assertTrue(first["attempted"])
         self.assertTrue(first["success"])
-        self.assertEqual(first["state"]["lastResult"], "无预警")
-        self.assertTrue(first["state"]["catchupFromMidnight"])
+        self.assertEqual(first["state"]["lastResult"], "来源数据已过期，暂不发出预测预警")
+        self.assertEqual(first["state"]["lastCheckMode"], "scheduled")
         self.assertEqual(first["state"]["nextCheckAt"], "2026-08-11T01:00:00Z")
         self.assertEqual(second["suppressed"], "already-checked")
-        self.assertEqual(len(opener.calls), 2)
+        self.assertEqual(len(opener.calls), 5)
 
     def test_cache_health_reports_and_clears_only_corrupt_cache(self):
         self.cache.write_text("not json", encoding="utf-8")

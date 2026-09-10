@@ -202,30 +202,19 @@ class ManagerServer(_app.ThreadingHTTPServer):
         }
 
     def notify_radar_alert(self, alert: dict) -> bool:
-        """Keep community predictions distinct from source-confirmed alerts."""
-        if not isinstance(alert, dict) or alert.get("level") not in {"A", "B", "P"}:
+        """Deliver a system notification with or without a permanent tray."""
+        from agent_manager.platform.notifications import radar_notification_text, notify_windows
+        content = radar_notification_text(alert)
+        if content is None or self.shutdown_started.is_set():
             return False
-        if self.tray is None:
+        title, message = content
+        if self.tray is not None and getattr(self.tray, "visible", False) and not self.tray_error:
             try:
-                behavior = _app.core.load_settings().get("appBehavior", {})
-                if not behavior.get("closeToTray") and not behavior.get("radarMonitoring"):
-                    return False
-            except Exception:
-                return False
-            if not self.ensure_tray():
-                return False
-        lines = [
-            "【社区预测预警，非官方确认】" if alert.get("level") == "P" else f"【{alert.get('level')}级】",
-            f"证据：{str(alert.get('evidence') or '')[:160]}",
-            f"窗口：{str(alert.get('window') or '')[:80]}",
-            f"建议：{str(alert.get('advice') or '继续观察')[:40]}",
-        ]
-        try:
-            self.tray.notify("\n".join(lines), "Agent Manager · Codex 重置预警")
-            return True
-        except Exception as exc:
-            self.tray_error = str(exc)[:300]
-            return False
+                self.tray.notify(message, title)
+                return True
+            except Exception as exc:
+                self.tray_error = str(exc)[:300]
+        return notify_windows(title, message)
 
     def ensure_tray(self) -> bool:
         if not self.native_window:

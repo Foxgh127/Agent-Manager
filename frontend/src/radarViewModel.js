@@ -121,7 +121,7 @@ function timestamp(value) {
 }
 
 export function isCurrentRadarAlert(alert, now = Date.now()) {
-  if (!alert || typeof alert !== "object" || !["A", "B", "P"].includes(text(alert.level).toUpperCase())) {
+  if (!alert || typeof alert !== "object" || !["A", "B", "C", "P"].includes(text(alert.level).toUpperCase())) {
     return false;
   }
   const nowMs = timestamp(now);
@@ -138,6 +138,7 @@ export function isCurrentRadarAlert(alert, now = Date.now()) {
 export function formatResetOccurrence(event = {}) {
   const precision = text(event.occurrencePrecision);
   const raw = text(event.occurredAt);
+  if (precision === "month" && /^\d{4}-(0[1-9]|1[0-2])$/.test(raw)) return `${raw}（月度汇总，具体日期未公布）`;
   if (!raw || !["date", "minute", "second"].includes(precision)) return "发生时间未公布";
   if (precision === "date") return `${raw}（仅日期，具体时刻未公布）`;
   const parsed = new Date(raw);
@@ -172,7 +173,10 @@ export function buildResetRadarViewModel(reset = {}, { now = Date.now() } = {}) 
   const checkAt = timestamp(monitor.lastRunAt || monitor.lastSuccessAt);
   const checkStale = checkAt !== null && Number(now) - checkAt > ALERT_MAX_AGE_MS;
   const resetHistory = (Array.isArray(reset.resetHistory) ? reset.resetHistory : [])
-    .filter((entry) => entry && entry.completed === true);
+    .filter((entry) => entry && (entry.completed === true || entry.aggregate === true));
+  const latestResetEvent = resetHistory.filter(entry => entry.resetType === "full-reset" && !entry.aggregate
+    && ["date", "minute", "second"].includes(entry.occurrencePrecision) && Number.isFinite(Date.parse(entry.occurredAt)))
+    .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt))[0] || null;
   const latestSignal = forecast.latestSignal && typeof forecast.latestSignal === "object"
     ? forecast.latestSignal
     : null;
@@ -217,6 +221,18 @@ export function buildResetRadarViewModel(reset = {}, { now = Date.now() } = {}) 
     judgmentDetail = "线索仍不足以确认重置，请等待后续公开信息。";
   }
 
+  const rawAssessment = reset.assessment || monitor.assessment;
+  const assessmentScore = normalizeRadarScore(rawAssessment?.score);
+  const assessment = rawAssessment && assessmentScore !== null ? { ...rawAssessment, score: assessmentScore } : null;
+  if (assessment) {
+    const copy = {
+      confirmed: ["发现已完成的公开公告", "critical", "来源出现完成表述；具体到账情况请核对实际账号。"],
+      warning: ["重置预警", "critical", "存在较新且可核对的重置计划或额度变化信号。"],
+      watch: ["关注重置信号", "attention", "存在值得关注的公开线索，尚不能视为已完成或必定发生。"],
+      information: ["暂无明确重置预警", "neutral", "目前缺少足够的新鲜证据，继续按小时观察。"],
+    }[assessment.severity];
+    if (copy && !checkStale) [judgment, judgmentTone, judgmentDetail] = copy;
+  }
   const action = alertAdvice.text
     ? alertAdvice.text
     : alertAdvice.needsRetry
@@ -237,12 +253,14 @@ export function buildResetRadarViewModel(reset = {}, { now = Date.now() } = {}) 
     checkStale,
     sourceFresh,
     resetHistory,
+    latestResetEvent,
     alert,
     expiredAlert,
     alertEvidence,
     alertAdvice,
     alertTranslationNeedsRetry,
     score,
+    assessment,
     latestSignal,
     scoreHistory,
     breakdown,

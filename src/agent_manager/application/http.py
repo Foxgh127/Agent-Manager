@@ -1556,7 +1556,7 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                         refresh=True,
                     )
                     if refreshed.get("newAlert") and isinstance(refreshed.get("alert"), dict):
-                        self.server.notify_radar_alert(refreshed["alert"])
+                        self.server.runtime._deliver_radar_alert(refreshed["alert"])
                 else:
                     raise _app.core.ManagerError("雷达刷新类型无效；请选择智力、额度或重置雷达。")
                 self._json({"ok": True, section: _app._radar_api_section(refreshed)})

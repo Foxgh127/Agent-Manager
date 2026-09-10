@@ -202,7 +202,7 @@ def _default_app_behavior() -> dict:
         "appearance": "system",
         "usageRange": _core._normalize_usage_range(None),
         "closeToTray": False,
-        "radarMonitoring": False,
+        "radarMonitoring": True,
         "quotaRefreshMinutes": 10,
         # Mailbox checks validate only login + readonly SELECT.  They never
         # search or download messages and default to one check per day.

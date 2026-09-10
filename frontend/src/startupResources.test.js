@@ -2,25 +2,28 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { loadAppUpdate } from "./appUpdateResource.js";
 
 const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8").replaceAll("\r\n", "\n");
 
-test("startup resource reads are single-flight and never force remote discovery", async () => {
+test("application startup checks maintenance exactly once", async () => {
   const start = source.indexOf("function refreshStartupResourcesOnce()");
   const end = source.indexOf("function cx(", start);
   const calls = [];
   const context = vm.createContext({
-    api: async (url) => { calls.push(url); return { cached: true }; },
+    api: async (url) => { calls.push(url); return { cached: true, status: { configured: true } }; },
+    loadAppUpdate,
     startupResourceRefreshPromise: null,
+    maintenanceStartupPromise: null,
     radarResourceCache: {}, maintenanceResourceCache: null, skillsResourceCache: null,
   });
   vm.runInContext(source.slice(start, end), context);
   const first = context.refreshStartupResourcesOnce();
   assert.equal(context.refreshStartupResourcesOnce(), first);
   await first;
-  assert.deepEqual(calls, ["/api/radar", "/api/updates", "/api/emergency/checks", "/api/skills", "/api/skills/catalog"]);
+  assert.deepEqual(calls, ["/api/updates/check", "/api/emergency/checks?force=1", "/api/app-update", "/api/radar", "/api/app-update/check", "/api/skills", "/api/skills/catalog"]);
   await context.refreshStartupResourcesOnce();
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 7);
 });
 
 test("activation completion replaces the pre-activation dashboard once", async () => {
@@ -41,5 +44,5 @@ test("activation completion replaces the pre-activation dashboard once", async (
   await request(); // while the immediate call is in flight, no duplicate
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(reloads, 1);
-  assert.equal(context.maintenanceResourceCache, null);
+  assert.equal(context.maintenanceResourceCache.stale, true);
 });

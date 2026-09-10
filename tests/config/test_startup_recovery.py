@@ -121,6 +121,7 @@ class StartupRecoveryV95Tests(unittest.TestCase):
             patch.object(app.ManagerRuntime, "_start_account_auto_refresh"),
             patch.object(app.ManagerRuntime, "_start_mail_health_checks"),
             patch.object(app.ManagerRuntime, "_start_update_checks"),
+            patch.object(app.ManagerRuntime, "_start_radar_monitor"),
         ):
             runtime = app.ManagerRuntime(defer_configuration=True)
             session = runtime.activate_configuration_session()
@@ -161,6 +162,7 @@ class StartupRecoveryV95Tests(unittest.TestCase):
             patch.object(app.ManagerRuntime, "_start_account_auto_refresh"),
             patch.object(app.ManagerRuntime, "_start_mail_health_checks"),
             patch.object(app.ManagerRuntime, "_start_update_checks"),
+            patch.object(app.ManagerRuntime, "_start_radar_monitor"),
         ):
             runtime = app.ManagerRuntime(
                 quick_restart=True,
@@ -214,6 +216,7 @@ class StartupRecoveryV95Tests(unittest.TestCase):
                 patch.object(app.ManagerRuntime, "_start_account_auto_refresh"),
                 patch.object(app.ManagerRuntime, "_start_mail_health_checks"),
                 patch.object(app.ManagerRuntime, "_start_update_checks"),
+            patch.object(app.ManagerRuntime, "_start_radar_monitor"),
             ):
                 runtime = app.ManagerRuntime(
                     quick_restart=True,

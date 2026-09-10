@@ -1,9 +1,3 @@
-.quota-estimate { margin: -1px 0 12px; padding: 8px 11px; border: 1px solid var(--border-soft); border-radius: 13px; background: rgb(var(--canvas-rgb) / .07); color: var(--text); }
-.quota-estimate summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; cursor: pointer; font-size: 11px; }
-.quota-estimate summary::after { content: "⌄"; margin-left: auto; color: var(--muted); }
-.quota-estimate details[open] summary::after { content: "⌃"; }
-.quota-estimate summary:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; border-radius: 3px; }
-.quota-estimate summary strong { font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.quota-estimate-detail { color: var(--muted); font-size: 10px; }
-.quota-estimate-detail p { margin: 8px 0 0; line-height: 1.6; overflow-wrap: anywhere; }
-.quota-estimate-detail a { color: inherit; text-decoration: underline; }
+.quota-estimate { margin: -1px 0 12px; padding: 8px 11px; border: 1px solid var(--border-soft); border-radius: 13px; background: rgb(var(--canvas-rgb) / .07); color: var(--text); display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px; }
+.quota-estimate > span { flex: 0 0 auto; }
+.quota-estimate > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }

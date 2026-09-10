@@ -36,6 +36,7 @@ from urllib.parse import urlencode, urlparse
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from zoneinfo import ZoneInfo
+from . import radar_monitor as monitor_engine
 
 
 PUBLIC_SUMMARY_URL = "https://codexradar.com/current.json"
@@ -47,7 +48,7 @@ PUBLIC_FEED_URL = "https://codexradar.com/feed.xml"
 PUBLIC_FORECAST_URL = "https://www.willcodexquotareset.com/api/forecast"
 PUBLIC_TRANSLATE_URL = "https://api.mymemory.translated.net/get"
 OPENAI_STATUS_INCIDENTS_URL = "https://status.openai.com/api/v2/incidents.json"
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 MAX_PUBLIC_BYTES = 6 * 1024 * 1024
 MAX_SUMMARY_BYTES = MAX_PUBLIC_BYTES
 MAX_HTML_BYTES = 2 * 1024 * 1024
@@ -284,7 +285,7 @@ def data_sources() -> list[dict]:
         {"url": PUBLIC_FORECAST_URL, "format": "json", "purpose": "public reset forecast and @thsottiaux signal mirror", "authentication": "none"},
         {"url": PUBLIC_TRANSLATE_URL, "format": "json", "purpose": "fallback Chinese translation for public reset posts missing a reviewed site translation", "authentication": "none"},
         {"url": OPENAI_STATUS_INCIDENTS_URL, "format": "json", "purpose": "official OpenAI incident signals", "authentication": "none"},
-        {"url": PUBLIC_HTML_URL, "format": "html", "purpose": "degraded fallback for public cards", "authentication": "none"},
+        {"url": PUBLIC_HTML_URL, "format": "html", "purpose": "current community USD quota measurements, monthly reset evidence, and reviewed translations", "authentication": "none"},
     ]
 
 
@@ -548,6 +549,7 @@ def parse_intelligence_metrics(raw: bytes | str) -> dict:
 
 
 _COMPOSITE_MODEL_INFO = {
+    "gpt-6-astra": ("Astra", -1),
     "gpt-5.6-sol": ("Sol", 0),
     "gpt-5.6-terra": ("Terra", 1),
     "gpt-5.6-luna": ("Luna", 2),
@@ -587,17 +589,19 @@ def _intelligence_component(raw: bytes | str, *, label: str) -> dict:
         "runs_48h",
         "runs_total",
     )
-    for item in _list(payload.get("points"))[:64]:
+    for item in _list(payload.get("points"))[:200]:
         if not isinstance(item, dict):
             continue
         model = _text(item.get("model"), 160)
-        effort = _text(item.get("effort") or item.get("reasoning_effort"), 80).casefold()
+        effort = (_text(item.get("effort") or item.get("reasoning_effort"), 80) or "").casefold()
         iq = _safe_number(item.get("iq"))
         if not model or not effort or iq is None or iq < 0:
             continue
         valid_tasks = _safe_number(item.get("valid_tasks"))
         if valid_tasks is None:
             valid_tasks = _safe_number(item.get("total") or item.get("weighted_total"))
+        if valid_tasks is not None and valid_tasks <= 0:
+            continue
         benchmark_tasks = _safe_number(item.get("benchmark_tasks"))
         point: dict[str, Any] = {
             "model": model,
@@ -686,19 +690,14 @@ def _compose_intelligence_components(
             continue
         model = str(software_point.get("model") or "")
         effort = str(software_point.get("effort") or "").casefold()
-        model_info = _COMPOSITE_MODEL_INFO.get(model)
+        model_info = _COMPOSITE_MODEL_INFO.get(model, (model, 100))
         visual_point = visual_by_key.get((model, effort))
-        if model_info is None or not isinstance(visual_point, Mapping):
+        if not isinstance(visual_point, Mapping):
             continue
-        allowed_efforts = (
-            {"max", "high", "off"}
-            if model.startswith("deepseek-")
-            else set(_COMPOSITE_EFFORT_ORDER) - {"off"}
-        )
         software_iq = _safe_number(software_point.get("iq"))
         visual_iq = _safe_number(visual_point.get("iq"))
         if (
-            effort not in allowed_efforts
+            not effort
             or software_iq is None
             or visual_iq is None
             or software_iq < 0
@@ -706,13 +705,13 @@ def _compose_intelligence_components(
         ):
             continue
         cost = _weighted_component_metric(
-            software_point, visual_point, "average_price_usd", "price_samples"
-        )
+            software_point, visual_point, "average_price_usd", "valid_tasks"
+        ) if all(_safe_number(p.get("average_price_usd")) is not None for p in (software_point, visual_point)) else None
         minutes = _weighted_component_metric(
-            software_point, visual_point, "average_minutes", "duration_samples"
-        )
+            software_point, visual_point, "average_minutes", "valid_tasks"
+        ) if all(_safe_number(p.get("average_minutes")) is not None for p in (software_point, visual_point)) else None
         runs_24h = _summed_component_metric(software_point, visual_point, "runs_24h")
-        score = math.sqrt(software_iq * visual_iq)
+        score = _weighted_component_metric(software_point, visual_point, "iq", "valid_tasks")
         family, family_order = model_info
         points.append(
             {
@@ -738,13 +737,15 @@ def _compose_intelligence_components(
     points.sort(
         key=lambda item: (
             item["familyOrder"],
+            item["model"],
             _COMPOSITE_EFFORT_ORDER.get(item["effort"], 99),
         )
     )
     if not points:
         raise RadarSchemaError("两个公开榜单没有可配对的综合智能评分。")
     return {
-        "mode": "composite-geomean",
+        "mode": "composite-weighted-mean",
+        "formula": "IQ、费用、耗时按两侧有效题量加权；仅纳入两个维度均有有效成绩的模型档位。",
         "updatedAt": _older_component_time(software.get("updatedAt"), visual.get("updatedAt")),
         "runs24h": _summed_component_metric(software, visual, "runs24h"),
         "runs48h": _summed_component_metric(software, visual, "runs48h"),
@@ -757,7 +758,7 @@ def _compose_intelligence_components(
 def parse_composite_intelligence_metrics(
     software_raw: bytes | str, visual_raw: bytes | str
 ) -> dict:
-    """Reproduce Codex Radar's public equal-weight geometric composite."""
+    """Reproduce Codex Radar's public valid-task-weighted composite."""
     software = _intelligence_component(software_raw, label="软件工程能力数据")
     visual = _intelligence_component(visual_raw, label="视觉空间推理数据")
     return _compose_intelligence_components(software, visual)
@@ -1244,15 +1245,138 @@ def _plain_html(value: str, limit: int = 1200) -> str:
     return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()[:limit]
 
 
+class _PublicRadarCardsParser(HTMLParser):
+    """Capture bounded visible source cards, without evaluating page scripts."""
+
+    TARGETS = {"quota-radar-head", "quota-radar-current-card", "tibo-radar-monthly-row",
+               "tibo-radar-monthly-note", "tibo-radar-chart-description"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.active: list[dict] = []
+        self.records: list[dict] = []
+        self.monthly_updated_at = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if attributes.get("data-tibo-monthly-updated-at"):
+            self.monthly_updated_at = attributes["data-tibo-monthly-updated-at"]
+        if tag in {"br", "img", "input", "meta", "link", "hr", "source", "wbr"}:
+            return
+        self.depth += 1
+        classes = set((attributes.get("class") or "").split())
+        matched = self.TARGETS & classes
+        if matched:
+            self.active.append({"kind": sorted(matched)[0], "attrs": attributes,
+                                "depth": self.depth, "parts": []})
+
+    def handle_data(self, data):
+        for record in self.active:
+            if len(record["parts"]) < 500:
+                record["parts"].append(data[:2000])
+
+    def handle_endtag(self, tag):
+        if tag in {"br", "img", "input", "meta", "link", "hr", "source", "wbr"}:
+            return
+        remaining = []
+        for record in self.active:
+            if record["depth"] == self.depth:
+                record["text"] = _text(" ".join(record.pop("parts")), 6000) or ""
+                if len(self.records) < 200:
+                    self.records.append(record)
+            else:
+                remaining.append(record)
+        self.active = remaining
+        self.depth = max(0, self.depth - 1)
+
+
+def parse_public_html_cards(raw: bytes | str) -> dict:
+    """Read current USD measurements and published monthly reset evidence.
+
+    Monthly totals remain aggregates: they must never manufacture individual
+    card-delivery dates or use our fetch time as their occurrence timestamp.
+    """
+    body = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    if len(body.encode("utf-8")) > MAX_HTML_BYTES:
+        raise RadarSchemaError("公开雷达 HTML 超过响应大小限制。")
+    parser = _PublicRadarCardsParser()
+    parser.feed(body)
+    rows, monthly, events = [], [], []
+    update_text = None
+    note = next((r["text"] for r in parser.records if r["kind"] == "tibo-radar-monthly-note"), "")
+    for record in parser.records:
+        text = record["text"]
+        if record["kind"] == "quota-radar-head":
+            update_text = text.removeprefix("额度雷达").strip()
+        elif record["kind"] == "quota-radar-current-card":
+            match = re.search(r"(.+?)\s*·\s*只跑\s*(.+?)\s*\$([\d,]+(?:\.\d+)?)\s*(.+)", text)
+            if match:
+                tier, model, amount, label = match.groups()
+                value = float(amount.replace(",", ""))
+                if math.isfinite(value) and value >= 0:
+                    rows.append({"tier": tier, "model": model, "label": f"{tier} · 只跑 {model}",
+                                 "amountUsd": value, "currency": "USD", "measurement": "community-measured",
+                                 "window": None, "basis": label, "sourceLabel": "社区额度实测",
+                                 "sourceUrl": PUBLIC_HTML_URL + "#quota-radar"})
+        elif record["kind"] == "tibo-radar-monthly-row":
+            month = record["attrs"].get("data-month", "")
+            counts = re.findall(r"(\d+)\s*次", text)
+            if re.fullmatch(r"\d{4}-\d{2}", month) and len(counts) == 2:
+                monthly.append({"month": month, "directResetCount": int(counts[0]),
+                                "resetCardCount": int(counts[1]), "sourceUrl": PUBLIC_HTML_URL,
+                                "updatedAt": parser.monthly_updated_at, "note": note,
+                                "confirmation": "community-reported"})
+    # The site's reviewed note can explicitly confirm a date-only action.
+    confirmed = re.search(r"(\d{1,2})月已由站长确认(\d+)次重置卡及(\d{1,2})月(\d{1,2})日(\d+)次直接重置完成", note)
+    if confirmed:
+        card_month, card_count, month, day, count = map(int, confirmed.groups())
+        matching = next((m for m in monthly if int(m["month"][5:]) == card_month), None)
+        if matching and count == 1:
+            year = matching["month"][:4]
+            date = f"{year}-{month:02d}-{day:02d}"
+            if _parse_time(date):
+                events.append({"id": f"html-direct-{date}", "title": "站长确认 Codex 直接重置完成",
+                               "description": note, "url": PUBLIC_HTML_URL,
+                               "publishedAt": None, "sourceUpdatedAt": parser.monthly_updated_at,
+                               "completed": True, "resetType": "full-reset", "source": "public-html",
+                               "sourceLabel": "Codex 雷达站长确认（社区记录）",
+                               **_occurrence_metadata(date, basis="site-reviewed-date")})
+        if matching and card_count > 0:
+            reported_count = matching["resetCardCount"]
+            matching["noteCount"] = card_count
+            if card_count != matching["resetCardCount"]:
+                matching["discrepancy"] = f"月度表列出 {matching['resetCardCount']} 次卡，说明文字仅确认 {card_count} 次；独立完成日期未公开。"
+            events.append({"id": f"html-cards-{matching['month']}", "title": f"来源月表统计 {reported_count} 次重置卡发放",
+                           "description": note, "url": PUBLIC_HTML_URL, "publishedAt": None,
+                           "sourceUpdatedAt": parser.monthly_updated_at, "occurredAt": matching["month"],
+                           "occurrencePrecision": "month", "occurrenceBasis": "site-reviewed-monthly-total",
+                           "aggregate": True, "count": reported_count, "reportedCount": reported_count,
+                           "noteCount": card_count, "discrepancy": bool(matching.get("discrepancy")),
+                           "verification": "conflicting_source_summary" if matching.get("discrepancy") else "community_summary",
+                           "completed": True, "resetType": "reset-card",
+                           "source": "public-html", "sourceLabel": "Codex 雷达来源统计（月度汇总）"})
+    result = {"monthlyHistory": monthly, "resetHistory": events}
+    if rows:
+        result["quota"] = {"tiers": rows, "updatedAt": None, "sourceUpdatedText": update_text,
+                           "measurement": "community-measured", "currency": "USD", "plans": [],
+                           "trendPoints": [], "history": [], "radar": {},
+                           "sourceUrl": PUBLIC_HTML_URL + "#quota-radar",
+                           "summary": "社区单模型额度实测（美元口径）；页面未公开测量窗口及完整方法，不能换算为固定 token 额度或官方订阅保证。"}
+    return result
+
+
 def _reset_type(title: Any, description: Any = None) -> str:
     text = f"{_text(title, 1000) or ''} {_text(description, 2000) or ''}".casefold()
     if any(marker in text for marker in ("重置卡", "reset card", "banked reset", "reset credit")):
         return "reset-card"
+    if any(marker in text for marker in ("软重置", "soft reset", "soft-reset")):
+        return "soft-reset"
     return "full-reset"
 
 
 def _reset_type_label(value: str) -> str:
-    return "重置卡" if value == "reset-card" else "全量重置"
+    return {"reset-card": "重置卡", "soft-reset": "软重置"}.get(value, "全量重置")
 
 
 def _completed_reset_event(title: Any, description: Any = None) -> bool:
@@ -1263,6 +1387,7 @@ def _completed_reset_event(title: Any, description: Any = None) -> bool:
     if any(marker in title_text for marker in (
         "已重置", "窗口关闭", "窗口已关闭", "reset completed",
         "limits have been reset", "have reset usage limits", "reset applied",
+        "have now reset usage", "has been propagated", "已发放", "已到账",
     )):
         return True
     return bool(re.search(r"(?:权益真实生效|窗口关闭|重置完成)[：:]", description_text))
@@ -1322,7 +1447,7 @@ def _history_record(event: Mapping[str, Any], discovered_at: str) -> dict | None
     if not (event.get("completed") is True or str(event.get("status") or "").casefold() == "completed"):
         return None
     text = _signal_text(event)
-    if any(term in text for term in ("weekly reset", "weekly quota", "每周重置", "周期重置", "个人账号")):
+    if event.get("scope") == "account" or any(term in text for term in ("每周自动重置", "个人账号周期重置")):
         return None
     reset_type = event.get("resetType") or _reset_type(event.get("title"), event.get("context") or event.get("description"))
     raw_identity = str(event.get("id") or event.get("guid") or "")
@@ -1334,6 +1459,7 @@ def _history_record(event: Mapping[str, Any], discovered_at: str) -> dict | None
     selected = {key: _bounded_json(event[key]) for key in (
         "title", "titleZh", "description", "context", "url", "publishedAt", "source", "sourceLabel",
         "occurredAt", "occurrencePrecision", "occurrenceBasis", "sourceTimeText", "resetAt",
+        "aggregate", "count", "sourceUpdatedAt", "reportedCount", "noteCount", "discrepancy", "verification",
     ) if key in event}
     # Legacy cache resetAt may be only a copied publication timestamp. Never
     # silently upgrade that to the event's occurrence time.
@@ -1452,15 +1578,22 @@ def parse_public_forecast(raw: bytes | str) -> dict:
         )
         if not event_id or not reset_at:
             continue
+        # This mirror also emits synthetic activationAt copied from pubDate.
+        # Such a value confirms the post time, not the actual rollout time.
+        published_at = _text(item.get("publishedAt") or item.get("pubDate"), 80)
+        activation_at = item.get("activationAt")
+        if activation_at and _parse_time(activation_at) == _parse_time(published_at):
+            activation_at = None
+        occurrence = _occurrence_metadata(activation_at)
         normalized = _attach_public_translation({
             "id": event_id,
             "title": title,
             "context": context,
             "status": status,
-            "publishedAt": _text(item.get("publishedAt") or item.get("pubDate"), 80),
+            "publishedAt": published_at,
             "effectiveAt": _text(item.get("effectiveAt"), 80),
-            "resetAt": reset_at,
-            **_occurrence_metadata(item.get("activationAt")),
+            "resetAt": occurrence.get("occurredAt"),
+            **occurrence,
             "scheduledAt": _text(item.get("effectiveAt"), 80),
             "url": _safe_public_link(item.get("link")),
             "source": "thsottiaux-public-post",
@@ -1471,7 +1604,7 @@ def parse_public_forecast(raw: bytes | str) -> dict:
         reset_events.append(normalized)
         if status.casefold() == "completed":
             reset_history.append(normalized)
-    reset_history.sort(key=lambda item: str(item.get("resetAt")), reverse=True)
+    reset_history.sort(key=lambda item: str(item.get("occurredAt") or item.get("publishedAt") or ""), reverse=True)
     score = _safe_number(forecast.get("score"))
     breakdown = []
     for item in _list(forecast.get("breakdown"))[:12]:
@@ -1644,177 +1777,12 @@ def _signal_text(item: Mapping[str, Any]) -> str:
     ).casefold()
 
 
-def classify_reset_alert(
-    forecast: Mapping[str, Any],
-    status_incidents: Iterable[Mapping[str, Any]],
-    *,
-    since: datetime,
-    now: datetime,
-) -> dict | None:
-    """Separate source-backed A/B signals from fresh community predictions P."""
-    since = _aware(since)
-    now = _aware(now)
-    target_terms = ("codex", "chatgpt work")
-    quota_terms = ("usage limit", "usage limits", "rate limit", "rate limits", "quota", "额度", "用量限制")
-    future_actions = (
-        "will reset", "will restore", "will replenish", "will increase", "within 24 hour",
-        "within the next 24", "tomorrow we'll restore", "未来24小时", "将重置", "将恢复", "将补发", "将提高",
-    )
-    compensation_terms = ("compensat", "replenish", "restore", "reset", "补偿", "补发", "恢复额度")
-    predictor_score = _safe_number(_mapping(forecast.get("predictor")).get("score")) or 0
-
-    pending = []
-    terminal_statuses = {"completed", "resolved", "cancelled", "canceled", "expired", "failed"}
-    for event in _list(forecast.get("resetEvents")):
-        if (
-            not isinstance(event, Mapping)
-            or str(event.get("status") or "").casefold() in terminal_statuses
-            or _completed_reset_event(event.get("title"), event.get("context"))
-        ):
-            continue
-        published = _signal_time(event, "publishedAt")
-        if published is None or not since < published <= now + timedelta(minutes=5):
-            continue
-        pending.append(event)
-
-    recent_posts = []
-    for post in _list(forecast.get("posts")):
-        if not isinstance(post, Mapping):
-            continue
-        if _completed_reset_event(post.get("title"), post.get("context")):
-            continue
-        published = _signal_time(post, "publishedAt")
-        if published is not None and since < published <= now + timedelta(minutes=5):
-            recent_posts.append(post)
-
-    recent_incidents = []
-    for incident in status_incidents:
-        if not isinstance(incident, Mapping):
-            continue
-        updated = _signal_time(incident, "updatedAt", "createdAt")
-        if updated is not None and since < updated <= now + timedelta(minutes=5):
-            recent_incidents.append(incident)
-
-    # A: an official public post explicitly names the quota object and gives a
-    # future action inside the next 24 hours.  Completed resets never alert.
-    for event in pending:
-        text = _signal_text(event)
-        target_clear = any(term in text for term in target_terms) and any(term in text for term in quota_terms)
-        explicit_future = any(term in text for term in future_actions)
-        effective = _signal_time(event, "effectiveAt", "resetAt")
-        within_24h = effective is not None and now < effective <= now + timedelta(hours=24)
-        if target_clear and explicit_future and within_24h:
-            evidence = _text(event.get("titleZh") or event.get("title"), 180) or "官方明确承诺未来 24 小时内调整 Codex 使用额度。"
-            alert = {
-                "level": "A",
-                "evidence": evidence,
-                "window": _iso(effective) if effective else "未来24小时内（北京时间）",
-                "advice": "按实际需求使用额度，并核对官方执行情况。",
-                "sourceUrls": [safe_url] if (safe_url := _safe_public_link(event.get("url"))) else [],
-                "signalIds": [event.get("id")],
-            }
-            break
-    else:
-        alert = None
-
-    if alert is None:
-        official_quota_signals = []
-        for item in [*pending, *recent_posts]:
-            text = _signal_text(item)
-            if any(term in text for term in target_terms) and any(term in text for term in quota_terms):
-                official_quota_signals.append(item)
-        active_compensation_incidents = []
-        for incident in recent_incidents:
-            text = _signal_text(incident)
-            active = str(incident.get("status") or "").casefold() not in {"resolved", "completed"}
-            if active and "codex" in text and any(term in text for term in quota_terms) and any(term in text for term in compensation_terms):
-                active_compensation_incidents.append(incident)
-        score = predictor_score
-        ambiguous_pending = next((item for item in pending if item in official_quota_signals), None)
-        independent_signal = next(iter(official_quota_signals or active_compensation_incidents), None)
-        if active_compensation_incidents:
-            incident = active_compensation_incidents[0]
-            alert = {
-                "level": "B",
-                "evidence": _text(incident.get("nameZh") or incident.get("name"), 180) or "OpenAI 官方确认 Codex 额度或容量故障并暗示补偿。",
-                "window": "执行时间尚未明确（北京时间）",
-                "advice": "继续观察",
-                "sourceUrls": [safe_url] if (safe_url := _safe_public_link(incident.get("url"))) else [],
-                "signalIds": [incident.get("id")],
-            }
-        elif ambiguous_pending is not None:
-            alert = {
-                "level": "B",
-                "evidence": _text(ambiguous_pending.get("titleZh") or ambiguous_pending.get("title"), 180) or "官方回复链高度指向 Codex 额度重置，但范围或时间仍有歧义。",
-                "window": "预计时间仍有歧义（北京时间）",
-                "advice": "继续观察",
-                "sourceUrls": [safe_url] if (safe_url := _safe_public_link(ambiguous_pending.get("url"))) else [],
-                "signalIds": [ambiguous_pending.get("id")],
-            }
-        elif score >= 70 and independent_signal is not None:
-            alert = {
-                "level": "B",
-                "evidence": f"公开预测为 {round(score):g}%，且存在独立官方额度信号。",
-                "window": "预计时间尚未明确（北京时间）",
-                "advice": "继续观察",
-                "sourceUrls": [safe_url] if (safe_url := _safe_public_link(independent_signal.get("url"))) else [],
-                "signalIds": [independent_signal.get("id")],
-                "predictorConflict": False,
-            }
-
-    if alert is None:
-        checked = _parse_time(forecast.get("checkedAt"))
-        if not (predictor_score >= COMMUNITY_ALERT_THRESHOLD and checked is not None
-                and now - COMMUNITY_SIGNAL_MAX_AGE <= checked <= now + timedelta(minutes=5)):
-            return None
-        predictor = _mapping(forecast.get("predictor"))
-        band = "high" if predictor_score >= 90 else "elevated"
-        alert = {
-            "level": "P", "kind": "community-prediction", "score": min(100, predictor_score),
-            "evidence": f"社区信号分为 {min(100, round(predictor_score)):g}/100；这是预测评分，不是重置发生概率或官方承诺。",
-            "window": "实际发生时间未确认", "advice": "留意官方确认，按实际需求使用额度，不必为预测刻意消耗。",
-            "sourceUrls": [PUBLIC_FORECAST_URL],
-            "signalIds": [f"community:{predictor.get('latestResetAt') or 'unknown'}:{band}"],
-            "sourceCheckedAt": _iso(checked), "expiresAt": _iso(checked + COMMUNITY_SIGNAL_MAX_AGE),
-        }
-    if predictor_score < 70 and alert.get("sourceUrls"):
-        alert["predictorConflict"] = True
-        alert["evidence"] = (
-            f"{_text(alert.get('evidence'), 145) or ''}；预测站为 {round(predictor_score):g}%，以官方原帖为准。"
-        )[:220]
-    alert["detectedAt"] = _iso(now)
-    signature_source = json.dumps(
-        {"level": alert["level"], "ids": alert.get("signalIds"), "window": alert.get("window")},
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    alert["signature"] = hashlib.sha256(signature_source.encode("utf-8")).hexdigest()[:24]
-    return alert
-
-
-def _monitor_slot(now: datetime) -> datetime | None:
-    local = _aware(now).astimezone(BEIJING_TIMEZONE)
-    if MONITOR_START_HOUR <= local.hour <= MONITOR_END_HOUR:
-        return local.replace(minute=0, second=0, microsecond=0)
-    return None
+def classify_reset_alert(forecast, status_incidents, *, since, now):
+    return monitor_engine.classify_reset_alert(forecast, status_incidents, since=since, now=now)
 
 
 def next_monitor_time(now: datetime, last_slot: Any = None) -> datetime:
-    local = _aware(now).astimezone(BEIJING_TIMEZONE)
-    parsed_last = _parse_time(last_slot)
-    last_local = parsed_last.astimezone(BEIJING_TIMEZONE) if parsed_last else None
-    current_slot = _monitor_slot(local)
-    if current_slot is not None and local.minute == 0 and (
-        last_local is None or last_local.replace(minute=0, second=0, microsecond=0) != current_slot
-    ):
-        return current_slot.astimezone(timezone.utc)
-    if local.hour < MONITOR_START_HOUR:
-        candidate = local.replace(hour=MONITOR_START_HOUR, minute=0, second=0, microsecond=0)
-    elif local.hour >= MONITOR_END_HOUR:
-        candidate = (local + timedelta(days=1)).replace(hour=MONITOR_START_HOUR, minute=0, second=0, microsecond=0)
-    else:
-        candidate = (local + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    return candidate.astimezone(timezone.utc)
+    return monitor_engine.next_monitor_time(now, last_slot)
 
 
 def _default_state() -> dict:
@@ -1924,6 +1892,14 @@ class RadarCache:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return _default_state()
+        if isinstance(value, dict) and value.get("schemaVersion") == 4:
+            # Revalidate changed parsers without losing historical evidence or
+            # previously delivered alert identities during a routine upgrade.
+            migrated = _default_state()
+            for field in ("resetHistoryLedger", "monitor", "machineTranslations"):
+                if isinstance(value.get(field), dict):
+                    migrated[field] = value[field]
+            return migrated
         if not isinstance(value, dict) or value.get("schemaVersion") != CACHE_SCHEMA_VERSION:
             return _default_state()
         if not isinstance(value.get("sections"), dict) or not isinstance(value.get("validators"), dict):
@@ -1983,7 +1959,7 @@ class RadarCache:
             if size > MAX_CACHE_BYTES:
                 raise RadarSchemaError("雷达缓存超过安全大小限制。")
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(value, dict) or value.get("schemaVersion") != CACHE_SCHEMA_VERSION:
+            if not isinstance(value, dict) or value.get("schemaVersion") not in (4, CACHE_SCHEMA_VERSION):
                 raise RadarSchemaError("雷达缓存版本或结构无效。")
             if not isinstance(value.get("sections"), dict) or not isinstance(value.get("validators"), dict):
                 raise RadarSchemaError("雷达缓存缺少 sections 或 validators。")
@@ -2316,24 +2292,7 @@ class RadarService:
             event.get("occurredAt") or event.get("publishedAt") or event.get("discoveredAt") or ""), reverse=True)
 
     def _evaluate_refreshed_forecast(self, forecast: Mapping[str, Any], now: datetime) -> dict:
-        """Evaluate already-fetched data: no additional network or translation."""
-        monitor = {**_default_state()["monitor"], **_mapping(self._state.get("monitor"))}
-        alert = classify_reset_alert(forecast, [], since=now - timedelta(hours=24), now=now)
-        seen = [str(item) for item in _list(monitor.get("seenAlertSignatures"))]
-        new_alert = bool(alert and alert["signature"] not in seen)
-        if new_alert:
-            seen.append(alert["signature"])
-        result_label = "预测预警" if alert and alert.get("level") == "P" else f"{alert['level']}级预警" if alert else "无新增预警"
-        checked = _parse_time(forecast.get("checkedAt"))
-        if checked is not None and checked < now - COMMUNITY_SIGNAL_MAX_AGE:
-            result_label = "来源数据已过期，暂不发出预测预警"
-        monitor.update(lastRunAt=_iso(now), lastSuccessAt=_iso(now), lastCheckMode="manual-refresh",
-                       lastSourceCheckedAt=forecast.get("checkedAt"), lastResult=result_label,
-                       lastAlert=alert, lastError=None, seenAlertSignatures=seen[-128:])
-        monitor["runs"] = [{"at": _iso(now), "result": result_label, "mode": "manual-refresh",
-                            "sourceCheckedAt": forecast.get("checkedAt")}, *_list(monitor.get("runs"))[:95]]
-        self._state["monitor"] = monitor
-        return {"alert": alert, "newAlert": new_alert}
+        return monitor_engine.evaluate_reset_refresh(self, {"forecastSignals": forecast}, now)
 
     def _record_reset_refresh_failure(self, now: datetime, error: Exception) -> None:
         monitor = {**_default_state()["monitor"], **_mapping(self._state.get("monitor"))}
@@ -2504,6 +2463,7 @@ class RadarService:
             return {str(key): _mapping(value) for key, value in cached.items() if isinstance(value, dict)}
         translations = parse_public_html_translations(response.body)
         self._state["postTranslations"] = translations
+        self._state["publicHtmlCards"] = parse_public_html_cards(response.body)
         return translations
 
     @staticmethod
@@ -2775,6 +2735,18 @@ class RadarService:
         forecast_not_modified = False
         post_translations: dict[str, dict[str, str]] = {}
         supplemental_errors: dict[str, list[str]] = {}
+        html_cards = {}
+        html_error = None
+        if sections & {"quota", "reset"}:
+            try:
+                post_translations = self._fetch_public_post_translations()
+                html_cards = _mapping(self._state.get("publicHtmlCards"))
+            except Exception as exc:
+                html_error = exc
+                remember_retry_after(exc)
+                for section in sections & {"quota", "reset"}:
+                    supplemental_errors.setdefault(section, []).append(f"公开网页补充失败：{str(exc)[:240]}")
+                html_cards = _mapping(self._state.get("publicHtmlCards"))
         if summary_error is not None:
             for name in sections & {"intelligence", "reset"}:
                 supplemental_errors.setdefault(name, []).append(
@@ -2803,17 +2775,17 @@ class RadarService:
                     isinstance(item, dict) and item.get("id")
                     for item in (forecast.get("posts", []) or [])
                 ):
-                    try:
-                        post_translations = self._fetch_public_post_translations()
-                        self._merge_forecast_translations(forecast, post_translations)
-                    except Exception as exc:
-                        remember_retry_after(exc)
-                        # The forecast remains useful even if the reviewed
-                        # HTML companion cannot be reached.
-                        supplemental_errors.setdefault("reset", []).append(
-                            f"中文译文补充失败：{str(exc)[:240]}"
-                        )
+                    self._merge_forecast_translations(forecast, post_translations)
                 self._translate_missing_forecast_posts(forecast)
+
+        status_incidents = []
+        status_refreshed = False
+        if "reset" in sections:
+            status_incidents = monitor_engine.fetch_status_for_refresh(self, now, remember_retry_after)
+            status_monitor = _mapping(self._state.get("monitor"))
+            status_refreshed = status_monitor.get("statusLastSuccessAt") == _iso(now) and not status_monitor.get("statusError")
+            if status_monitor.get("statusError"):
+                supplemental_errors.setdefault("reset", []).append(str(status_monitor["statusError"])[:300])
 
         for name in sections:
                 if name in failures:
@@ -2842,13 +2814,17 @@ class RadarService:
                     source_healthy = summary_not_modified and bool(previous)
                     if name == "intelligence":
                         source_healthy = source_healthy or intelligence_metrics is not None or intelligence_not_modified
+                    elif name == "quota":
+                        source_healthy = source_healthy or bool(html_cards.get("quota"))
                     elif name == "reset":
                         source_healthy = (
                             source_healthy
+                            or status_refreshed
                             or reset_events is not None
                             or (reset_events_not_modified and bool(previous.get("events")))
                             or forecast is not None
                             or (forecast_not_modified and bool(previous.get("forecastSignals")))
+                            or bool(html_cards.get("resetHistory"))
                         )
                     if not source_healthy:
                         not_modified_without_cache = (
@@ -2870,7 +2846,7 @@ class RadarService:
                 if name == "intelligence":
                     if isinstance(intelligence_metrics, dict):
                         section_data.update(intelligence_metrics)
-                    elif previous.get("mode") == "composite-geomean" and _list(previous.get("items")):
+                    elif previous.get("mode") == "composite-weighted-mean" and _list(previous.get("items")):
                         # A composite is meaningful only when both public
                         # dimensions are available. Never replace it with the
                         # single-dimension summary after a 304 or partial error.
@@ -2885,7 +2861,7 @@ class RadarService:
                         ):
                             if key in previous:
                                 section_data[key] = previous[key]
-                    if section_data.get("mode") != "composite-geomean":
+                    if section_data.get("mode") != "composite-weighted-mean":
                         failures[name] = RadarSchemaError(
                             "综合智能需要软件工程与视觉空间两项公开评分，当前未取得完整数据。"
                         )
@@ -2893,6 +2869,16 @@ class RadarService:
                     if not _list(section_data.get("items")) and not _list(section_data.get("comparisons")):
                         failures[name] = RadarSchemaError("智力效率接口没有返回可用的综合智能评分。")
                         continue
+                elif name == "quota":
+                    if previous.get("measurement") == "community-measured" and (html_error or not html_cards.get("quota")):
+                        failures[name] = html_error or RadarSchemaError("公开网页未返回额度实测卡片，保留上次实测并等待源站恢复。")
+                        continue
+                    if html_cards.get("quota"):
+                        section_data.update(html_cards["quota"])
+                    elif previous.get("measurement") == "community-measured":
+                        section_data = dict(previous)
+                    else:
+                        section_data["legacySnapshot"] = True
                 elif name == "reset":
                     if reset_events is not None:
                         section_data["events"] = reset_events
@@ -2904,9 +2890,12 @@ class RadarService:
                     elif previous.get("forecastSignals"):
                         section_data["forecastSignals"] = previous.get("forecastSignals")
                         section_data["predictionSource"] = previous.get("predictionSource")
+                    if html_cards:
+                        section_data["monthlyHistory"] = html_cards.get("monthlyHistory", [])
+                        section_data["resetHistory"] = html_cards.get("resetHistory", [])
                     self._retain_reset_history(section_data, now)
-                    if forecast is not None or (forecast_not_modified and section_data.get("forecastSignals")):
-                        reset_evaluation = self._evaluate_refreshed_forecast(section_data["forecastSignals"], now)
+                    section_data["statusIncidents"] = status_incidents
+                    reset_evaluation = monitor_engine.evaluate_reset_refresh(self, section_data, now)
                     # Revisit cached failed/pending fields on every successful
                     # reset refresh, including when one source returned 304.
                     self._translate_reset_payload(section_data, include_forecast=not isinstance(forecast, dict))
@@ -2922,13 +2911,15 @@ class RadarService:
                 else:
                     section_data.pop("supplementalErrors", None)
 
-                actually_changed = summary is not None
+                actually_changed = summary is not None or bool(html_cards and name in {"quota", "reset"})
                 if name == "intelligence":
                     actually_changed = actually_changed or intelligence_metrics is not None
                 elif name == "reset":
-                    actually_changed = actually_changed or reset_events is not None or forecast is not None
+                    actually_changed = actually_changed or reset_events is not None or forecast is not None or status_refreshed
                 if actually_changed:
-                    if summary is not None:
+                    if name == "quota" and html_cards.get("quota"):
+                        url, format_name = PUBLIC_HTML_URL, "html"
+                    elif summary is not None:
                         url = PUBLIC_SUMMARY_URL if summary_format == "json" else PUBLIC_HTML_URL
                         format_name = (summary or {}).get("format", summary_format)
                     elif name == "intelligence" and intelligence_metrics is not None:
@@ -3018,180 +3009,13 @@ class RadarService:
         return result
 
     def monitor_status(self) -> dict:
-        with self._lock:
-            defaults = _default_state()["monitor"]
-            current = _mapping(self._state.get("monitor"))
-            status = {**defaults, **current}
-            status["timezone"] = "Asia/Shanghai"
-            status["schedule"] = "每天 08:00—23:00，每个整点"
-            status["nextCheckAt"] = _iso(next_monitor_time(self._now(), status.get("lastRunSlot")))
-            return _bounded_json(status)
+        return monitor_engine.monitor_status(self)
 
     def seconds_until_next_monitor(self) -> float:
-        with self._lock:
-            now = self._now()
-            next_at = next_monitor_time(now, _mapping(self._state.get("monitor")).get("lastRunSlot"))
-            return max(0.0, (next_at - now).total_seconds())
-
-    def _prepare_monitor_run(self, force: bool) -> dict:
-        """Claim one scheduled slot across processes before fetching sources."""
-
-        now = self._now()
-        local = now.astimezone(BEIJING_TIMEZONE)
-        slot = _monitor_slot(now)
-        monitor_lock = self.cache.path.with_suffix(self.cache.path.suffix + ".monitor.lock")
-        with _exclusive_cache_file_lock(monitor_lock, timeout=30.0):
-            # A second manager process may have completed this slot after this
-            # service instance loaded its in-memory snapshot.
-            self._state = self.cache.load()
-            self._persisted_state = copy.deepcopy(self._state)
-            monitor = {**_default_state()["monitor"], **_mapping(self._state.get("monitor"))}
-            if not force and slot is None:
-                monitor["nextCheckAt"] = _iso(next_monitor_time(now, monitor.get("lastRunSlot")))
-                self._state["monitor"] = monitor
-                self._persist_state()
-                return {
-                    "response": {
-                        "attempted": False,
-                        "suppressed": "outside-schedule",
-                        "state": _bounded_json(monitor),
-                        "newAlert": False,
-                    }
-                }
-            if not force and _parse_time(monitor.get("lastRunSlot")) == slot.astimezone(timezone.utc):
-                monitor["nextCheckAt"] = _iso(next_monitor_time(now, monitor.get("lastRunSlot")))
-                return {
-                    "response": {
-                        "attempted": False,
-                        "suppressed": "already-checked",
-                        "state": _bounded_json(monitor),
-                        "newAlert": False,
-                    }
-                }
-
-            last_success = _parse_time(monitor.get("lastSuccessAt"))
-            if last_success is None or last_success.astimezone(BEIJING_TIMEZONE).date() < local.date():
-                since = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-                catchup = True
-            else:
-                # A short overlap catches a late-arriving source record. Seen
-                # signatures keep the overlap from producing repeat alerts.
-                since = last_success - timedelta(minutes=5)
-                catchup = False
-
-            monitor["lastRunAt"] = _iso(now)
-            monitor["lastRunSlot"] = _iso(
-                (slot or local.replace(minute=0, second=0, microsecond=0)).astimezone(timezone.utc)
-            )
-            monitor["catchupFromMidnight"] = catchup
-            self._state["monitor"] = monitor
-            # Persist the claim before network access. A concurrent process
-            # will observe the slot and avoid duplicate notification work.
-            self._persist_state()
-            return {
-                "now": now,
-                "monitor": monitor,
-                "since": since,
-                "catchup": catchup,
-            }
+        return monitor_engine.seconds_until_next_monitor(self)
 
     def run_monitor(self, *, force: bool = False) -> dict:
-        """Run one conservative scheduled reset check without model calls."""
-        with self._lock:
-            prepared = self._prepare_monitor_run(force)
-            if prepared.get("response"):
-                return prepared["response"]
-            now = prepared["now"]
-            monitor = prepared["monitor"]
-            since = prepared["since"]
-            catchup = bool(prepared["catchup"])
-            try:
-                forecast, forecast_not_modified = self._fetch_forecast()
-                reset_entry = _mapping(_mapping(self._state.get("sections")).get("reset"))
-                reset_data = dict(_mapping(reset_entry.get("data")))
-                cached_forecast = _mapping(reset_data.get("forecastSignals")) or _mapping(monitor.get("lastForecast"))
-                if forecast is None and forecast_not_modified:
-                    forecast = cached_forecast
-                if not forecast:
-                    raise RadarError("预测源返回 304，但本地没有可用缓存。")
-                if any(
-                    isinstance(item, dict) and item.get("id")
-                    for item in (forecast.get("posts", []) or [])
-                ):
-                    try:
-                        translations = self._fetch_public_post_translations()
-                        self._merge_forecast_translations(forecast, translations)
-                    except Exception:
-                        # Scheduled monitoring must keep running even when the
-                        # companion translation page is unavailable.
-                        pass
-                self._translate_missing_forecast_posts(forecast)
-                status_incidents, status_not_modified = self._fetch_status_incidents()
-                if status_incidents is None and status_not_modified:
-                    cached_incidents = monitor.get("lastStatusIncidents")
-                    if not isinstance(cached_incidents, list):
-                        raise RadarError("OpenAI 状态源返回 304，但本地没有对应缓存。")
-                    status_incidents = [item for item in cached_incidents if isinstance(item, dict)]
-                status_incidents = self._translate_status_incidents(status_incidents or [])
-                alert = classify_reset_alert(forecast, status_incidents, since=since, now=now)
-                seen = [str(item) for item in _list(monitor.get("seenAlertSignatures")) if str(item)]
-                new_alert = bool(alert and alert.get("signature") not in seen)
-                if alert and alert.get("signature") not in seen:
-                    seen.append(str(alert["signature"]))
-                monitor.update({
-                    "lastSuccessAt": _iso(now),
-                    "lastError": None,
-                    "lastResult": "预测预警" if alert and alert.get("level") == "P" else f"{alert['level']}级预警" if alert else "无预警",
-                    "lastCheckMode": "manual-check" if force else "scheduled",
-                    "lastSourceCheckedAt": forecast.get("checkedAt"),
-                    "lastAlert": alert,
-                    "seenAlertSignatures": seen[-128:],
-                    "lastStatusIncidents": status_incidents[:40],
-                    "lastForecast": forecast,
-                })
-                run_record = {
-                    "at": _iso(now),
-                    "result": monitor["lastResult"],
-                    "catchupFromMidnight": catchup,
-                }
-                monitor["runs"] = [run_record, *_list(monitor.get("runs"))[:95]]
-                reset_data["forecastSignals"] = forecast
-                reset_data["predictionSource"] = forecast.get("predictor")
-                reset_data["monitor"] = {
-                    key: monitor.get(key)
-                    for key in (
-                        "lastRunAt", "lastSuccessAt", "lastResult", "lastError", "lastAlert",
-                        "catchupFromMidnight", "runs",
-                    )
-                }
-                self._retain_reset_history(reset_data, now)
-                self._translate_reset_payload(reset_data, include_forecast=False)
-                reset_entry = dict(reset_entry)
-                reset_entry["data"] = reset_data
-                reset_entry["fetchedAt"] = _iso(now)
-                reset_entry.setdefault("source", {"url": PUBLIC_FORECAST_URL, "format": "json", "degraded": False})
-                self._state.setdefault("sections", {})["reset"] = reset_entry
-            except Exception as exc:
-                alert = None
-                new_alert = False
-                monitor.update({
-                    "lastError": str(exc)[:300],
-                    "lastResult": "检查失败",
-                })
-                monitor["runs"] = [
-                    {"at": _iso(now), "result": "检查失败", "catchupFromMidnight": catchup},
-                    *_list(monitor.get("runs"))[:95],
-                ]
-            monitor["nextCheckAt"] = _iso(next_monitor_time(now + timedelta(seconds=1), monitor.get("lastRunSlot")))
-            self._state["monitor"] = monitor
-            self._persist_state()
-            return {
-                "attempted": True,
-                "success": monitor.get("lastError") is None,
-                "alert": _bounded_json(alert),
-                "newAlert": new_alert,
-                "state": _bounded_json(monitor),
-            }
+        return monitor_engine.run_monitor(self, force=force)
 
     def get_intelligence(self, *, refresh: bool = False, startup: bool = False) -> dict:
         with self._lock:
@@ -3226,13 +3050,11 @@ class RadarService:
         refresh: bool = False,
         startup: bool = False,
     ) -> dict:
+        refresh_result = None
+        if refresh or (startup and not self._startup_attempted):
+            self._startup_attempted = True
+            refresh_result = self.run_monitor(force=True)
         with self._lock:
-            refresh_result = None
-            if startup and not self._startup_attempted:
-                self._startup_attempted = True
-                refresh_result = self._refresh({"reset"})
-            elif refresh:
-                refresh_result = self._refresh({"reset"})
             result = self._section("reset", refresh_result=refresh_result)
             result["data"] = merge_reset_metadata(result["data"], accounts)
             result["data"]["monitor"] = self.monitor_status()
@@ -3253,9 +3075,22 @@ class RadarService:
                 self._startup_attempted = True
             if should_start or refresh:
                 sections = {"intelligence", "reset"}
+                # The backend monitor and first UI snapshot share this lock.
+                # Reuse only a recent completion in this service instance;
+                # an old process's cache must not suppress a new startup.
+                recent_reset = getattr(self, "_monitor_last_finished", None)
+                if not refresh and recent_reset is not None and timedelta(0) <= self._now() - recent_reset < timedelta(seconds=30):
+                    sections.discard("reset")
                 if self._quota_due(self._now()):
                     sections.add("quota")
                 refresh_result = self._refresh(sections)
+                if "reset" in sections and refresh_result.get("attempted") and refresh_result.get("success") and "reset" not in _mapping(self._state.get("sectionErrors")):
+                    self._monitor_last_finished = self._now()
+                    self._state.setdefault("monitor", {})["lastRefreshFinishedAt"] = _iso(self._monitor_last_finished)
+                    self._persist_state()
+                wake_monitor = getattr(self, "_monitor_wake_callback", None)
+                if refresh_result.get("newAlert") and callable(wake_monitor):
+                    wake_monitor()
             intelligence = self._section("intelligence", refresh_result=refresh_result)
             quota = self._section("quota", refresh_result=refresh_result)
             reset = self._section("reset", refresh_result=refresh_result)
@@ -3302,6 +3137,7 @@ __all__ = [
     "parse_public_feed",
     "parse_public_forecast",
     "parse_public_html",
+    "parse_public_html_cards",
     "parse_public_html_translations",
     "parse_machine_translation",
     "_auto_translate_public_text",

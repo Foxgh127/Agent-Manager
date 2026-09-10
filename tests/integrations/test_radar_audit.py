@@ -88,8 +88,8 @@ class RadarAuditV8Tests(unittest.TestCase):
         self.assertIn("304", result["error"])
 
     def test_two_stale_monitor_instances_emit_one_new_alert(self):
-        first = radar.RadarService(self.cache, clock=self.clock)
-        second = radar.RadarService(self.cache, clock=self.clock)
+        first = radar.RadarService(self.cache, clock=self.clock, opener=QueueOpener([]))
+        second = radar.RadarService(self.cache, clock=self.clock, opener=QueueOpener([]))
         forecast = alert_forecast()
         with (
             patch.object(first, "_fetch_forecast", return_value=(copy.deepcopy(forecast), False)),
@@ -104,7 +104,7 @@ class RadarAuditV8Tests(unittest.TestCase):
 
         self.assertTrue(first_result["newAlert"])
         self.assertFalse(second_result["newAlert"])
-        self.assertEqual(second_result["suppressed"], "already-checked")
+        self.assertEqual(second_result["suppressed"], "recent-check")
         second_fetch.assert_not_called()
 
     def test_effective_reset_time_uses_nearest_year_at_new_year_boundary(self):
@@ -120,7 +120,7 @@ class RadarAuditV8Tests(unittest.TestCase):
         self.assertEqual(parsed[0]["resetAt"], "2027-01-01T01:00:00Z")
 
     def test_monitor_cache_contains_no_notification_delivery_side_effects(self):
-        service = radar.RadarService(self.cache, clock=self.clock)
+        service = radar.RadarService(self.cache, clock=self.clock, opener=QueueOpener([]))
         with (
             patch.object(service, "_fetch_forecast", return_value=(alert_forecast(), False)),
             patch.object(service, "_fetch_status_incidents", return_value=([], False)),
@@ -152,16 +152,17 @@ class RadarAuditV8Tests(unittest.TestCase):
         self.assertIsNone(radar.classify_reset_alert(cancelled, [], since=since, now=now))
         self.assertIsNone(radar.classify_reset_alert(completed_post, [], since=since, now=now))
 
-    def test_status_304_without_monitor_cache_is_not_treated_as_empty_authority(self):
-        service = radar.RadarService(self.cache, clock=self.clock)
+    def test_status_304_without_cache_keeps_independent_forecast_and_reports_status_error(self):
+        service = radar.RadarService(self.cache, clock=self.clock, opener=QueueOpener([]))
         with (
             patch.object(service, "_fetch_forecast", return_value=({"predictor": {}, "posts": [], "resetEvents": []}, False)),
             patch.object(service, "_fetch_status_incidents", return_value=(None, True)),
             patch.object(service, "_translate_missing_forecast_posts", side_effect=lambda value: value),
         ):
             result = service.run_monitor()
-        self.assertFalse(result["success"])
-        self.assertIn("304", result["state"]["lastError"])
+        self.assertTrue(result["success"])
+        self.assertIn("304", result["state"]["statusError"])
+        self.assertFalse(result["newAlert"])
 
     def test_corrupt_future_cadence_and_failure_count_fail_open_for_refresh(self):
         state = radar._default_state()

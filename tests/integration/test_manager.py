@@ -8931,7 +8931,7 @@ class AgentManagerTests(unittest.TestCase):
         self.assertEqual(calls, ["account", "updates"])
         start_radar.assert_not_called()
 
-    def test_radar_monitor_compatibility_hook_never_polls_in_background(self):
+    def test_disabled_radar_monitor_never_polls_in_background(self):
         runtime = object.__new__(app.ManagerRuntime)
         runtime.radar_monitor_stop = threading.Event()
         runtime.radar_monitor_wake = threading.Event()
@@ -8946,8 +8946,9 @@ class AgentManagerTests(unittest.TestCase):
         calls = []
         runtime.radar = type("FakeRadar", (), {"run_monitor": lambda _self: calls.append("network")})()
 
-        runtime._start_radar_monitor()
-        time.sleep(0.15)
+        with patch.object(core, "load_settings", return_value={"appBehavior": {"radarMonitoring": False}}):
+            runtime._start_radar_monitor()
+            time.sleep(0.15)
 
         self.assertIsNone(runtime.radar_monitor_thread)
         self.assertEqual(calls, [])

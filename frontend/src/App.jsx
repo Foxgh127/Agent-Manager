@@ -13,6 +13,7 @@ import { Modal, ConfirmDialog } from "./components/Dialog.jsx";
 import RecoveryPanel from "./components/RecoveryPanel.jsx";
 import ConfigRecoveryPanel from "./components/ConfigRecoveryPanel.jsx";
 import AppUpdatePanel from "./components/AppUpdatePanel.jsx";
+import { loadAppUpdate } from "./appUpdateResource.js";
 import RelayOriginNotice from "./components/RelayOriginNotice.jsx";
 import SessionSyncModal from "./components/SessionSyncModal.jsx";
 import SessionRepairPanel from "./components/SessionRepairPanel.jsx";
@@ -180,6 +181,7 @@ let oauthLoginHelperDraft = "";
 let oauthLoginHelperSessionId = "";
 let skillsResourceCache = null;
 let maintenanceResourceCache = null;
+let maintenanceStartupPromise = null;
 let usageResourceCache = null;
 let radarResourceCache = { loaded: false, payload: null, error: "" };
 let startupResourceRefreshPromise = null;
@@ -390,11 +392,22 @@ async function api(path, options = {}) {
 
 function refreshStartupResourcesOnce() {
   if (startupResourceRefreshPromise) return startupResourceRefreshPromise;
+  maintenanceStartupPromise = Promise.allSettled([
+    api("/api/updates/check", { method: "POST", body: "{}" }),
+    api("/api/emergency/checks?force=1", { timeoutMs: 120000 }),
+    loadAppUpdate(api, { force: true }),
+  ]).then(([updates, checks]) => {
+    maintenanceResourceCache = {
+      updates: updates.status === "fulfilled" ? updates.value : null,
+      checks: checks.status === "fulfilled" ? checks.value : null,
+      error: [updates, checks].filter(item => item.status === "rejected").map(item => item.reason?.message).filter(Boolean).join("；"),
+    };
+    return maintenanceResourceCache;
+  });
   startupResourceRefreshPromise = Promise.allSettled([
-    api("/api/radar"),
-    api("/api/updates"),
-    api("/api/emergency/checks"),
-  ]).then(async ([radar, updates, checks]) => {
+    api("/api/radar", { timeoutMs: 120000 }),
+    maintenanceStartupPromise,
+  ]).then(async ([radar]) => {
     if (radar.status === "fulfilled") {
       radarResourceCache = { loaded: true, payload: radar.value, error: "" };
     } else {
@@ -404,15 +417,6 @@ function refreshStartupResourcesOnce() {
         error: radar.reason?.message || "雷达首次读取失败。",
       };
     }
-    const maintenanceErrors = [updates, checks]
-      .filter((item) => item.status === "rejected")
-      .map((item) => item.reason?.message)
-      .filter(Boolean);
-    maintenanceResourceCache = {
-      updates: updates.status === "fulfilled" ? updates.value : null,
-      checks: checks.status === "fulfilled" ? checks.value : null,
-      error: maintenanceErrors.join("；"),
-    };
     // Startup reads persistent inventories. Full discovery and remote catalog
     // refresh remain explicit actions on the corresponding management page.
     const [installed, catalog] = await Promise.allSettled([
@@ -9265,6 +9269,7 @@ function radarSourceChinese(value) {
 
 function radarTone(item) {
   const value = `${item?.family || ""} ${item?.model || ""}`.toLowerCase();
+  if (value.includes("astra")) return "astra";
   if (value.includes("sol")) return "sol";
   if (value.includes("terra")) return "terra";
   if (value.includes("luna")) return "luna";
@@ -9277,6 +9282,7 @@ function radarFamilyLabel(value) {
   const text = radarText(value, "Codex");
   const normalized = text.trim().toLowerCase();
   const labels = [
+    ["astra", "Astra"],
     ["dsh-deepseek-v4-flash", "DSH Flash"],
     ["dsh-deepseek-v4-pro", "DSH Pro"],
     ["deepseek-v4-flash", "DSV4 Flash"],
@@ -9298,7 +9304,7 @@ function radarFamilyLabel(value) {
 
 const radarEffortOrder = { ultra: 0, max: 1, xhigh: 2, high: 3, medium: 4, low: 5 };
 const radarEffortColumn = { ultra: 1, max: 2, xhigh: 3, high: 4, medium: 5, low: 6, off: 6 };
-const radarFamilyOrder = { sol: 0, terra: 1, luna: 2, gpt55: 3, deepseek: 4, default: 9 };
+const radarFamilyOrder = { astra: 0, sol: 1, terra: 2, luna: 3, gpt55: 4, deepseek: 5, default: 9 };
 
 function radarIq(value) {
   const number = Number(value);
@@ -9447,7 +9453,7 @@ function RadarView({ data, updateData, notify }) {
     try {
       const result = await api("/api/app-behavior", {method:"POST",body:JSON.stringify({radarMonitoring:enabled})});
       updateData(current => ({...current,settings:{...current.settings,appBehavior:result.behavior}}));
-      notify(enabled ? "后台预警已开启，管理器运行时在北京时间整点检查" : "后台预警已暂停，仍可手动检查");
+      notify(enabled ? "后台预警已开启，立即检查后每小时自动更新" : "后台预警已暂停，仍可手动检查");
       if (enabled) await checkResetNow();
     } catch (error) { notify(error.message,"error"); }
     finally { setRefreshing(current => ({...current,monitor:false})); }
@@ -9504,7 +9510,7 @@ function RadarView({ data, updateData, notify }) {
       error: sectionErrors[section] || remoteError,
       source: radarText(radarField(data, ["source", "sourceLabel"], radarField(meta, ["source", "sourceLabel", "provenance"], defaultSource))),
       confidence: radarText(radarField(data, ["confidence", "confidenceLabel"], radarField(meta, ["confidence", "confidenceLabel", "certainty"], "未标注"))),
-      updatedAt: radarDate(radarField(data, ["updatedAt", "fetchedAt", "sourceUpdatedAt"], radarField(meta, ["updatedAt", "fetchedAt", "checkedAt"], null))),
+      updatedAt: data?.sourceUpdatedText || radarDate(radarField(data, ["updatedAt", "fetchedAt", "sourceUpdatedAt"], radarField(meta, ["updatedAt", "fetchedAt", "checkedAt"], null))),
       refreshSuppressed: Boolean(radarField(data, ["refreshSuppressed"], radarField(meta, ["refreshSuppressed"], false))),
       nextRefreshAt: radarDate(radarField(data, ["nextWeeklyRefreshAt", "nextRefreshAt", "nextAllowedAt"], radarField(meta, ["nextAllowedAt"], null))),
       feedback: sectionMessages[section] || null,
@@ -9512,7 +9518,7 @@ function RadarView({ data, updateData, notify }) {
   };
 
   const intelligenceState = sectionState("intelligence", intelligence, "社区公开基准与经验报告");
-  const quotaState = sectionState("quota", quota, "本地账号状态与订阅信息");
+  const quotaState = sectionState("quota", quota, quota?.measurement === "community-measured" ? "Codex Radar 社区实测" : "本地账号状态与订阅信息");
   const resetState = sectionState("reset", reset, "OpenAI 公开活动与本地账号状态");
   const renderState = (state) => (
     <footer className="radar-card-footer">
@@ -9573,7 +9579,7 @@ function RadarView({ data, updateData, notify }) {
           <div className="radar-intelligence-meta">
             <span>
               <RefreshCw size={13} />
-              数据截至 {intelligenceState.updatedAt} · 综合智能按软件工程与视觉空间两项等权合成
+              数据截至 {intelligenceState.updatedAt} · 按软件工程与视觉空间的有效题量加权
             </span>
             <a href="https://deng.codexradar.com/?harness=codex" target="_blank" rel="noreferrer">
               前往贡献 <ExternalLink size={12} />
@@ -9590,7 +9596,7 @@ function RadarView({ data, updateData, notify }) {
                       return (
                       <article className={cx("radar-score-card", `tone-${radarTone(item)}`)} style={gridColumn ? { gridColumn } : undefined} key={item.id || `${family}-${item.model || item.name || index}`}>
                         <header>
-                          <strong>{radarText(radarField(item, ["label", "name", "model", "modelName"], family)).replace(/^GPT-5\.[56]\s+/i, "")}</strong>
+                          <strong>{radarText(radarField(item, ["label", "name", "model", "modelName"], family)).replace(/^GPT-(?:5\.[56]|6)\s+/i, "")}</strong>
                           <span title="近 24 小时两项能力的有效样本合计">
                             {radarText(radarField(item, ["sampleCount", "samples", "n"], "—"))}
                           </span>
@@ -9637,12 +9643,14 @@ function RadarView({ data, updateData, notify }) {
           {quotaTiers.length ? (
             <div className="radar-tier-table" tabIndex="0" role="region" aria-label="订阅档位额度估算表">
               <table>
-                <thead><tr><th>订阅档位</th><th>7d 额度</th><th>来源</th></tr></thead>
+                <thead><tr><th>订阅与模型</th><th>额度实测 / 估算</th><th>来源</th></tr></thead>
                 <tbody>
                   {quotaTiers.slice(0, 12).map((tier, index) => (
                     <tr key={tier.id || tier.slug || tier.name || index}>
                       <th scope="row">{radarText(radarField(tier, ["label", "name", "title", "plan", "planLabel", "tier"]))}</th>
-                      <td>{radarText(radarField(tier, ["estimated7d", "estimate7d", "weeklyEstimate", "usage7d", "quota"]))}</td>
+                      <td>{tier.amountUsd != null && Number.isFinite(Number(tier.amountUsd))
+                        ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(Number(tier.amountUsd))
+                        : radarText(radarField(tier, ["estimated7d", "estimate7d", "weeklyEstimate", "usage7d", "quota"]))}</td>
                       <td>{radarSourceChinese(radarField(tier, ["sourceLabel", "basis", "source"], "推算"))}</td>
                     </tr>
                   ))}
@@ -9662,7 +9670,7 @@ function RadarView({ data, updateData, notify }) {
             </>
           )}
           <RadarTrend points={quotaTrendPoints} />
-          <div className="radar-weekly-note"><CalendarDays size={15} /><span>7d 估算每周最多更新一次，不以实时剩余额度或账单数据冒充精确值。</span></div>
+          <div className="radar-weekly-note"><CalendarDays size={15} /><span>{quota?.measurement === "community-measured" ? "社区实测只对应所列套餐与模型；来源未注明的测量周期不作推断。可手动刷新读取新记录。" : "自动同步遵循来源更新节奏；手动刷新会重新读取，数据不代表实际账单。"}</span></div>
           {renderState(quotaState)}
         </article>
 
@@ -10426,11 +10434,14 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
     setLoading(false);
   }, []);
   useEffect(() => {
-    // Re-read local diagnostics on entry and after activation: the in-memory
-    // startup promise may contain a pre-activation configuration warning.
-    maintenanceResourceCache = null;
-    load(false);
+    let active = true;
+    if (maintenanceResourceCache) load(false);
+    else {
+      refreshStartupResourcesOnce();
+      maintenanceStartupPromise.then(() => { if (active) load(false); });
+    }
     return () => {
+      active = false;
       ++loadGenerationRef.current;
     };
   }, [load, data.configurationSession?.status]);
@@ -10438,6 +10449,11 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
   const cli = updateComponent(updates, "cli");
   const desktopHasUpdate = hasAvailableUpdate(desktop);
   const cliHasUpdate = hasAvailableUpdate(cli);
+  const desktopMessage = desktop.updateState === "check_failed"
+    ? "上次检查未成功，可点击刷新状态重试"
+    : /checking updates/i.test(String(desktop.message || ""))
+      ? "尚未取得明确的更新结果"
+      : desktop.message || "刷新状态后检查更新";
   const cliStatus = String(cli.status || "").toLowerCase();
   const cliMissing =
     cli.available === false ||
@@ -10582,7 +10598,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
         <AppUpdatePanel api={api} notify={notify} refreshKey={appRefreshKey} />
         <article className="update-component">
           <span className="update-icon codex"><img src="/codex-official.png" alt="" /></span>
-          <div className="update-copy"><small>CODEX DESKTOP</small><strong>{desktop.currentVersion || desktop.installedVersion || "未检测"}</strong><p title={desktop.message}>{desktopHasUpdate === true ? `可更新到 ${desktop.latestVersion || desktop.availableVersion || "新版本"}` : desktopHasUpdate === false ? "Microsoft Store 确认已是最新版" : desktop.message || "刷新状态后检查更新"}</p></div>
+          <div className="update-copy"><small>CODEX DESKTOP</small><strong>{desktop.currentVersion || desktop.installedVersion || "未检测"}</strong><p title={desktop.message}>{desktopHasUpdate === true ? `可更新到 ${desktop.latestVersion || desktop.availableVersion || "新版本"}` : desktopHasUpdate === false ? "Microsoft Store 确认已是最新版" : desktopMessage}</p></div>
           {desktopHasUpdate === true && desktop.canAutoUpdate ? <button className="button secondary compact" disabled={Boolean(working)} onClick={() => action("desktop", () => api("/api/updates/desktop", { method: "POST", body: "{}", timeoutMs: 960000 }), "Desktop 更新检查完成", false)}>{working === "desktop" ? <Loader2 className="spin" size={14} /> : <Download size={14} />}一键更新</button> : desktopHasUpdate === false ? <span className="status-pill success"><Check size={13} />已是最新版</span> : <button className="button secondary compact" disabled={loading || Boolean(working)} onClick={() => load(true)}><RefreshCw size={14} />检查更新</button>}
 
         </article>
@@ -11292,7 +11308,6 @@ export default function App() {
         const result = await api("/api/app-lifecycle");
         if (stopped) return;
         if (result.configurationSession?.active) {
-          maintenanceResourceCache = null;
           await reload();
           return;
         }

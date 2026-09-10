@@ -18,7 +18,8 @@ test('one-click update checks, downloads, verifies, then installs exactly once',
     .replace(/^import .*;\r?\n/gm,'').replace('export default function','function');
   const transformed = await transformWithOxc(source,'AppUpdatePanel.jsx',{jsx:{runtime:'classic'}});
   const context=vm.createContext({React,window:dom.window,useRef:React.useRef,useState:React.useState,
-    useEffect:React.useEffect,useCallback:React.useCallback,Check:()=>null,Download:()=>null,Loader2:()=>null,RefreshCw:()=>null});
+    useEffect:React.useEffect,useCallback:React.useCallback,Check:()=>null,Download:()=>null,Loader2:()=>null,RefreshCw:()=>null,
+    ...(await import('../appUpdateResource.js'))});
   vm.runInContext(transformed.code+'\nthis.Panel=AppUpdatePanel;',context);
   const { createRoot } = require('react-dom/client');const root=createRoot(document.querySelector('#root'));
   const calls=[];
@@ -32,7 +33,10 @@ test('one-click update checks, downloads, verifies, then installs exactly once',
   };
   try {
     await React.act(async()=>root.render(React.createElement(context.Panel,{api,notify:()=>{}})));
-    assert.deepEqual(calls,['/api/app-update','/api/app-update/check']);
+    assert.deepEqual(calls,['/api/app-update']);
+    await React.act(async()=>root.render(null));
+    await React.act(async()=>root.render(React.createElement(context.Panel,{api,notify:()=>{}})));
+    assert.deepEqual(calls,['/api/app-update']); // reopening settings does not check again
     assert.match(document.body.textContent,/9.13.0/);
     assert.doesNotMatch(document.body.textContent,/更新源设置|下载目录/);
     await React.act(async()=>document.querySelector('button').click());

@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import agent_manager.integrations.radar as radar
+from tests.integrations.test_radar_service import QueueOpener
 
 
 class RadarPredictionHistoryTests(unittest.TestCase):
@@ -14,7 +15,13 @@ class RadarPredictionHistoryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / 'radar.json'
         self.now = datetime(2026, 9, 8, 13, tzinfo=timezone.utc)
-        self.service = radar.RadarService(self.path, clock=lambda: self.now)
+        self.service = radar.RadarService(self.path, clock=lambda: self.now, opener=QueueOpener([]))
+        status_patch = patch.object(radar.RadarService, '_fetch_status_incidents', return_value=([], False))
+        status_patch.start()
+        self.addCleanup(status_patch.stop)
+        html = patch.object(radar.RadarService, '_fetch_public_post_translations', return_value={})
+        html.start()
+        self.addCleanup(html.stop)
 
     def forecast(self, score=100, checked=None, events=None):
         return {'checkedAt': checked or radar._iso(self.now),
@@ -54,7 +61,7 @@ class RadarPredictionHistoryTests(unittest.TestCase):
         self.assertEqual(first['data']['monitor']['lastRunAt'], radar._iso(self.now))
         self.assertEqual(first['data']['monitor']['lastCheckMode'], 'manual-refresh')
         self.assertEqual(first['data']['monitor']['lastResult'], '预测预警')
-        self.service = radar.RadarService(self.path, clock=lambda: self.now)
+        self.service = radar.RadarService(self.path, clock=lambda: self.now, opener=QueueOpener([]))
         self.now += timedelta(minutes=10)
         second = self.refresh(self.forecast())
         self.assertFalse(second['newAlert'])
@@ -66,7 +73,7 @@ class RadarPredictionHistoryTests(unittest.TestCase):
         again = self.refresh(self.forecast(events=[self.event()]))
         self.assertEqual(len(again['data']['resetHistory']), 1)
         self.assertEqual(again['data']['resetHistory'][0]['discoveredAt'], '2026-09-08T13:00:00Z')
-        self.service = radar.RadarService(self.path, clock=lambda: self.now)
+        self.service = radar.RadarService(self.path, clock=lambda: self.now, opener=QueueOpener([]))
         later = self.refresh(self.forecast(events=[]))
         self.assertEqual(len(later['data']['resetHistory']), 1)
         self.assertEqual(later['data']['resetHistory'][0]['occurrencePrecision'], 'unknown')
@@ -110,15 +117,16 @@ class RadarPredictionHistoryTests(unittest.TestCase):
         self.refresh(self.forecast())
         self.now += timedelta(hours=1)
         with patch.object(self.service, '_fetch_summary', return_value=(None, 'json', False)), \
-             patch.object(self.service, '_fetch_events', return_value=([], False)), \
+             patch.object(self.service, '_fetch_events', side_effect=radar.RadarError('source unavailable')), \
              patch.object(self.service, '_fetch_forecast', side_effect=radar.RadarError('source unavailable')), \
+             patch.object(self.service, '_fetch_status_incidents', side_effect=radar.RadarError('source unavailable')), \
              patch.object(self.service, '_translate_missing_forecast_posts'), \
              patch.object(self.service, '_translate_reset_payload'):
             result = self.service.get_reset_radar(refresh=True)
         monitor = result['data']['monitor']
         self.assertEqual(monitor['lastRunAt'], '2026-09-08T14:00:00Z')
         self.assertEqual(monitor['lastSuccessAt'], '2026-09-08T13:00:00Z')
-        self.assertEqual(monitor['lastError'], 'source unavailable')
+        self.assertIn('source unavailable', monitor['lastError'])
 
     def test_more_precise_evidence_upgrades_existing_event_without_changing_discovery(self):
         self.refresh(self.forecast(events=[self.event()]))

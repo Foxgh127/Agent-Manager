@@ -248,6 +248,7 @@ class QuickRestartProtocolTests(unittest.TestCase):
             patch.object(runtime, "_start_account_auto_refresh"),
             patch.object(runtime, "_start_mail_health_checks"),
             patch.object(runtime, "_start_update_checks"),
+            patch.object(runtime, "_start_radar_monitor"),
         ):
             runtime.resume_after_failed_restart()
         for key in (

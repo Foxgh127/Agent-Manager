@@ -4,7 +4,7 @@
 
 **个人练手项目，代码、界面、文档和开发工作由 Codex 完成，仅供个人学习与测试。** 本项目不是 OpenAI、Anthropic 或任何中转站的官方产品，不提供生产服务承诺。
 
-一个面向 Windows 的本地 AI 开发工作台：管理 Codex 账号与 API、组织模型和子代理、维护会话与配置。当前版本 **1.1.0**。
+一个面向 Windows 的本地 AI 开发工作台：管理 Codex 账号与 API、组织模型和子代理、维护会话与配置。当前版本 **1.1.2**。
 
 [下载安装包](https://github.com/Foxgh127/Agent-Manager/releases/latest) · [版本说明](docs/release-notes.md) · [使用与故障处理](docs/usage.md) · [开发与发布](docs/development.md) · [设计与资料](docs/architecture.md)
 
@@ -18,6 +18,7 @@
 | 会话维护 | 检查会话可见性、同步与恢复索引；保留原始对话和必要的回滚记录 |
 | 配置备份 | 自动保留最近三份不同内容；手动备份、恢复、删除和查看保护原因 |
 | 版本与维护 | 查看 Agent Manager、Codex Desktop 与 CLI 的版本，按系统能力检查并更新 |
+| Codex 雷达 | 同步社区模型与额度实测；启动及每小时检查重置信号，按等级发送 Windows 通知 |
 | 用量与估算 | 按模型、请求上下文、服务档位和缓存读写估算总额度；记录可比周期的容量变化线索 |
 | 其他工作区 | 保留 Claude 直连配置、雷达、邮箱、2FA 等现有工具 |
 
