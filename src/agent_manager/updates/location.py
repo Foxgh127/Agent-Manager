@@ -226,16 +226,13 @@ def read_location_status(*, state_dir, runtime_file=None):
     return status
 
 
-def create_desktop_shortcut(*, target=None, state_dir=None):
-    current = _current_executable()
-    if target is not None and Path(target).absolute() != current:
-        raise UpdateError("快捷方式只能指向当前管理器。", "invalid_shortcut_target")
+def _run_shortcut_helper(current, state_dir, *, operation="create"):
     parent = _regular_path(Path(state_dir).absolute()) if state_dir else None
     if parent:
         parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="agent-manager-shortcut-", dir=parent) as temporary:
         root = Path(temporary)
-        _atomic_json(root / "shortcut.json", {"target": str(current)})
+        _atomic_json(root / "shortcut.json", {"target": str(current), "operation": operation})
         script = root / "shortcut.ps1"
         script.write_text(SHORTCUT_SCRIPT + SHORTCUT_ENTRY, encoding="utf-8-sig", newline="")
         powershell = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
@@ -245,32 +242,78 @@ def create_desktop_shortcut(*, target=None, state_dir=None):
                                        timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
             result = _read_json(root / "shortcut-result.json", 65536)
             if completed.returncode != 0 or not isinstance(result, dict) or result.get("ok") is not True:
-                raise UpdateError("无法创建桌面快捷方式，请确认桌面目录可写。", "shortcut_failed")
-            return {key: result[key] for key in ("created", "path", "target")}
+                failure = result if isinstance(result, dict) else {}
+                error = UpdateError(str(failure.get("message") or "快捷方式助手未返回可验证的结果，请重试。")[:300],
+                                    str(failure.get("code") or "shortcut_failed"))
+                error.detail = str(failure.get("detail") or "")[:500]
+                raise error
+            path, desktop = Path(str(result.get("path") or "")), Path(str(result.get("desktop") or ""))
+            if (result.get("verified") is not True or result.get("exists") is not True
+                    or not isinstance(result.get("created"), bool)
+                    or Path(str(result.get("target") or "")) != current
+                    or not path.is_absolute() or not desktop.is_absolute() or path.parent != desktop
+                    or path.suffix.lower() != ".lnk" or not path.is_file() or path.stat().st_size <= 0
+                    or getattr(path.lstat(), "st_file_attributes", 0) & (2 | 4 | 1024)):
+                raise UpdateError("桌面快捷方式未通过最终文件校验，请重试。", "shortcut_verification_failed")
+            return {key: result[key] for key in ("created", "path", "target", "desktop", "verified", "exists", "shellNotified")}
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise UpdateError("创建桌面快捷方式超时或系统组件不可用。", "shortcut_failed") from exc
 
 
+def create_desktop_shortcut(*, target=None, state_dir=None):
+    current = _current_executable()
+    if target is not None and Path(target).absolute() != current:
+        raise UpdateError("快捷方式只能指向当前管理器。", "invalid_shortcut_target")
+    return _run_shortcut_helper(current, state_dir)
+
+
+def reveal_desktop_shortcut(*, state_dir=None):
+    """Select the verified current app's link only after an explicit UI action."""
+    result = _run_shortcut_helper(_current_executable(), state_dir, operation="find")
+    explorer = Path(os.environ.get("SystemRoot", "C:/Windows")) / "explorer.exe"
+    try:
+        subprocess.Popen([str(explorer), "/select,", result["path"]], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    except OSError as exc:
+        raise UpdateError("无法在资源管理器中定位快捷方式。", "shortcut_reveal_failed") from exc
+    return {**result, "revealed": True}
+
+
 SHORTCUT_SCRIPT = r'''$ErrorActionPreference = 'Stop'
 $script:shortcutOwner = 'openai-agent-manager:desktop-shortcut:v1'
-function Get-LocationDesktop {
+function Initialize-LocationKnownFolders {
     if (-not ('AgentManagerLocation.KnownFolders' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 namespace AgentManagerLocation {
     public static class KnownFolders {
         [DllImport("shell32.dll")] private static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
+        [DllImport("advapi32.dll", SetLastError=true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("shell32.dll", CharSet=CharSet.Unicode)] private static extern void SHChangeNotify(uint events, uint flags, string path, IntPtr other);
+        public static void NotifyShortcut(string path, bool created) {
+            // SHCNF_PATHW | SHCNF_FLUSHNOWAIT; request an Explorer item refresh.
+            SHChangeNotify(created ? 2U : 0x2000U, 5U | 0x2000U, path, IntPtr.Zero);
+        }
         public static string Desktop() {
             Guid id = new Guid("B4BFCC3A-DB2C-424C-B029-7FE99A87C641");
-            IntPtr path; int result = SHGetKnownFolderPath(ref id, 0, IntPtr.Zero, out path);
-            if (result != 0) Marshal.ThrowExceptionForHR(result);
-            try { return Marshal.PtrToStringUni(path); } finally { Marshal.FreeCoTaskMem(path); }
+            IntPtr token;
+            if (!OpenProcessToken(new IntPtr(-1), 0xC, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                IntPtr path; int result = SHGetKnownFolderPath(ref id, 0, token, out path);
+                if (result != 0) Marshal.ThrowExceptionForHR(result);
+                try { return Marshal.PtrToStringUni(path); } finally { Marshal.FreeCoTaskMem(path); }
+            } finally { CloseHandle(token); }
         }
     }
 }
 '@
     }
+}
+function Get-LocationDesktop {
+    Initialize-LocationKnownFolders
     $path = [AgentManagerLocation.KnownFolders]::Desktop()
     if (-not [IO.Directory]::Exists($path)) { throw 'Windows Desktop known folder is unavailable.' }
     return $path
@@ -387,8 +430,34 @@ function Save-OwnedShortcut([string]$path, [string]$target, [string]$previous = 
             if (-not (Test-OwnedShortcut $path $previous)) { throw 'Existing shortcut changed during creation.' }
             [IO.File]::Replace($temporary, $path, [NullString]::Value)
         } else { [IO.File]::Move($temporary, $path) }
-        return @{created=(-not $existed); path=$path; target=$target}
+        # Clear visibility flags only on this app-owned, just-verified link.
+        $attributes = [IO.File]::GetAttributes($path)
+        [IO.File]::SetAttributes($path, ($attributes -band (-bnot ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System))))
+        $result = Confirm-OwnedDesktopShortcut $path $target
+        $result.created = (-not $existed)
+        Initialize-LocationKnownFolders
+        [AgentManagerLocation.KnownFolders]::NotifyShortcut($path, (-not $existed))
+        $result.shellNotified = $true
+        return $result
     } finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+}
+function Confirm-OwnedDesktopShortcut([string]$path, [string]$target) {
+    $desktop = Get-LocationDesktop
+    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($path)) -ine [IO.Path]::GetFullPath($desktop) -or
+        -not (Test-OwnedShortcut $path $target)) { throw 'Shortcut is missing or no longer belongs to the current application Desktop.' }
+    $link = [AgentManagerLocation.NativeShortcuts]::Read($path)
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.Length -le 0 -or ($item.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) -ne 0 -or
+        $link.WorkingDirectory -ine [IO.Path]::GetDirectoryName($target) -or $link.IconPath -ine $target -or
+        $link.IconIndex -ne 0 -or $link.WindowStyle -ne 1) { throw 'Final shortcut fields or visibility could not be verified.' }
+    return @{created=$false; path=$path; target=$link.TargetPath; desktop=$desktop; verified=$true; exists=$true; shellNotified=$false}
+}
+function Find-OwnedDesktopShortcut([string]$target) {
+    $desktop = Get-LocationDesktop
+    foreach ($item in @(Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -File -Force)) {
+        if (Test-OwnedShortcut $item.FullName $target) { return (Confirm-OwnedDesktopShortcut $item.FullName $target) }
+    }
+    return $null
 }
 function New-OwnedDesktopShortcut([string]$target) {
     $desktop = Get-LocationDesktop
@@ -417,10 +486,25 @@ function Update-OwnedDesktopShortcuts([string]$source, [string]$target) {
 SHORTCUT_ENTRY = r'''
 try {
     $metadata = ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'shortcut.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json)
-    $result = New-OwnedDesktopShortcut ([string]$metadata.target)
+    if ($metadata.operation -ceq 'find') {
+        $result = Find-OwnedDesktopShortcut ([string]$metadata.target)
+        if ($null -eq $result) {
+            $result = @{ok=$false; code='shortcut_not_found'; message='当前桌面没有指向此程序的管理器快捷方式，请先创建。'}
+        }
+    } else { $result = New-OwnedDesktopShortcut ([string]$metadata.target) }
+    if ($result.ok -eq $false) {
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'shortcut-result.json'), ($result | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+        exit 1
+    }
+    $verified = Confirm-OwnedDesktopShortcut ([string]$result.path) ([string]$metadata.target)
+    $result.verified = $verified.verified; $result.exists = $verified.exists
     $result.ok = $true
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'shortcut-result.json'), ($result | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
-} catch { exit 1 }
+} catch {
+    $result = @{ok=$false; code='shortcut_failed'; message='无法创建或校验桌面快捷方式，请确认桌面目录可用。'; detail=$_.Exception.Message}
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'shortcut-result.json'), ($result | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    exit 1
+}
 '''
 
 

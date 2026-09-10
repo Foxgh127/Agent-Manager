@@ -208,7 +208,7 @@ class QuickRestartProtocolTests(unittest.TestCase):
             app._restart_readiness_watchdog(
                 server, {"readyDeadlineEpoch": time.time() - 1}
             )
-            exit_only.assert_called_once_with(server)
+            exit_only.assert_called_once_with(server, confirmed=True)
             self.assertFalse(server.allow_forced_process_exit)
 
     def test_cancelled_child_never_migrates_state_or_constructs_runtime(self):

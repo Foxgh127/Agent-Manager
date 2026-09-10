@@ -37,6 +37,7 @@ class ManagerServer(_app.ThreadingHTTPServer):
         self.tray_thread = None
         self.tray_error = None
         self.tray_lock = _app.threading.RLock()
+        self.tray_action_lock = _app.threading.Lock()
         self.force_exit = False
         self.quick_restart_requested = False
         self.quick_restart_token = None
@@ -235,17 +236,48 @@ class ManagerServer(_app.ThreadingHTTPServer):
                     self.show_native_window()
 
                 def exit_application(icon=None, _item=None) -> None:
-                    self.force_exit = True
-                    if icon is not None:
-                        try:
-                            icon.stop()
-                        except Exception:
-                            pass
                     _app.request_application_shutdown(self)
 
+                def exit_only_application(_icon=None, _item=None) -> None:
+                    # Native dialogs and icon.stop can wait on message loops.
+                    # Keep the tray callback free to dispatch their messages.
+                    def confirm_and_exit():
+                        if not self.tray_action_lock.acquire(blocking=False):
+                            return
+                        try:
+                            if self.shutdown_started.is_set():
+                                return
+                            decision = self.runtime.exit_only_preflight()
+                            approved = False
+                            if decision.get("requiresConfirmation"):
+                                self.show_native_window()
+                                window = self.native_window_object
+                                confirm = getattr(window, "create_confirmation_dialog", None)
+                                if callable(confirm):
+                                    approved = bool(confirm("仅退出软件？", decision["message"]))
+                                elif _app.os.name == "nt":
+                                    approved = _app.ctypes.windll.user32.MessageBoxW(
+                                        None, decision["message"], "仅退出软件？", 0x134,
+                                    ) == 6
+                                else:
+                                    raise _app.core.ManagerError("请在管理器窗口确认仅退出软件。")
+                                if not approved:
+                                    return
+                            _app.request_application_exit_only(self, confirmed=approved)
+                        except Exception as exc:
+                            self.tray_error = _app.core._redact_sensitive_text(exc, limit=300)
+                            self.show_native_window()
+                        finally:
+                            self.tray_action_lock.release()
+
+                    _app.threading.Thread(
+                        target=confirm_and_exit, name="agent-manager-tray-exit", daemon=True,
+                    ).start()
+
                 menu = pystray.Menu(
-                    pystray.MenuItem("显示 Agent Manager", show_window, default=True),
+                    pystray.MenuItem("显示", show_window, default=True),
                     pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("仅退出软件", exit_only_application),
                     pystray.MenuItem("彻底退出", exit_application),
                 )
                 tray = pystray.Icon("codex-agent-manager", image, _app.core.APP_NAME, menu)

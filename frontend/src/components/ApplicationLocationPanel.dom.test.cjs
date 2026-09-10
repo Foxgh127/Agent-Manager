@@ -28,7 +28,7 @@ test('application location preserves Unicode, cancels safely and submits each mo
     calls.push({route,body:options?.body && JSON.parse(options.body)});
     if(route.endsWith('/select'))return{directory:destination};
     if(route.endsWith('/move'))return new Promise(resolve=>{finishMove=()=>resolve({result:{started:true}});});
-    if(route.endsWith('/shortcut'))return new Promise(resolve=>{finishShortcut=()=>resolve({message:'已创建'});});
+    if(route.endsWith('/shortcut'))return new Promise(resolve=>{finishShortcut=()=>resolve({message:'已创建',result:{verified:true,exists:true,created:true,path:'C:\\用户\\Desktop\\Agent Manager.lnk'}});});
     return{location};
   };
   const button=text=>[...document.querySelectorAll('button')].find(item=>item.textContent===text);
@@ -43,6 +43,9 @@ test('application location preserves Unicode, cancels safely and submits each mo
     await React.act(async()=>{button('创建桌面快捷方式').click();button('创建桌面快捷方式').click();});
     assert.equal(calls.filter(c=>c.route.endsWith('/shortcut')).length,1);
     await React.act(async()=>finishShortcut());
+    assert.match(document.body.textContent,/快捷方式：C:\\用户\\Desktop\\Agent Manager.lnk/);
+    await React.act(async()=>button('定位快捷方式').click());
+    assert.deepEqual(calls.find(c=>c.route.endsWith('/shortcut/reveal')).body,{});
     await React.act(async()=>button('更改位置').click());
     await React.act(async()=>button('选择文件夹').click());
     await React.act(async()=>{button('移动并重启').click();button('移动并重启').click();});

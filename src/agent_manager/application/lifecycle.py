@@ -24,6 +24,12 @@ def _read_shutdown_status() -> dict:
         for key, value in raw_timing.items()
         if isinstance(key, str) and isinstance(value, (bool, int, float, str))
     } if isinstance(raw_timing, dict) else {}
+    raw_shutdown_timing = payload.get("shutdownTiming")
+    shutdown_timing = {
+        str(key)[:80]: value
+        for key, value in raw_shutdown_timing.items()
+        if isinstance(key, str) and isinstance(value, (bool, int, float))
+    } if isinstance(raw_shutdown_timing, dict) else {}
     return {
         "pid": int(payload.get("pid") or 0),
         "phase": str(payload.get("phase") or "")[:80],
@@ -31,6 +37,9 @@ def _read_shutdown_status() -> dict:
         "errors": [_app.core._redact_sensitive_text(item, limit=300) for item in errors[:8]],
         "native": bool(payload.get("native")),
         "restartTiming": restart_timing,
+        "shutdownTiming": shutdown_timing,
+        "restorationComplete": bool(payload.get("restorationComplete")),
+        "preserved": bool(payload.get("preserved")),
     }
 
 
@@ -585,6 +594,7 @@ def _write_shutdown_status(server: _app.ManagerServer, phase: str, errors: list[
                 "errors": list(errors or []),
                 "native": bool(server.native_window),
                 "restartTiming": dict(getattr(server, "quick_restart_timing", {}) or {}),
+                "shutdownTiming": dict(getattr(server, "shutdown_timing", {}) or {}),
                 "restorationComplete": bool(
                     getattr(server, "shutdown_result", {}).get("restorationComplete")
                 ),
@@ -643,7 +653,9 @@ def _restart_readiness_watchdog(server: _app.ManagerServer, handoff: dict | None
         "quick-restart-replacement-not-ready",
         ["新管理器未在交接期限内完成窗口激活，已安全退出并交回旧管理器。"],
     )
-    _app.request_application_exit_only(server)
+    # This is a failed replacement handing the preserved gateway back to its
+    # waiting parent, not a user choosing to leave API routes unavailable.
+    _app.request_application_exit_only(server, confirmed=True)
 
 
 
@@ -876,11 +888,17 @@ def _recover_unexpected_native_window_exit(server: _app.ManagerServer, error: ob
 
 
 
-def request_application_exit_only(server: _app.ManagerServer) -> bool:
+def request_application_exit_only(server: _app.ManagerServer, *, confirmed: bool = False) -> bool:
     """Exit the manager without closing Codex or restoring its active overlay."""
+    preflight = getattr(server.runtime, "exit_only_preflight", None)
+    if callable(preflight):
+        decision = preflight()
+        if decision.get("requiresConfirmation") and confirmed is not True:
+            raise _app.core.ManagerError(decision["message"])
     if not server.claim_shutdown():
         return False
     server.exit_only_requested = True
+    server.exit_only_confirmed = confirmed is True
     _app.threading.Thread(
         target=_app.shutdown_application,
         args=(server,),
@@ -917,9 +935,14 @@ def _handle_startup_activation_failure(server: _app.ManagerServer, phase: str, e
 def handle_native_window_closing(server: _app.ManagerServer, window: object) -> bool | None:
     if server.force_exit:
         started = getattr(server, "shutdown_started", None)
+        runtime = getattr(server, "runtime", None)
+        close_result = getattr(runtime, "_close_result", None)
         if (
             isinstance(started, _app.threading.Event) and started.is_set()
-            and not getattr(getattr(server, "runtime", None), "_closed", False)
+            and (
+                not getattr(runtime, "_closed", False)
+                or (isinstance(close_result, dict) and close_result.get("completed") is False)
+            )
         ):
             # Repeated title-bar clicks while cleanup is running must not
             # destroy the repair window before restoration has been verified.
@@ -955,6 +978,8 @@ def shutdown_application(
     errors: list[str] = []
     server.shutdown_errors = errors
     server.shutdown_result = {}
+    shutdown_started = _app.time.monotonic()
+    server.shutdown_timing = {}
     abort_shutdown = False
     blocked_phase = "blocked-restoration"
     _app._write_shutdown_status(server, "quick-restart-starting" if quick_restart else "starting")
@@ -966,18 +991,25 @@ def shutdown_application(
             daemon=True,
         ).start()
     try:
+        stage_started = _app.time.monotonic()
         try:
             server.stop_tray()
         except Exception as exc:
             errors.append(f"停止托盘：{str(exc)[:300]}")
+        server.shutdown_timing["trayStopMs"] = round((_app.time.monotonic() - stage_started) * 1000, 1)
         # Stop accepting new work before restoring the Codex files.  This also
         # releases browser-only serve_forever loops even if a later cleanup
         # operation fails.
+        stage_started = _app.time.monotonic()
         try:
             server.shutdown()
         except Exception as exc:
             errors.append(f"停止管理服务：{str(exc)[:300]}")
-        if not _app._wait_for_server_mutations(server):
+        server.shutdown_timing["httpStopMs"] = round((_app.time.monotonic() - stage_started) * 1000, 1)
+        stage_started = _app.time.monotonic()
+        mutations_drained = _app._wait_for_server_mutations(server)
+        server.shutdown_timing["mutationDrainMs"] = round((_app.time.monotonic() - stage_started) * 1000, 1)
+        if not mutations_drained:
             errors.append(
                 f"仍有修改请求在 {_app.MUTATION_DRAIN_TIMEOUT_SECONDS:g} 秒内未结束；"
                 "为避免与 Codex 配置还原并发，已取消本次退出。"
@@ -985,19 +1017,37 @@ def shutdown_application(
             abort_shutdown = True
             blocked_phase = "blocked-active-mutations"
         else:
+            stage_started = _app.time.monotonic()
             try:
                 if quick_restart:
                     result = server.runtime.close_for_restart()
                 elif exit_only:
+                    # A request already in flight can start the gateway after
+                    # the tray's first preflight. Recheck once mutations drain.
+                    preflight = getattr(server.runtime, "exit_only_preflight", None)
+                    if callable(preflight) and not getattr(server, "exit_only_confirmed", False):
+                        decision = preflight()
+                        if decision.get("requiresConfirmation"):
+                            raise _app.core.ManagerError(decision["message"])
                     result = server.runtime.close_for_restart(exit_only=True)
                 else:
                     result = server.runtime.close()
                 server.shutdown_result = result
+                prepared = result.get("restartPreparation") or {}
+                cleanup = result.get("serviceCleanup") or {}
+                server.shutdown_timing.update({
+                    "prepareMs": prepared.get("elapsedMs", 0),
+                    "serviceCleanupMs": cleanup.get("elapsedMs", 0),
+                    **{f"service:{key}": value for key, value in cleanup.get("timings", {}).items()},
+                    **result.get("shutdownTiming", {}),
+                })
                 errors.extend(str(item) for item in result.get("errors", []) if str(item))
                 if result.get("completed") is False:
                     abort_shutdown = True
                     if result.get("blocked") == "codex-or-workers":
                         blocked_phase = "blocked-codex-or-workers"
+                    elif result.get("blocked") == "services":
+                        blocked_phase = "blocked-services"
             except Exception as exc:
                 action = (
                     "保留快速重启状态"
@@ -1008,6 +1058,8 @@ def shutdown_application(
                 )
                 errors.append(f"{action}：{str(exc)[:300]}")
                 abort_shutdown = True
+            finally:
+                server.shutdown_timing["runtimeCloseMs"] = round((_app.time.monotonic() - stage_started) * 1000, 1)
         if server.native_window and not abort_shutdown and not quick_restart:
             try:
                 import webview
@@ -1020,6 +1072,7 @@ def shutdown_application(
             except Exception as exc:
                 errors.append(f"关闭桌面窗口：{str(exc)[:300]}")
     finally:
+        server.shutdown_timing["elapsedMs"] = round((_app.time.monotonic() - shutdown_started) * 1000, 1)
         recovered = False
         if abort_shutdown:
             if quick_restart:
@@ -1152,6 +1205,7 @@ def shutdown_application(
                 errors.append(f"释放管理端口：{str(exc)[:300]}")
             _app._cleanup_runtime()
         if not recovered:
+            server.shutdown_timing["elapsedMs"] = round((_app.time.monotonic() - shutdown_started) * 1000, 1)
             _app._write_shutdown_status(server, "completed-with-errors" if errors else "completed", errors)
             server.shutdown_finished.set()
 

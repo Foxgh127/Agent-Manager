@@ -161,6 +161,7 @@ from .location import (
     select_application_directory,
     prepare_application_relocation,
     create_application_shortcut,
+    reveal_application_shortcut,
     finish_application_location_handoff,
 )
 from .lifecycle import (

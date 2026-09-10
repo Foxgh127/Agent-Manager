@@ -442,6 +442,76 @@ function Remove-VerifiedOldLocation { & $boundedRemove -timeoutSeconds 0 }
             location.prepare_location_move(**self.arguments)
         self.assertEqual(caught.exception.code, "location_busy")
 
+    def test_create_entry_verifies_final_desktop_file_and_updates_existing_hidden_owned_link(self):
+        if os.name != "nt":
+            self.skipTest("Windows only")
+        desktop = self.root / "用户桌面🚀"
+        desktop.mkdir()
+        script = location.SHORTCUT_SCRIPT + "\nfunction Get-LocationDesktop { return $env:AGENT_MANAGER_TEST_DESKTOP }\n"
+        with patch.object(location, "_current_executable", return_value=self.source), patch.object(location, "SHORTCUT_SCRIPT", script), patch.dict(os.environ, {"AGENT_MANAGER_TEST_DESKTOP": str(desktop)}):
+            first = location.create_desktop_shortcut(state_dir=self.state)
+            self.assertTrue(first["created"])
+            self.assertTrue(first["verified"])
+            self.assertTrue(first["exists"])
+            self.assertTrue(first["shellNotified"])
+            self.assertEqual(Path(first["path"]).parent, desktop)
+            set_attributes = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+            set_attributes.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+            set_attributes.restype = ctypes.c_int
+            self.assertTrue(set_attributes(first["path"], 2))
+            second = location.create_desktop_shortcut(state_dir=self.state)
+        self.assertFalse(second["created"])
+        self.assertEqual(first["path"], second["path"])
+        self.assertFalse(Path(second["path"]).stat().st_file_attributes & (2 | 4))
+        self.assertEqual(len(list(desktop.glob("*.lnk"))), 1)
+
+    def test_helper_exit_zero_with_claimed_success_but_missing_file_is_rejected(self):
+        def fake_run(command, **kwargs):
+            root = Path(command[-1]).parent
+            (root / "shortcut-result.json").write_text(json.dumps({"ok": True, "created": True, "verified": True, "exists": True,
+                "target": str(self.source), "path": str(self.destination / "missing.lnk"), "desktop": str(self.destination), "shellNotified": True}), encoding="utf-8")
+            return Mock(returncode=0)
+        with patch.object(location, "_current_executable", return_value=self.source), patch.object(location.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(UpdateError) as caught:
+                location.create_desktop_shortcut(state_dir=self.state)
+        self.assertEqual(caught.exception.code, "shortcut_verification_failed")
+
+    def test_helper_failure_feedback_preserves_code_and_diagnostic(self):
+        def fake_run(command, **kwargs):
+            root = Path(command[-1]).parent
+            (root / "shortcut-result.json").write_text(json.dumps({"ok": False, "code": "shortcut_not_found", "message": "当前桌面没有管理器快捷方式。", "detail": "native verification detail"}), encoding="utf-8")
+            return Mock(returncode=1)
+        with patch.object(location, "_current_executable", return_value=self.source), patch.object(location.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(UpdateError) as caught:
+                location.reveal_desktop_shortcut(state_dir=self.state)
+        self.assertEqual(caught.exception.code, "shortcut_not_found")
+        self.assertEqual(caught.exception.detail, "native verification detail")
+        self.assertEqual(str(caught.exception), "当前桌面没有管理器快捷方式。")
+
+    def test_reveal_uses_only_verified_current_owned_shortcut_path(self):
+        result = {"path": str(self.destination / "管理器🚀.lnk"), "verified": True, "exists": True}
+        with patch.object(location, "_current_executable", return_value=self.source), patch.object(location, "_run_shortcut_helper", return_value=result) as helper, patch.object(location.subprocess, "Popen") as launch:
+            returned = location.reveal_desktop_shortcut(state_dir=self.state)
+        helper.assert_called_once_with(self.source, self.state, operation="find")
+        self.assertEqual(launch.call_args.args[0][1:], ["/select,", result["path"]])
+        self.assertTrue(returned["revealed"])
+
+    def test_known_folder_uses_current_user_token_despite_inherited_profile_overrides(self):
+        self.prepare()
+        probe = r'''
+$desktop = Get-LocationDesktop
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'desktop-env.json'), (@{path=$desktop} | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+'''
+        self.powershell(probe, invoke=False)
+        actual = json.loads((self.prepared["directory"] / "desktop-env.json").read_text(encoding="utf-8"))["path"]
+        fake_profile = self.root / "另一个用户🚀"
+        (fake_profile / "Desktop").mkdir(parents=True)
+        with patch.dict(os.environ, {"USERPROFILE": str(fake_profile), "OneDrive": str(fake_profile), "HOMEPATH": str(fake_profile)[2:]}):
+            self.powershell(probe, invoke=False)
+        with_override = json.loads((self.prepared["directory"] / "desktop-env.json").read_text(encoding="utf-8"))["path"]
+        self.assertEqual(with_override, actual)
+        self.assertNotEqual(Path(with_override), fake_profile / "Desktop")
+
     def test_shortcut_com_roundtrip_redirected_unicode_desktop_idempotent_and_preserves_other_link(self):
         powershell = shutil.which("powershell.exe")
         if not powershell:

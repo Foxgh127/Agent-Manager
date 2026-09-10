@@ -779,13 +779,13 @@ class ManagerRuntime:
         state["mailHealthStatus"] = _app.json.loads(_app.json.dumps(self.mail_health_status))
         state["updateCheckStatus"] = _app.json.loads(_app.json.dumps(self.update_check_status))
         state["radarMonitorStatus"] = _app.json.loads(_app.json.dumps(self.radar_monitor_status))
-        if getattr(self, "quota_estimates", None):
+        if getattr(self, "quota_estimates", None) and not self._closed and not self._restart_prepared:
             self.quota_estimates.decorate(state.get("settings", {}).get("accounts", []))
         return state
 
     def account_snapshot(self) -> dict:
         snapshot = _app.core.public_account_snapshot()
-        if getattr(self, "quota_estimates", None):
+        if getattr(self, "quota_estimates", None) and not self._closed and not self._restart_prepared:
             self.quota_estimates.decorate(snapshot.get("accounts", []))
         with self.account_refresh_lock:
             snapshot["accountRefreshStatus"] = _app.json.loads(_app.json.dumps(self.account_refresh_status))
@@ -1012,7 +1012,7 @@ class ManagerRuntime:
                     parallel_operations=False,
                     commit_guard=lambda: not self.account_refresh_stop.is_set() and not self._closed,
                 )
-                if getattr(self, "quota_estimates", None):
+                if getattr(self, "quota_estimates", None) and not self._closed and not self._restart_prepared:
                     self.quota_estimates.schedule()
                 if result.get("cancelled"):
                     state = "cancelled"
@@ -1094,6 +1094,8 @@ class ManagerRuntime:
             import agent_manager.gateway.service
             agent_manager.gateway.service.stop_codex_session_usage_backfill(timeout_seconds=0)
             self.update_check_stop.set()
+            if getattr(self, "update_check_wake", None) is not None:
+                self.update_check_wake.set()
             self.radar_monitor_stop.set()
             self.radar_monitor_wake.set()
             self.account_auto_refresh_stop.set()
@@ -1101,6 +1103,9 @@ class ManagerRuntime:
             self.mail_health_stop.set()
             self.mail_health_wake.set()
             self.account_refresh_stop.set()
+            sampler = getattr(self, "quota_estimates", None)
+            if sampler is not None:
+                sampler.stop.set()
             with self.account_refresh_lock:
                 self.account_refresh_pending.clear()
                 refresh_workers = list(self.account_refresh_threads)
@@ -1108,6 +1113,7 @@ class ManagerRuntime:
                 self.radar_monitor_thread,
                 self.account_auto_refresh_thread,
                 self.mail_health_thread,
+                getattr(sampler, "thread", None),
                 *refresh_workers,
             ]
             workers = list(
@@ -1119,7 +1125,7 @@ class ManagerRuntime:
                     and thread.is_alive()
                 )
             )
-        deadline = _app.time.monotonic() + max(0.0, min(float(timeout_seconds), 5.0))
+        deadline = started + max(0.0, min(float(timeout_seconds), 5.0))
         for thread in workers:
             remaining = deadline - _app.time.monotonic()
             if remaining <= 0:
@@ -1136,6 +1142,177 @@ class ManagerRuntime:
         with self.lock:
             self._restart_prepare_result = result
         return _app.json.loads(_app.json.dumps(result))
+
+    def exit_only_preflight(self) -> dict:
+        """Expose the same API dependency warning to the window and tray."""
+        running = bool(self.web2api.server) if hasattr(self.web2api, "server") else bool(self.web2api.status().get("running"))
+        return {
+            "requiresConfirmation": running,
+            "gatewayRunning": running,
+            "message": (
+                "本地 API 会随管理器停止；使用聚合、子代理或中转站路由的 Codex "
+                "需要重新打开 Agent Manager 后才能继续请求。当前 Codex 进程和配置会保留。"
+                if running else "仅退出管理器，保留当前 Codex 进程和临时配置。"
+            ),
+        }
+
+    def _new_service_shutdown(self) -> dict:
+        """Build independent stop workers; the caller starts them without self.lock."""
+        operations = [
+            ("停止更新检查", self._stop_update_checks),
+            ("停止雷达监控", self._stop_radar_monitor),
+            ("停止账号自动刷新", self._stop_account_auto_refresh),
+            ("停止邮箱检查", self._stop_mail_health_checks),
+            ("停止账号刷新任务", self._stop_account_refresh_workers),
+        ]
+        if getattr(self, "app_updates", None):
+            operations.append(("停止更新服务", lambda: self.app_updates.close(timeout=2.0)))
+        optional_count = len(operations)
+        gateway_server = getattr(self.web2api, "server", None)
+        gateway_thread = getattr(self.web2api, "thread", None)
+        gateway_failed = False
+
+        def stop_gateway():
+            nonlocal gateway_failed
+            if gateway_failed and gateway_server is not None:
+                # Web2API.stop clears its references before shutdown/flush.
+                # Retain the original target when that call raises so retry
+                # cannot mistake a cleared reference for completed cleanup.
+                with self.web2api.lock:
+                    if self.web2api.server is not None and self.web2api.server is not gateway_server:
+                        raise _app.core.ManagerError("本地服务实例已变化，无法确认旧服务退出。")
+                    self.web2api.server = gateway_server
+                    self.web2api.thread = gateway_thread
+            # status() rebuilds account/quota summaries; a live server reference
+            # is sufficient here and avoids that work during every exit.
+            running = bool(self.web2api.server) if hasattr(self.web2api, "server") else bool(self.web2api.status().get("running"))
+            if running:
+                try:
+                    self.web2api.stop(disable=False)
+                except Exception:
+                    gateway_failed = True
+                    raise
+
+        operations.extend([
+            ("停止本地服务", stop_gateway),
+            ("取消 OAuth", self.oauth.close),
+            ("关闭中转站登录窗口", lambda: self.relay_portal.close(silent=True)),
+        ])
+        outcomes = {}
+        timings = {}
+        outcome_lock = _app.threading.Lock()
+
+        def stop_one(label, callback):
+            operation_started = _app.time.monotonic()
+            error = None
+            try:
+                callback()
+            except Exception as exc:
+                error = f"{label}：{_app.core._redact_sensitive_text(exc, limit=300)}"
+            with outcome_lock:
+                outcomes[label] = error
+                timings[label] = round((_app.time.monotonic() - operation_started) * 1000, 1)
+
+        workers = []
+        for index, (label, callback) in enumerate(operations):
+            workers.append((label, _app.threading.Thread(
+                target=stop_one, args=(label, callback),
+                name=f"agent-manager-worker-stop-{index}", daemon=True,
+            )))
+        return {
+            "workers": workers, "optionalCount": optional_count,
+            "outcomes": outcomes, "timings": timings, "lock": outcome_lock,
+            "started": _app.threading.Event(),
+            "operations": operations, "stopOne": stop_one,
+        }
+
+    def _close_services(self, timeout_seconds: float = 2.0) -> dict:
+        """One shared wait budget, retaining required pending cleanup for retry."""
+        started = _app.time.monotonic()
+        deadline = started + max(0.0, min(float(timeout_seconds), 5.0))
+        with self.lock:
+            state = getattr(self, "_service_shutdown", None)
+            to_start = []
+            if state is None:
+                state = self._new_service_shutdown()
+                self._service_shutdown = state
+                to_start = [worker for _label, worker in state["workers"]]
+            elif state["started"].is_set():
+                # Explicit retry only restarts failed required callbacks. A
+                # still-running stop retains its original worker and target.
+                with state["lock"]:
+                    for index in range(state["optionalCount"], len(state["workers"])):
+                        label, previous = state["workers"][index]
+                        if previous.is_alive() or not state["outcomes"].get(label):
+                            continue
+                        worker = _app.threading.Thread(
+                            target=state["stopOne"], args=state["operations"][index],
+                            name=f"agent-manager-worker-stop-{index}", daemon=True,
+                        )
+                        state["workers"][index] = (label, worker)
+                        state["outcomes"].pop(label, None)
+                        state["timings"].pop(label, None)
+                        to_start.append(worker)
+                if to_start:
+                    state["started"].clear()
+        if to_start:
+            for worker in to_start:
+                worker.start()
+            state["started"].set()
+        ready = state["started"].wait(max(0.0, deadline - _app.time.monotonic()))
+        if ready:
+            for _label, worker in state["workers"]:
+                worker.join(timeout=max(0.0, deadline - _app.time.monotonic()))
+        with state["lock"]:
+            errors = [state["outcomes"][label] for label, _worker in state["workers"] if state["outcomes"].get(label)]
+            timing_snapshot = dict(state["timings"])
+            required_errors = {
+                label: state["outcomes"][label]
+                for label, _worker in state["workers"][state["optionalCount"]:]
+                if state["outcomes"].get(label)
+            }
+        lingering = [label for label, worker in state["workers"] if not ready or worker.is_alive()]
+        pending_required = [
+            label for label, worker in state["workers"][state["optionalCount"]:]
+            if not ready or worker.is_alive()
+        ]
+        return {
+            "elapsedMs": round((_app.time.monotonic() - started) * 1000, 1),
+            "lingeringWorkers": lingering,
+            "pendingRequired": pending_required,
+            "requiredErrors": required_errors,
+            "errors": errors,
+            "timings": timing_snapshot,
+        }
+
+    def _finish_service_close(self) -> dict:
+        cleanup = self._close_services()
+        with self.lock:
+            result = self._close_result
+            result["serviceCleanup"] = cleanup
+            result["errors"] = list(cleanup["errors"])
+            if cleanup["pendingRequired"] or cleanup.get("requiredErrors"):
+                message = (
+                    "组件仍在退出，管理器已保留；请稍后重试退出：" + "、".join(cleanup["pendingRequired"])
+                    if cleanup["pendingRequired"] else
+                    "组件退出失败，管理器已保留；请重试退出：" + "、".join(cleanup["requiredErrors"])
+                )
+                result.update(completed=False, blocked="services")
+                result["errors"].append(message)
+                self.configuration_session.update(
+                    status="error", recoverable=True, recoveryOnly=True,
+                    message=message, error=message,
+                )
+            else:
+                result["completed"] = True
+                result.pop("blocked", None)
+                self.configuration_session.update(
+                    recoveryOnly=bool(self._service_closed_session.get("recoveryOnly")),
+                    recoverable=bool(self._service_closed_session.get("recoverable")),
+                )
+                self.configuration_session.update(self._service_closed_session)
+                self.configuration_session["error"] = "；".join(result["errors"]) or None
+            return result
 
     def resume_after_failed_restart(self) -> None:
         """Resume periodic workers when preflight failed before shutdown."""
@@ -1163,36 +1340,16 @@ class ManagerRuntime:
 
     def close_for_restart(self, *, exit_only: bool = False) -> dict:
         """Preserve Codex only for a handoff or the explicit manager-only exit."""
+        if self._closed and self._close_result:
+            return self._finish_service_close() if self._close_result.get("blocked") == "services" else self._close_result
         prepared = self.prepare_for_restart()
         with self.lock:
             if self._closed:
                 return self._close_result or {"preserved": True, "alreadyClosed": True}
             session_was_active = bool(self.configuration_session.get("active"))
             self._closed = True
-            errors = []
-            if getattr(self, "app_updates", None):
-                try:
-                    self.app_updates.close(timeout=2.0)
-                except Exception as exc:
-                    errors.append(f"停止更新服务：{str(exc)[:300]}")
-            try:
-                web2api_running = bool(self.web2api.status().get("running"))
-            except Exception as exc:
-                web2api_running = bool(getattr(self.web2api, "server", None))
-                errors.append(f"读取本地服务状态：{str(exc)[:300]}")
-            if web2api_running:
-                try:
-                    self.web2api.stop(disable=False)
-                except Exception as exc:
-                    errors.append(f"停止本地服务：{str(exc)[:300]}")
-            try:
-                self.oauth.close()
-            except Exception as exc:
-                errors.append(f"取消 OAuth：{str(exc)[:300]}")
-            try:
-                self.relay_portal.close(silent=True)
-            except Exception as exc:
-                errors.append(f"关闭中转站登录窗口：{str(exc)[:300]}")
+        errors = []
+        with self.lock:
             self.configuration_session.update(
                 {
                     "status": "exited" if exit_only else "restarting",
@@ -1206,7 +1363,8 @@ class ManagerRuntime:
                 }
             )
             self._close_result = {
-                "completed": True,
+                "completed": False,
+                "blocked": "services",
                 "restorationComplete": False,
                 "preserved": True,
                 "restored": False,
@@ -1215,12 +1373,27 @@ class ManagerRuntime:
                 "errors": errors,
                 "restartPreparation": prepared,
             }
-            return self._close_result
+            self._service_closed_session = dict(self.configuration_session)
+        return self._finish_service_close()
 
     def close(self) -> dict:
         # Worker callbacks may need self.lock to finish. Drain them before
         # acquiring it for the restore transaction.
+        if self._closed and self._close_result:
+            was_pending = self._close_result.get("blocked") == "services"
+            result = self._finish_service_close() if was_pending else self._close_result
+            if not was_pending or not result.get("completed") or not result.get("preserved"):
+                return result
+            # A previously requested manager-only exit may be pending when the
+            # user chooses full exit instead. Do not reuse its preserved result
+            # as evidence that the baseline has been restored.
+            with self.lock:
+                self._closed = False
+                self._close_result = None
+                self._restart_prepared = False
+                self._restart_prepare_result = None
         prepared = self.prepare_for_restart()
+        timing = {}
         with self.lock:
             if self._closed:
                 return self._close_result or {"restored": False, "alreadyClosed": True}
@@ -1235,14 +1408,18 @@ class ManagerRuntime:
                 if prepared.get("lingeringWorkers"):
                     raise _app.core.ManagerError("后台任务尚未停止，已取消配置恢复；请稍后重试退出。")
                 if session_was_active:
+                    stage_started = _app.time.monotonic()
                     if _app.core._require_codex_process_scan_known():
                         closed = _app._close_codex_processes_safely()
                     # A successful termination request is not evidence that
                     # Codex is gone. Also reject unknown/partial process scans.
                     if _app.core._require_codex_process_scan_known():
                         raise _app.core.ManagerError("Codex 仍在运行，未恢复配置或停止本地服务。")
+                    timing["codexCloseMs"] = round((_app.time.monotonic() - stage_started) * 1000, 1)
                 restore_attempted = True
+                stage_started = _app.time.monotonic()
                 restored = _app.core.restore_runtime_configuration_overlay()
+                timing["restoreMs"] = round((_app.time.monotonic() - stage_started) * 1000, 1)
                 if self.configuration_session.get("restorePending") and not _app.core.RUNTIME_OVERLAY_FILE.exists() and not restored.get("restored"):
                     previous = self.configuration_session.get("restore") or {}
                     session_id = previous.get("sessionId")
@@ -1302,45 +1479,14 @@ class ManagerRuntime:
                     "closedCodex": closed,
                     "errors": [error],
                     "blocked": "restoration" if restore_attempted else "codex-or-workers",
+                    "restartPreparation": prepared,
+                    "shutdownTiming": timing,
                 }
             # Do not mark this runtime closed or dismantle the gateway until
             # restoration is verified. Failed attempts remain retryable.
             self._closed = True
-            errors = []
-            for label, stop in (
-                ("停止更新检查", self._stop_update_checks),
-                ("停止雷达监控", self._stop_radar_monitor),
-                ("停止账号自动刷新", self._stop_account_auto_refresh),
-                ("停止邮箱检查", self._stop_mail_health_checks),
-                ("停止账号刷新任务", self._stop_account_refresh_workers),
-            ):
-                try:
-                    stop()
-                except Exception as exc:
-                    errors.append(f"{label}：{str(exc)[:300]}")
-            if getattr(self, "app_updates", None):
-                try:
-                    self.app_updates.close(timeout=2.0)
-                except Exception as exc:
-                    errors.append(f"停止更新服务：{str(exc)[:300]}")
-            try:
-                web2api_running = bool(self.web2api.status().get("running"))
-            except Exception as exc:
-                web2api_running = bool(getattr(self.web2api, "server", None))
-                errors.append(f"读取本地服务状态：{str(exc)[:300]}")
-            if web2api_running:
-                try:
-                    self.web2api.stop(disable=False)
-                except Exception as exc:
-                    errors.append(f"停止本地服务：{str(exc)[:300]}")
-            try:
-                self.oauth.close()
-            except Exception as exc:
-                errors.append(f"取消 OAuth：{str(exc)[:300]}")
-            try:
-                self.relay_portal.close(silent=True)
-            except Exception as exc:
-                errors.append(f"关闭中转站登录窗口：{str(exc)[:300]}")
+        errors = []
+        with self.lock:
             self.configuration_session.update(
                 {
                     "status": "restored" if restored.get("restored") else "closed",
@@ -1359,13 +1505,17 @@ class ManagerRuntime:
                 }
             )
             self._close_result = {
-                "completed": True,
+                "completed": False,
+                "blocked": "services",
                 "restorationComplete": True,
                 "restored": bool(restored.get("restored")),
                 "restore": restored,
                 "closedCodex": closed,
                 "launch": None,
                 "errors": errors,
+                "restartPreparation": prepared,
+                "shutdownTiming": timing,
             }
-            return self._close_result
+            self._service_closed_session = dict(self.configuration_session)
+        return self._finish_service_close()
 

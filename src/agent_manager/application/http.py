@@ -320,6 +320,9 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                 if path == "/api/application/location":
                     self._json({"ok": True, "location": _app.application_location_status(self.server)})
                     return
+                if path == "/api/exit-only/preflight":
+                    self._json({"ok": True, "preflight": self.server.runtime.exit_only_preflight()})
+                    return
                 if path == "/api/app-lifecycle":
                     self._json(
                         {
@@ -588,7 +591,13 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                         "message": result.get("message") or "正在移动程序并重启管理器。"})
                 elif path == "/api/application/location/shortcut":
                     result = _app.create_application_shortcut(self.server)
-                    self._json({"ok": True, "result": result, "message": "桌面快捷方式已创建。"})
+                    if not result.get("verified") or not result.get("exists"):
+                        raise _app.core.ManagerError("未能确认桌面快捷方式已保存，请重试。")
+                    self._json({"ok": True, "result": result,
+                        "message": "桌面快捷方式已创建。" if result.get("created") else "桌面快捷方式已就绪。"})
+                elif path == "/api/application/location/shortcut/reveal":
+                    result = _app.reveal_application_shortcut(self.server)
+                    self._json({"ok": True, "result": result})
                 else:
                     raise _app.core.ManagerError("应用位置操作不存在。")
                 return
@@ -1448,8 +1457,10 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                 _app.request_application_shutdown(self.server)
                 return
             if path == "/api/exit-only":
+                payload = self._read_json(optional=True)
+                if not _app.request_application_exit_only(self.server, confirmed=payload.get("confirmed") is True):
+                    raise _app.core.ManagerError("管理器已在退出或重启中。")
                 self._json({"ok": True})
-                _app.request_application_exit_only(self.server)
                 return
             if path == "/api/configuration-session/retry":
                 self._read_json(optional=True)

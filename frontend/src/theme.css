@@ -150,7 +150,7 @@ button, button *, [role="tab"], [role="tab"] *, [role="option"], [role="option"]
 .sidebar nav > button.active > span { background: var(--accent-soft); }
 .sidebar nav button i { display: none; }
 .sidebar-status { border: 0; background: transparent; }
-.brand img { box-shadow: none; border-radius: 12px; }
+.brand img { box-shadow: none; border-radius: 0; }
 .brand strong, .brand span { font-weight: 650; }
 .brand span { color: var(--muted); font-size: 10px; letter-spacing: 1px; }
 .page { width: min(1500px,100%); padding: 34px clamp(24px,3vw,48px) 64px; }

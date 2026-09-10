@@ -9,6 +9,13 @@
 .application-location-error { color: var(--danger); }
 .application-location-feedback { display: flex; align-items: center; gap: 10px; color: var(--warning); font-size: 13px; }
 .application-location-modal .modal-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 16px 24px; }
+.application-location-cell { display: flex; flex-direction: column; align-items: stretch; justify-content: center; gap: 4px; }
+.application-location-cell .application-location-row { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 0; }
+.application-location-cell .application-location-path { color: var(--muted); font-size: 12px; padding: 0; line-height: 1.5; }
+.application-location-cell .application-location-actions { flex-wrap: wrap; gap: 8px; }
+.application-location-cell .application-location-actions .button { min-height: 34px; }
+.application-shortcut-result { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; color: var(--muted); font-size: 11px; }
+.application-shortcut-result span { min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 760px) {
   .application-location-row { align-items: stretch; flex-direction: column; gap: 8px; }
   .application-location-actions { flex-wrap: wrap; }

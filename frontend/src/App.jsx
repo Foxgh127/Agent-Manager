@@ -1,4 +1,5 @@
 import { APP_VERSION } from "./version.js";
+import appIconUrl from "../../packaging/app-icon.png";
 import {
   useCallback,
   useEffect,
@@ -4910,12 +4911,6 @@ export function SwitchProgressModal({ operation, onClose, onRetry, retrying = fa
             );
           })}
         </ol>
-        {running && elapsedSeconds >= 4 && (
-          <div className="switch-progress-note">
-            <Clock3 size={17} />
-            <span>Windows 首次唤起或旧进程退出可能稍慢；当前操作仍在推进，请不要重复点击。</span>
-          </div>
-        )}
         {failed && operation.error && (
           <div className="switch-progress-error"><AlertTriangle size={17} /><span>{operation.error}</span></div>
         )}
@@ -7713,10 +7708,6 @@ function OrchestrationView({
               <span className="runtime-quick-icon"><Gauge size={18} /></span>
               <span className="runtime-quick-copy">
                 <strong>上下文与自动压缩</strong>
-                <small>{expectedContextBudget.usable != null
-                  ? `${configDocument?.common?.modelInputReferenceMax ? `模型总上下文 ${formatTokenCount(modelContextReferenceMax)}，最大输入 ${formatTokenCount(configDocument.common.modelInputReferenceMax)}；` : ""}Codex 另预留 ${expectedContextBudget.reservedPercent}%。设置值受输入上限约束，保存同步后需让 Codex 重新加载配置。`
-                  : "上下文是总容量；当前来源未提供可用比例，Codex 实际容量以运行时报告为准。"}</small>
-                {expectedContextBudget.capped && <small>当前设置超过已知输入范围；预计按 {formatTokenCount(expectedContextBudget.total)} 输入窗口生效。</small>}
               </span>
               <span className="runtime-current-state"><em>当前</em><strong>{contextCurrentLabel}</strong></span>
               <div className="runtime-linked-controls">
@@ -10634,7 +10625,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
         </article>
       </div>
       <div className={cx("repair-section", healthy && "healthy")}>
-        <div className="repair-heading"><span>{healthy ? <ShieldCheck size={18} /> : <ShieldAlert size={18} />}</span><div><strong>{configurationPending ? "正在激活临时配置" : !checked ? "尚未检查配置" : healthy ? "Codex 配置健康" : "Codex 配置需要处理"}</strong><small>{configurationPending ? "激活完成后自动核对；其他诊断结果仍列于下方" : !checked ? "刷新状态后查看具体检查结果" : healthy ? `配置已同步 · ${modelCount} 个当前可用模型 · ${data.codexVersion || "版本已检测"}` : issues.length ? `发现 ${issues.length} 个配置或运行问题 · ${canRepair ? "可以自动修复" : "请按下方提示处理"}` : "配置尚未同步，请重新检查后应用"}</small></div>{!healthy && canRepair ? <button className="button primary" disabled={working === "repair"} onClick={repair}>{working === "repair" ? <Loader2 className="spin" size={15} /> : <Wrench size={15} />}修复问题</button> : !healthy ? <span className={cx("status-pill", checked && "warning")}>{checked ? "需按提示处理" : "待检查"}</span> : null}</div>
+        <div className="repair-heading"><span>{healthy ? <ShieldCheck size={18} /> : <ShieldAlert size={18} />}</span><div><strong>{configurationPending ? "正在激活临时配置" : !checked ? "尚未检查配置" : healthy ? "Codex 配置健康" : "Codex 配置需要处理"}</strong><small>{configurationPending ? "激活完成后自动核对；其他诊断结果仍列于下方" : !checked ? "刷新状态后查看具体检查结果" : healthy ? `配置已同步 · ${modelCount} 个当前可用模型` : issues.length ? `发现 ${issues.length} 个配置或运行问题 · ${canRepair ? "可以自动修复" : "请按下方提示处理"}` : "配置尚未同步，请重新检查后应用"}</small></div>{!healthy && canRepair ? <button className="button primary" disabled={working === "repair"} onClick={repair}>{working === "repair" ? <Loader2 className="spin" size={15} /> : <Wrench size={15} />}修复问题</button> : !healthy ? <span className={cx("status-pill", checked && "warning")}>{checked ? "需按提示处理" : "待检查"}</span> : null}</div>
         {!healthy && <div className="repair-checks">
           {checkItems.map((item, index) => {
             const ok = item.ok ?? item.healthy ?? item.status === "ok";
@@ -10648,6 +10639,12 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
 }
 
 function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
+  const lifecycleInFlight = useRef(false);
+  const exitWatch = useRef({ timer: null, cancelled: false });
+  useEffect(() => () => {
+    exitWatch.current.cancelled = true;
+    window.clearTimeout(exitWatch.current.timer);
+  }, []);
   const [closeToTray, setCloseToTray] = useState(
     Boolean(data.settings.appBehavior?.closeToTray),
   );
@@ -10724,17 +10721,64 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
       notify(error.message, "error");
     }
   };
+  const exitManager = async (onlyManager) => {
+    if (lifecycleInFlight.current || busy) return;
+    lifecycleInFlight.current = true;
+    setBusy(true);
+    try {
+      const preflight = onlyManager ? (await api("/api/exit-only/preflight")).preflight : null;
+      const approved = await confirm(onlyManager ? {
+        tone: "warning", title: "仅退出 Agent Manager？",
+        message: "只退出管理器，不关闭当前 Codex，也不还原当前临时配置。",
+        detail: preflight?.requiresConfirmation ? preflight.message : "下次打开管理器会继续接管并校验当前配置。",
+        confirmLabel: "仅退出软件",
+      } : {
+        tone: "danger", title: "彻底退出 Agent Manager？",
+        message: "应用窗口、系统托盘、本地 API 服务和正在运行的 Codex 都会停止。",
+        detail: "默认 Codex 配置会被还原；账号与管理器配置会保留。",
+        confirmLabel: "彻底退出",
+      });
+      if (approved) {
+        const requestedAt = Date.now();
+        await api(onlyManager ? "/api/exit-only" : "/api/shutdown", {
+          method: "POST", body: JSON.stringify(onlyManager ? { confirmed: preflight?.requiresConfirmation === true } : {}),
+        });
+        window.clearTimeout(exitWatch.current.timer);
+        let attempts = 0;
+        const checkFailure = async () => {
+          if (exitWatch.current.cancelled) return;
+          attempts += 1;
+          try {
+            const result = await api("/api/app-lifecycle", { timeoutMs: 750 });
+            const status = result.shutdown || {};
+            if (Date.parse(status.at || "") >= requestedAt - 2000 && String(status.phase || "").startsWith("blocked-")) {
+              if (!exitWatch.current.cancelled) {
+                notify(status.errors?.[0] || "退出尚未完成，请稍后重试", "error");
+                reload().catch(() => {});
+              }
+              return;
+            }
+          } catch { /* The closing server is normally unavailable. */ }
+          if (!exitWatch.current.cancelled && attempts < 8) exitWatch.current.timer = window.setTimeout(checkFailure, 500);
+        };
+        exitWatch.current.timer = window.setTimeout(checkFailure, 500);
+      }
+    } catch (error) { notify(error.message, "error"); }
+    finally { lifecycleInFlight.current = false; setBusy(false); }
+  };
   const quickRestart = async () => {
-    const approved = await confirm({
+    if (lifecycleInFlight.current || busy) return;
+    lifecycleInFlight.current = true;
+    setBusy(true);
+    try {
+      const approved = await confirm({
       tone: "warning",
       title: "快速重启 Agent Manager？",
       message: "这只会重启管理器及其本地后台服务，不会关闭或重新打开 Codex。",
       detail: "当前管理器页面会短暂断开，服务恢复后可重新访问。",
       confirmLabel: "快速重启",
     });
-    if (!approved) return;
-    setBusy(true);
-    try {
+      if (!approved) return;
       notify("正在预热新窗口，当前服务会尽量保持可用");
       const restart = await api("/api/quick-restart", { method: "POST", body: "{}", timeoutMs: 60_000 });
       notify("管理器正在快速重启；Codex 保持当前状态");
@@ -10754,7 +10798,7 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
             }`;
             break;
           }
-          if (shutdown.phase === "blocked-codex-still-running") {
+          if (String(shutdown.phase || "").startsWith("blocked-")) {
             terminalError = `快速重启已取消${
               shutdown.errors?.length ? `：${shutdown.errors.join("；")}` : "；Codex 保持运行。"
             }`;
@@ -10773,6 +10817,7 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
     } catch (error) {
       notify(error.message, "error");
     } finally {
+      lifecycleInFlight.current = false;
       setBusy(false);
     }
   };
@@ -10798,7 +10843,7 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
             </span>
             <div>
               <h2>应用行为</h2>
-              <p>窗口关闭与后台运行</p>
+              <p>窗口、后台任务与应用位置</p>
             </div>
           </header>
           <label className="setting-row">
@@ -10854,8 +10899,8 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
               <option value={168}>每周</option>
             </select>
           </label>
+          <ApplicationLocationPanel api={api} notify={notify} disabled={busy} embedded />
         </section>
-        <ApplicationLocationPanel api={api} notify={notify} disabled={busy} />
         <UpdateEmergencyPanel data={data} reload={reload} notify={notify} confirm={confirm} />
         <RecoveryPanel api={api} notify={notify} confirm={confirm} onRestored={reload} gatewayRunning={data.web2apiStatus.running} />
         <section className="settings-card danger-zone full">
@@ -10880,19 +10925,7 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
             <button
               className="button secondary"
               disabled={busy}
-              onClick={async () => {
-                const approved = await confirm({
-                  tone: "warning",
-                  title: "仅退出 Agent Manager？",
-                  message: "只退出管理器，不关闭当前 Codex，也不还原当前临时配置。",
-                  detail: data.web2apiStatus.running
-                    ? "本地 API 会随管理器停止；若 Codex 正在使用聚合、子代理或中转站路由，请在继续对话前重新打开 Agent Manager。"
-                    : "下次打开管理器会继续接管并校验当前配置。",
-                  confirmLabel: "仅退出软件",
-                });
-                if (approved)
-                  await api("/api/exit-only", { method: "POST", body: "{}" });
-              }}
+              onClick={() => exitManager(true)}
             >
               <X size={16} />
               仅退出软件
@@ -10900,17 +10933,7 @@ function SettingsView({ data, reload, notify, confirm, setBusy, busy }) {
             <button
               className="button danger-outline"
               disabled={busy}
-              onClick={async () => {
-                const approved = await confirm({
-                  tone: "danger",
-                  title: "彻底退出 Agent Manager？",
-                  message: "应用窗口、系统托盘、本地 API 服务和正在运行的 Codex 都会停止。",
-                  detail: "默认 Codex 配置会被还原，但不会自动重新打开 Codex；账号与管理器配置会保留。",
-                  confirmLabel: "彻底退出",
-                });
-                if (approved)
-                  await api("/api/shutdown", { method: "POST", body: "{}" });
-              }}
+              onClick={() => exitManager(false)}
             >
               <LogOut size={16} />
               彻底退出
@@ -11034,7 +11057,7 @@ function ClaudeWorkspace({ onBack, notify, confirm }) {
   return (
     <div className="claude-workspace">
       <aside className="claude-sidebar">
-        <button className="brand" onClick={onBack} title="返回 Agent Manager 首页"><img src="/app-icon.png" alt="" /><div><strong>Agent</strong><span>Manager</span></div></button>
+        <button className="brand" onClick={onBack} title="返回 Agent Manager 首页"><img src={appIconUrl} alt="" /><div><strong>Agent</strong><span>Manager</span></div></button>
         <div className="claude-platform"><span><ClaudeBrandMark /></span><div><small>ANTHROPIC</small><strong>Claude Desktop</strong></div></div>
         <nav><button className="active"><span><Settings size={19} /></span><div><strong>Desktop 工作台</strong><small>官方恢复与 3P 直连</small></div><i /></button></nav>
         <div className="claude-safety"><ShieldCheck size={18} /><span><strong>OAuth 边界</strong><small>官方账号只在 Claude Desktop 内登录与切换</small></span></div>
@@ -11075,7 +11098,7 @@ function ProductHome({ onOpenCodex, onOpenClaude }) {
   return (
     <main id="main-content" className="product-home">
       <header className="home-brand">
-        <img src="/app-icon.png" alt="" />
+        <img src={appIconUrl} alt="" />
         <span>
           <strong>Agent Manager</strong>
           <small>一个入口，管理你的 AI 开发工作台</small>
@@ -11370,7 +11393,7 @@ export default function App() {
   if (!data)
     return (
       <div className="app-loading">
-        <img src="/app-icon.png" alt="" />
+        <img src={appIconUrl} alt="" />
         <Loader2 className="spin" size={22} />
         <span>正在读取账号与模型…</span>
       </div>
@@ -11399,7 +11422,7 @@ export default function App() {
           onClick={returnHome}
           title="返回 Agent Manager 首页"
         >
-          <img src="/app-icon.png" alt="" />
+          <img src={appIconUrl} alt="" />
           <div>
             <strong>Agent</strong>
             <span>Manager</span>

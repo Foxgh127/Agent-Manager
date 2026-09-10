@@ -93,6 +93,18 @@ def create_application_shortcut(server):
         service._operation.release()
 
 
+def reveal_application_shortcut(server):
+    from agent_manager.updates.location import reveal_desktop_shortcut
+    service = server.runtime.get_app_updates()
+    if not service._operation.acquire(blocking=False):
+        raise _app.core.ManagerError("正在更新或移动程序，请稍后定位快捷方式。")
+    try:
+        assert_application_location_idle(server)
+        return reveal_desktop_shortcut(state_dir=_app.core.STATE_DIR)
+    finally:
+        service._operation.release()
+
+
 def finish_application_location_handoff(server):
     """Resume a verified relocation cleanup once the new window is ready."""
     try:

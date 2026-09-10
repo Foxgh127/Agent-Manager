@@ -300,25 +300,38 @@ def close_codex_processes(timeout_seconds: float = 10.0) -> dict:
     if not targets:
         raise _core.ManagerError("检测到了 Codex 进程，但无法读取安全的进程 ID。")
     flags = getattr(_core.subprocess, "CREATE_NO_WINDOW", 0)
+    started = _core.time.monotonic()
+    deadline = started + timeout
+    # Include taskkill itself in both budgets. Previously every PID could spend
+    # eight seconds before the nominal graceful/force wait even began.
+    graceful_deadline = started + min(3.0, timeout / 2)
 
-    def terminate(pid: str, force: bool = False) -> None:
-        command = ["taskkill.exe"]
-        if force:
-            command.append("/F")
-        command.extend(["/PID", pid])
-        try:
-            _core.subprocess.run(
-                command,
-                stdin=_core.subprocess.DEVNULL,
-                stdout=_core.subprocess.DEVNULL,
-                stderr=_core.subprocess.DEVNULL,
-                timeout=8,
-                creationflags=flags,
-            )
-        except (OSError, _core.subprocess.TimeoutExpired):
-            # The verification loop below is authoritative; taskkill can return an
-            # error when a process exits between enumeration and termination.
-            pass
+    def terminate(pids: list[str], *, force: bool, until: float) -> list[str]:
+        issued = []
+        # Bounded exact-PID batches avoid one shell/process launch per renderer.
+        # Never use /T, /IM or any image-name/wildcard termination.
+        for offset in range(0, len(pids), 64):
+            remaining_seconds = until - _core.time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            batch = pids[offset:offset + 64]
+            command = ["taskkill.exe", *(["/F"] if force else [])]
+            for pid in batch:
+                command.extend(["/PID", pid])
+            issued.extend(batch)
+            try:
+                _core.subprocess.run(
+                    command,
+                    stdin=_core.subprocess.DEVNULL,
+                    stdout=_core.subprocess.DEVNULL,
+                    stderr=_core.subprocess.DEVNULL,
+                    timeout=min(8.0, remaining_seconds),
+                    creationflags=flags,
+                )
+            except (OSError, _core.subprocess.TimeoutExpired):
+                # A successful/failed command is not evidence of process exit.
+                pass
+        return issued
 
     def process_depth(pid: str, records: dict[str, dict]) -> int:
         depth = 0
@@ -330,93 +343,72 @@ def close_codex_processes(timeout_seconds: float = 10.0) -> dict:
             parent = str(records.get(parent, {}).get("parentPid") or "")
         return depth
 
-    root_pids = [pid for pid, item in targets.items() if item["parentPid"] not in targets]
-    graceful_order = sorted(
-        targets,
-        key=lambda pid: (process_depth(pid, targets), int(pid)),
-        reverse=False,
-    )
-    for pid in graceful_order:
-        terminate(pid)
-    # Three seconds is enough for the Desktop root to tear down its renderers.
-    # The previous six-second grace period was paid on nearly every account
-    # switch when a renderer respawned after being terminated before its root.
-    graceful_budget = min(timeout, 3.0)
-    graceful_deadline = _core.time.monotonic() + graceful_budget
-    remaining: dict[str, str] = {}
-    current_after_grace: list[dict] = initial
-    while _core.time.monotonic() < graceful_deadline:
-        current, retries = _core._require_known_codex_processes_with_retry(
-            attempts=12,
-            context="等待 Codex 退出时",
-        )
-        scan_retries += retries
-        current_after_grace = current
-        running = {str(item.get("pid")): str(item.get("name")) for item in current}
-        newly_discovered = []
-        for item in current:
-            pid = str(item.get("pid") or "")
-            name = str(item.get("name") or "")
-            if not pid.isdigit() or not name or pid in targets:
-                continue
-            targets[pid] = {
-                "name": name,
-                "parentPid": str(item.get("parentPid") or ""),
-            }
-            newly_discovered.append(pid)
-        for pid in sorted(
-            newly_discovered,
-            key=lambda value: (process_depth(value, targets), int(value)),
-            reverse=True,
-        ):
-            terminate(pid)
-        remaining = {
-            pid: item["name"]
-            for pid, item in targets.items()
-            if running.get(pid, "").casefold() == item["name"].casefold()
-        }
-        if not running:
-            break
-        _core.time.sleep(0.15)
+    def depth_batches(pids, records, *, reverse=False):
+        groups = {}
+        for pid in pids:
+            groups.setdefault(process_depth(pid, records), []).append(pid)
+        batches = []
+        for depth in sorted(groups, reverse=reverse):
+            ordered = sorted(groups[depth], key=int, reverse=reverse)
+            batches.extend(ordered[offset:offset + 64] for offset in range(0, len(ordered), 64))
+        return batches
 
-    forced = []
-    if current_after_grace:
-        # Confirm each target still resolves to the same image immediately before
-        # force-closing it. The scanner has already verified each executable path.
-        current_records = {
+    def records_for(processes):
+        return {
             str(item.get("pid")): {
                 "name": str(item.get("name")),
                 "parentPid": str(item.get("parentPid") or ""),
             }
-            for item in current_after_grace
+            for item in processes
             if str(item.get("pid") or "").isdigit() and str(item.get("name") or "")
         }
-        for pid, record in current_records.items():
-            targets.setdefault(pid, record)
-        remaining = {pid: record["name"] for pid, record in current_records.items()}
-        force_order = sorted(
-            remaining,
-            key=lambda pid: (process_depth(pid, current_records), int(pid)),
-            reverse=True,
+
+    def observe(until, context):
+        nonlocal scan_retries
+        # Reserve only the retry sleeps that still fit. At expiry, perform one
+        # authoritative scan: a deadline must never turn unknown into stopped.
+        attempts = max(1, min(12, int(max(0.0, until - _core.time.monotonic()) / 0.12) + 1))
+        current, retries = _core._require_known_codex_processes_with_retry(
+            attempts=attempts, context=context,
         )
-        for pid in force_order:
-            forced.append(pid)
-            terminate(pid, force=True)
-        force_deadline = _core.time.monotonic() + max(1.0, timeout - graceful_budget)
-        while _core.time.monotonic() < force_deadline:
-            current, retries = _core._require_known_codex_processes_with_retry(
-                attempts=12,
-                context="强制关闭后的回验中",
-            )
-            scan_retries += retries
-            remaining = {
-                str(item.get("pid")): str(item.get("name"))
-                for item in current
-                if str(item.get("pid") or "").isdigit() and str(item.get("name") or "")
-            }
-            if not current:
+        scan_retries += retries
+        return current
+
+    root_pids = [pid for pid, item in targets.items() if item["parentPid"] not in targets]
+    for batch in depth_batches(targets, targets):
+        terminate(batch, force=False, until=graceful_deadline)
+
+    while True:
+        current = observe(graceful_deadline, "等待 Codex 退出时")
+        current_records = records_for(current)
+        if not current or _core.time.monotonic() >= graceful_deadline:
+            break
+        newly_discovered = [pid for pid in current_records if pid not in targets]
+        targets.update({pid: current_records[pid] for pid in newly_discovered})
+        for batch in depth_batches(newly_discovered, targets, reverse=True):
+            terminate(batch, force=False, until=graceful_deadline)
+        _core.time.sleep(max(0.0, min(0.15, graceful_deadline - _core.time.monotonic())))
+
+    forced = []
+    if current:
+        targets.update({pid: record for pid, record in current_records.items() if pid not in targets})
+        for batch in depth_batches(current_records, current_records, reverse=True):
+            if _core.time.monotonic() >= deadline:
                 break
-            _core.time.sleep(0.15)
+            # Revalidate after each potentially slow batch. Only records still
+            # path-verified by the scanner and matching the same image qualify.
+            fresh = records_for(observe(deadline, "强制关闭前的回验中"))
+            verified = [
+                pid for pid in batch if pid in fresh
+                and fresh[pid]["name"].casefold() == current_records[pid]["name"].casefold()
+            ]
+            forced.extend(terminate(verified, force=True, until=deadline))
+        while True:
+            current = observe(deadline, "强制关闭后的回验中")
+            if not current or _core.time.monotonic() >= deadline:
+                break
+            _core.time.sleep(max(0.0, min(0.15, deadline - _core.time.monotonic())))
+    remaining = {pid: record["name"] for pid, record in records_for(current).items()}
     if remaining:
         labels = ", ".join(f"{name} ({pid})" for pid, name in remaining.items())
         raise _core.ManagerError(f"无法自动关闭 Codex：{labels}。请手动关闭后重试。")

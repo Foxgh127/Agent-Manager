@@ -21,6 +21,11 @@ exe=args.executable.resolve(); archive=CArchiveReader(str(exe))
 keys={name.replace('\\','/'):name for name in archive.toc}
 for name in ('version.json','app-update-source.json','ui/index.html','ui/app-icon.png'):
     require('agent_manager/resources/'+name in keys,'Missing packaged resource: '+name)
+require(archive.extract(keys['agent_manager/resources/ui/app-icon.png']) == (root/'frontend/public/app-icon.png').read_bytes(),
+        'Packaged tray artwork differs from current app artwork')
+icon_names=[name for name in keys if name.startswith('agent_manager/resources/ui/assets/app-icon-') and name.endswith('.png')]
+require(len(icon_names)==1 and archive.extract(keys[icon_names[0]]) == (root/'packaging/app-icon.png').read_bytes(),
+        'Packaged UI icon differs from the current artwork')
 packaged=json.loads(archive.extract(keys['agent_manager/resources/version.json']))
 require(packaged=={'version':version['VERSION'],'releaseEpoch':version['RELEASE_EPOCH']},'Packaged version differs from source')
 for name in ('agent_manager.core','agent_manager.application','agent_manager.config.backups','agent_manager.accounts.relay',

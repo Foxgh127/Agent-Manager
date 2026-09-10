@@ -3463,12 +3463,11 @@ class AgentManagerTests(unittest.TestCase):
         ):
             result = core.close_codex_processes()
         self.assertEqual(result["rootPids"], ["100"])
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 2)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(commands, [
             ["taskkill.exe", "/PID", "100"],
-            ["taskkill.exe", "/PID", "101"],
-            ["taskkill.exe", "/PID", "102"],
+            ["taskkill.exe", "/PID", "101", "/PID", "102"],
         ])
         self.assertTrue(all("/T" not in command for command in commands))
         self.assertEqual(set(result["closed"]), {"100", "101", "102"})

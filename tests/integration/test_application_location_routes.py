@@ -35,7 +35,7 @@ def test_location_routes_preserve_unicode_and_require_authorization(location_ser
     status = {"supported": True, "executable": directory + "\\AgentManager.exe"}
     read = Mock(return_value=status)
     move = Mock(return_value={"started": True})
-    shortcut = Mock(return_value={"created": True})
+    shortcut = Mock(return_value={"created": True, "verified": True, "exists": True})
     monkeypatch.setattr(app, "application_location_status", read)
     monkeypatch.setattr(app, "prepare_application_relocation", move)
     monkeypatch.setattr(app, "select_application_directory", lambda _: {"directory": directory})
@@ -77,3 +77,31 @@ def test_directory_picker_cancel_and_chinese_path(monkeypatch):
     server.native_window = False
     with pytest.raises(app.core.ManagerError, match="直接输入"):
         app.select_application_directory(server)
+
+
+def test_shortcut_route_rejects_unverified_success_and_reveal_uses_no_supplied_path(location_server, monkeypatch):
+    server, request = location_server
+    monkeypatch.setattr(app, "create_application_shortcut", lambda _: {"created": True})
+    assert request("/api/application/location/shortcut", {})[0] == 400
+    reveal = Mock(return_value={"revealed": True})
+    monkeypatch.setattr(app, "reveal_application_shortcut", reveal)
+    assert request("/api/application/location/shortcut/reveal", {"path": "D:/unrelated.exe"})[0] == 200
+    reveal.assert_called_once_with(server)
+
+
+def test_exit_only_checks_acknowledgment_before_writing_success(location_server, monkeypatch):
+    server, request = location_server
+    server.runtime.exit_only_preflight = lambda: {"requiresConfirmation": True, "gatewayRunning": True,
+        "message": "本地路由会停止"}
+    assert request("/api/exit-only/preflight")[1]["preflight"]["requiresConfirmation"]
+    calls = []
+    def exit_only(actual, *, confirmed=False):
+        calls.append(confirmed)
+        if not confirmed:
+            raise app.core.ManagerError("请确认本地路由会停止")
+        return True
+    monkeypatch.setattr(app, "request_application_exit_only", exit_only)
+    assert request("/api/exit-only", {})[0] == 400
+    assert request("/api/exit-only", {"confirmed": "false"})[0] == 400
+    assert request("/api/exit-only", {"confirmed": True})[0] == 200
+    assert calls == [False, False, True]

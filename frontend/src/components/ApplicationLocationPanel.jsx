@@ -5,13 +5,14 @@ import "./ApplicationLocationPanel.css";
 
 const activeStates = new Set(["prepared", "waiting_for_exit", "copying", "verifying_startup"]);
 
-export default function ApplicationLocationPanel({ api, notify, disabled = false }) {
+export default function ApplicationLocationPanel({ api, notify, disabled = false, embedded = false }) {
   const [location, setLocation] = useState(null);
   const [open, setOpen] = useState(false);
   const [directory, setDirectory] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [moving, setMoving] = useState(false);
+  const [shortcutInfo, setShortcutInfo] = useState(null);
   const inFlight = useRef(false);
   const mounted = useRef(true);
   const load = useCallback(async () => {
@@ -74,12 +75,17 @@ export default function ApplicationLocationPanel({ api, notify, disabled = false
     }
   });
   const shortcut = () => operate("shortcut", async () => {
+    setShortcutInfo(null);
     const result = await api("/api/application/location/shortcut", { method: "POST", body: "{}", timeoutMs: 30000 });
-    notify?.(result.message || "桌面快捷方式已创建", "success");
+    if (!result.result?.verified || !result.result?.exists || !result.result?.path) throw new Error("未能确认快捷方式已保存，请重试");
+    setShortcutInfo(result.result);
+    notify?.(result.message || (result.result.created ? "桌面快捷方式已创建" : "桌面快捷方式已就绪"), "success");
   });
   const unavailable = disabled || Boolean(busy) || moving || !location?.supported;
-  return <section className="settings-card full application-location-card" aria-labelledby="application-location-title">
-    <header><span><FolderOpen size={19} /></span><div><h2 id="application-location-title">应用位置</h2><p>移动程序或创建桌面快捷方式</p></div></header>
+  const Container = embedded ? "div" : "section";
+  return <Container className={embedded ? "setting-row static application-location-cell" : "settings-card full application-location-card"} aria-labelledby="application-location-title">
+    {embedded ? <strong id="application-location-title">应用位置</strong>
+      : <header><span><FolderOpen size={19} /></span><div><h2 id="application-location-title">应用位置</h2><p>移动程序或创建桌面快捷方式</p></div></header>}
     <div className="application-location-row">
       <button className="application-location-path" title={location?.executable || ""} disabled={unavailable}
         onClick={() => { setDirectory(location?.directory || ""); setError(""); setOpen(true); }}>
@@ -94,6 +100,12 @@ export default function ApplicationLocationPanel({ api, notify, disabled = false
         </button>
       </div>
     </div>
+    {shortcutInfo && <div className="application-shortcut-result" role="status">
+      <span title={shortcutInfo.path}>快捷方式：{shortcutInfo.path}</span>
+      <button className="button subtle compact" disabled={Boolean(busy) || moving} onClick={() => operate("reveal", async () => {
+        await api("/api/application/location/shortcut/reveal", { method: "POST", body: "{}" });
+      })}><FolderOpen size={13} />定位快捷方式</button>
+    </div>}
     {!location?.supported && location?.message && <p className="application-location-note">{location.message}</p>}
     {location?.relocation?.state === "cleanup_pending" && <p className="application-location-note" role="status">{location.relocation.message || "正在等待启动确认，原位置文件暂时保留。"}</p>}
     {error && !open && <div className="application-location-feedback" role="status"><span>{error}</span>
@@ -118,5 +130,5 @@ export default function ApplicationLocationPanel({ api, notify, disabled = false
         </button>
       </footer>
     </Modal>}
-  </section>;
+  </Container>;
 }

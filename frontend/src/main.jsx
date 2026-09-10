@@ -29,7 +29,7 @@ class ApplicationErrorBoundary extends Component {
     if (!this.state.error) return this.props.children;
     return (
       <main className="fatal-error" role="alert">
-        <img src="/app-icon.png" alt="" />
+        <img src={appIconUrl} alt="" />
         <span>SAFE RECOVERY</span>
         <h1>界面没有正常完成加载</h1>
         <p>账号、密钥与 Codex 配置均未因此修改。可以重新载入界面；若问题持续，请在设置中的诊断中心执行只读检查。</p>
@@ -46,3 +46,4 @@ createRoot(document.getElementById("root")).render(
     </ApplicationErrorBoundary>
   </StrictMode>,
 );
+import appIconUrl from "../../packaging/app-icon.png";
