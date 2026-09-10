@@ -275,27 +275,116 @@ namespace AgentManagerLocation {
     if (-not [IO.Directory]::Exists($path)) { throw 'Windows Desktop known folder is unavailable.' }
     return $path
 }
-function Test-OwnedShortcut($shell, [string]$path, [string]$target) {
+function Initialize-NativeShortcuts {
+    if ('AgentManagerLocation.NativeShortcuts' -as [type]) { return }
+    # WScript.Shell may convert shortcut paths through the system ANSI code
+    # page. Explicit IShellLinkW/IPersistFile preserve every UTF-16 path.
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+namespace AgentManagerLocation {
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellLinkW {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr findData, uint flags);
+        void GetIDList(out IntPtr idList);
+        void SetIDList(IntPtr idList);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string value);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string value);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string value);
+        void GetHotkey(out short hotkey);
+        void SetHotkey(short hotkey);
+        void GetShowCmd(out int command);
+        void SetShowCmd(int command);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, out int index);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+        void Resolve(IntPtr window, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+    }
+    public sealed class ShortcutData {
+        public string TargetPath { get; set; }
+        public string WorkingDirectory { get; set; }
+        public string Description { get; set; }
+        public string Arguments { get; set; }
+        public string IconPath { get; set; }
+        public int IconIndex { get; set; }
+        public int WindowStyle { get; set; }
+        public string IconLocation { get { return IconPath + "," + IconIndex; } }
+    }
+    public static class NativeShortcuts {
+        static object Create() {
+            return Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046"), true));
+        }
+        public static void Save(string path, string target, string description) {
+            object instance = Create();
+            try {
+                IShellLinkW link = (IShellLinkW)instance;
+                link.SetPath(target);
+                link.SetWorkingDirectory(Path.GetDirectoryName(target));
+                link.SetIconLocation(target, 0);
+                link.SetDescription(description);
+                link.SetArguments("");
+                link.SetShowCmd(1);
+                ((IPersistFile)instance).Save(path, true);
+            } finally { Marshal.FinalReleaseComObject(instance); }
+        }
+        public static ShortcutData Read(string path) {
+            object instance = Create();
+            try {
+                ((IPersistFile)instance).Load(path, 0);
+                IShellLinkW link = (IShellLinkW)instance;
+                StringBuilder buffer = new StringBuilder(32768);
+                ShortcutData data = new ShortcutData();
+                // SLGP_RAWPATH: read the stored target without Resolve, UI,
+                // search/tracking or network access to a missing target.
+                link.GetPath(buffer, buffer.Capacity, IntPtr.Zero, 4);
+                data.TargetPath = buffer.ToString(); buffer.Length = 0;
+                link.GetWorkingDirectory(buffer, buffer.Capacity);
+                data.WorkingDirectory = buffer.ToString(); buffer.Length = 0;
+                link.GetDescription(buffer, buffer.Capacity);
+                data.Description = buffer.ToString(); buffer.Length = 0;
+                link.GetArguments(buffer, buffer.Capacity);
+                data.Arguments = buffer.ToString(); buffer.Length = 0;
+                int index, show;
+                link.GetIconLocation(buffer, buffer.Capacity, out index);
+                data.IconPath = buffer.ToString(); data.IconIndex = index;
+                link.GetShowCmd(out show); data.WindowStyle = show;
+                return data;
+            } finally { Marshal.FinalReleaseComObject(instance); }
+        }
+    }
+}
+'@
+}
+function Test-OwnedShortcut([string]$path, [string]$target) {
     if (-not [IO.File]::Exists($path)) { return $false }
     $item = Get-Item -LiteralPath $path -Force
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
     try {
-        $link = $shell.CreateShortcut($path)
+        Initialize-NativeShortcuts
+        $link = [AgentManagerLocation.NativeShortcuts]::Read($path)
         return ($link.Description -ceq $script:shortcutOwner -and $link.TargetPath -ieq $target -and [string]::IsNullOrEmpty($link.Arguments))
     } catch { return $false }
 }
-function Save-OwnedShortcut($shell, [string]$path, [string]$target, [string]$previous = '') {
+function Save-OwnedShortcut([string]$path, [string]$target, [string]$previous = '') {
     $existed = [IO.File]::Exists($path)
-    if ($existed -and -not (Test-OwnedShortcut $shell $path $previous)) { throw 'Existing shortcut belongs to another application.' }
+    if ($existed -and -not (Test-OwnedShortcut $path $previous)) { throw 'Existing shortcut belongs to another application.' }
     $temporary = Join-Path ([IO.Path]::GetDirectoryName($path)) ('.agent-manager-' + [Guid]::NewGuid().ToString('N') + '.lnk')
     try {
-        $link = $shell.CreateShortcut($temporary)
-        $link.TargetPath = $target; $link.WorkingDirectory = [IO.Path]::GetDirectoryName($target)
-        $link.IconLocation = $target + ',0'; $link.Description = $script:shortcutOwner
-        $link.Arguments = ''; $link.WindowStyle = 1; $link.Save()
-        if (-not (Test-OwnedShortcut $shell $temporary $target)) { throw 'Shortcut verification failed.' }
+        Initialize-NativeShortcuts
+        [AgentManagerLocation.NativeShortcuts]::Save($temporary, $target, $script:shortcutOwner)
+        if (-not (Test-OwnedShortcut $temporary $target)) { throw 'Shortcut verification failed.' }
+        $link = [AgentManagerLocation.NativeShortcuts]::Read($temporary)
+        if ($link.WorkingDirectory -ine [IO.Path]::GetDirectoryName($target) -or $link.IconPath -ine $target -or
+            $link.IconIndex -ne 0 -or $link.WindowStyle -ne 1) { throw 'Shortcut fields changed while saving.' }
         if ($existed) {
-            if (-not (Test-OwnedShortcut $shell $path $previous)) { throw 'Existing shortcut changed during creation.' }
+            if (-not (Test-OwnedShortcut $path $previous)) { throw 'Existing shortcut changed during creation.' }
             [IO.File]::Replace($temporary, $path, [NullString]::Value)
         } else { [IO.File]::Move($temporary, $path) }
         return @{created=(-not $existed); path=$path; target=$target}
@@ -303,30 +392,24 @@ function Save-OwnedShortcut($shell, [string]$path, [string]$target, [string]$pre
 }
 function New-OwnedDesktopShortcut([string]$target) {
     $desktop = Get-LocationDesktop
-    $shell = New-Object -ComObject WScript.Shell
-    try {
-        foreach ($item in @(Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -File -Force)) {
-            if (Test-OwnedShortcut $shell $item.FullName $target) { return (Save-OwnedShortcut $shell $item.FullName $target $target) }
-        }
-        foreach ($name in @('Agent Manager.lnk', 'Agent Manager (便携版).lnk') + @(2..20 | ForEach-Object { 'Agent Manager (' + $_ + ').lnk' })) {
-            $path = Join-Path $desktop $name
-            if (-not (Test-Path -LiteralPath $path)) { return (Save-OwnedShortcut $shell $path $target) }
-        }
-        throw 'No available desktop shortcut name.'
-    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    foreach ($item in @(Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -File -Force)) {
+        if (Test-OwnedShortcut $item.FullName $target) { return (Save-OwnedShortcut $item.FullName $target $target) }
+    }
+    foreach ($name in @('Agent Manager.lnk', 'Agent Manager (便携版).lnk') + @(2..20 | ForEach-Object { 'Agent Manager (' + $_ + ').lnk' })) {
+        $path = Join-Path $desktop $name
+        if (-not (Test-Path -LiteralPath $path)) { return (Save-OwnedShortcut $path $target) }
+    }
+    throw 'No available desktop shortcut name.'
 }
 function Update-OwnedDesktopShortcuts([string]$source, [string]$target) {
     $desktop = Get-LocationDesktop
-    $shell = New-Object -ComObject WScript.Shell
     $updated = 0
-    try {
-        foreach ($item in @(Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -File -Force)) {
-            if (Test-OwnedShortcut $shell $item.FullName $source) {
-                [void](Save-OwnedShortcut $shell $item.FullName $target $source)
-                $updated += 1
-            }
+    foreach ($item in @(Get-ChildItem -LiteralPath $desktop -Filter '*.lnk' -File -Force)) {
+        if (Test-OwnedShortcut $item.FullName $source) {
+            [void](Save-OwnedShortcut $item.FullName $target $source)
+            $updated += 1
         }
-    } finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+    }
     return @{updated=$updated}
 }
 '''

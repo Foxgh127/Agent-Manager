@@ -4,6 +4,7 @@ Process/launch boundaries are mocked; no installed executable or real Desktop
 shortcut is moved, started, deleted or modified by these tests.
 """
 from datetime import datetime, timedelta, timezone
+import ctypes
 import hashlib
 import json
 import os
@@ -12,10 +13,56 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
 from agent_manager.updates import location
 from agent_manager.updates.service import UpdateError
+
+
+def _write_native_shortcut_fixture(path, target, description):
+    """Independent fixture writer: call Unicode COM vtables directly in Python.
+
+    This uses neither the product's PowerShell/C# wrapper nor WScript.Shell, so
+    unrelated-shortcut preservation is checked against independently made data.
+    """
+    ole32 = ctypes.WinDLL("ole32")
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    initialized = ole32.CoInitializeEx(None, 2)
+    if initialized not in (0, 1, -2147417850):  # RPC_E_CHANGED_MODE: already initialized.
+        raise OSError("Unable to initialize fixture COM", initialized)
+    ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    def guid(value):
+        return (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(value).bytes_le)
+    def call(pointer, index, types, *values):
+        table = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        method = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *types)(table[index])
+        result = method(pointer, *values)
+        if result < 0:
+            raise OSError("Unicode shortcut fixture COM call failed", result)
+    shell = ctypes.c_void_p()
+    persist = ctypes.c_void_p()
+    try:
+        result = ole32.CoCreateInstance(guid("00021401-0000-0000-C000-000000000046"), None, 1,
+                                       guid("000214F9-0000-0000-C000-000000000046"), ctypes.byref(shell))
+        if result < 0:
+            raise OSError("Unable to create fixture ShellLinkW", result)
+        call(shell, 20, [ctypes.c_wchar_p], str(target))  # IShellLinkW.SetPath
+        call(shell, 7, [ctypes.c_wchar_p], description)  # SetDescription
+        call(shell, 9, [ctypes.c_wchar_p], str(Path(target).parent))
+        call(shell, 17, [ctypes.c_wchar_p, ctypes.c_int], str(target), 0)
+        call(shell, 0, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+             guid("0000010B-0000-0000-C000-000000000046"), ctypes.byref(persist))
+        call(persist, 6, [ctypes.c_wchar_p, ctypes.c_int], str(path), 1)  # IPersistFile.Save
+    finally:
+        if persist.value:
+            call(persist, 2, [])
+        if shell.value:
+            call(shell, 2, [])
+        if initialized in (0, 1):
+            ole32.CoUninitialize()
 
 
 class ApplicationLocationTests(unittest.TestCase):
@@ -399,29 +446,42 @@ function Remove-VerifiedOldLocation { & $boundedRemove -timeoutSeconds 0 }
         powershell = shutil.which("powershell.exe")
         if not powershell:
             self.skipTest("Windows PowerShell 5 is unavailable")
-        desktop = self.root / "OneDrive 企业" / "重定向桌面 中文 ' [one]"
+        desktop = self.root / "OneDrive 企业🚀" / "重定向桌面 中文 𐐀 ' [one]"
         desktop.mkdir(parents=True)
+        unicode_source = self.source.parent / "来源🚀𐐀" / "管理器🚀.exe"
+        unicode_source.parent.mkdir()
+        unicode_source.write_bytes(self.original)
+        unicode_target = self.destination / "目标🛰️𐐀" / "AgentManager.exe"
+        unicode_target.parent.mkdir()
+        unicode_target.write_bytes(self.original)
+        other_target = self.root / "另一程序🚀.exe"
+        other_target.write_bytes(b"unrelated fixture executable")
+        other_path = desktop / "Agent Manager.lnk"
+        _write_native_shortcut_fixture(other_path, other_target, "unrelated 另一程序🚀")
         metadata = self.root / "shortcut-test.json"
-        metadata.write_text(json.dumps({"desktop": str(desktop), "target": str(self.source), "newTarget": str(self.destination / "AgentManager.exe")}, ensure_ascii=False), encoding="utf-8")
+        metadata.write_text(json.dumps({"desktop": str(desktop), "target": str(unicode_source), "newTarget": str(unicode_target)}, ensure_ascii=False), encoding="utf-8")
         runner = self.root / "shortcut-test.ps1"
         runner.write_text(location.SHORTCUT_SCRIPT + r'''
 $testData = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'shortcut-test.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
 function Get-LocationDesktop { return [string]$testData.desktop }
-$shell = New-Object -ComObject WScript.Shell
+Initialize-NativeShortcuts
 function Get-TestHash([string]$path) {
     $stream = [IO.File]::OpenRead($path); $hash = [Security.Cryptography.SHA256]::Create()
     try { return [BitConverter]::ToString($hash.ComputeHash($stream)) } finally { $stream.Dispose(); $hash.Dispose() }
 }
 $otherPath = Join-Path $testData.desktop 'Agent Manager.lnk'
-$other = $shell.CreateShortcut($otherPath)
-$other.TargetPath = $env:COMSPEC; $other.Description = 'unrelated'; $other.Save()
+$other = [AgentManagerLocation.NativeShortcuts]::Read($otherPath)
 $before = Get-TestHash $otherPath
 $first = New-OwnedDesktopShortcut $testData.target
 $second = New-OwnedDesktopShortcut $testData.target
+$unicodePath = Join-Path $testData.desktop "管理器快捷方式🚀𐐀.lnk"
+[IO.File]::Move($first.path, $unicodePath)
+$third = New-OwnedDesktopShortcut $testData.target
 $updated = Update-OwnedDesktopShortcuts $testData.target $testData.newTarget
-$link = $shell.CreateShortcut($first.path)
-$result = @{first=$first; second=$second; updated=$updated; target=$link.TargetPath; working=$link.WorkingDirectory;
-    icon=$link.IconLocation; description=$link.Description; otherUnchanged=((Get-TestHash $otherPath) -ceq $before)}
+$link = [AgentManagerLocation.NativeShortcuts]::Read($third.path)
+$result = @{first=$first; second=$second; third=$third; updated=$updated; target=$link.TargetPath; working=$link.WorkingDirectory;
+    icon=$link.IconLocation; description=$link.Description; arguments=$link.Arguments; windowStyle=$link.WindowStyle;
+    otherTarget=$other.TargetPath; otherDescription=$other.Description; otherUnchanged=((Get-TestHash $otherPath) -ceq $before)}
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'shortcut-check.json'), ($result | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
 ''', encoding="utf-8-sig", newline="")
         completed = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(runner)], capture_output=True, timeout=25, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -431,11 +491,18 @@ $result = @{first=$first; second=$second; updated=$updated; target=$link.TargetP
         self.assertFalse(result["second"]["created"])
         self.assertEqual(result["first"]["path"], result["second"]["path"])
         self.assertNotEqual(Path(result["first"]["path"]).name, "Agent Manager.lnk")
+        self.assertFalse(result["third"]["created"])
+        self.assertEqual(result["third"]["path"], str(desktop / "管理器快捷方式🚀𐐀.lnk"))
         self.assertTrue(result["otherUnchanged"])
+        self.assertEqual(result["otherDescription"], "unrelated 另一程序🚀")
+        self.assertEqual(result["otherTarget"], str(other_target))
         self.assertEqual(result["updated"]["updated"], 1)
-        self.assertEqual(result["target"], str(self.destination / "AgentManager.exe"))
-        self.assertEqual(result["working"], str(self.destination))
-        self.assertEqual(result["icon"], str(self.destination / "AgentManager.exe") + ",0")
+        self.assertEqual(result["target"], str(unicode_target))
+        self.assertEqual(result["working"], str(unicode_target.parent))
+        self.assertEqual(result["icon"], str(unicode_target) + ",0")
+        self.assertEqual(result["description"], "openai-agent-manager:desktop-shortcut:v1")
+        self.assertEqual(result["arguments"], "")
+        self.assertEqual(result["windowStyle"], 1)
 
 
 if __name__ == "__main__":
