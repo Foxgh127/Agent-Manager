@@ -5,6 +5,7 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -12,9 +13,10 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 
-from agent_manager.updates.service import UpdateError, _regular_path, _atomic_json
+from agent_manager.updates.service import UpdateError, Version, _regular_path, _atomic_json, _read_json
 
 
 def _process_creation_filetime(pid):
@@ -42,6 +44,97 @@ def _process_creation_filetime(pid):
 def _sha256(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def installation_is_historical(spec, *, current_version):
+    """An attempt for another executable/version is history, never success."""
+    if os.name != "nt" or not getattr(sys, "frozen", False) or not isinstance(spec, dict):
+        return False
+    try:
+        target = Path(spec["target"])
+        if not target.is_absolute() or target.suffix.lower() != ".exe":
+            return False
+        target = _regular_path(target)
+        return (target.resolve() != Path(sys.executable).resolve()
+                or Version.parse(spec["version"]) < Version.parse(current_version))
+    except (UpdateError, OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def verify_current_installation(spec, *, current_version, runtime_file):
+    """Read-only proof that this installed process became ready after a handoff.
+
+    A version label or a live PID alone cannot clear an earlier install error.
+    The current frozen executable, its creation time and bytes, the discovery
+    nonce, and a direct loopback health response must all agree.
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False) or not isinstance(spec, dict):
+        return None
+    try:
+        if spec.get("schemaVersion") != 1 or Version.parse(spec.get("version")) != Version.parse(current_version):
+            return None
+        if not re.fullmatch(r"[a-f0-9]{48}", str(spec.get("installId") or "")):
+            return None
+        target = _regular_path(Path(spec["target"]).absolute(), missing=False)
+        runtime_path = _regular_path(Path(runtime_file).absolute(), missing=False)
+        if target.resolve() != Path(sys.executable).resolve() or target.suffix.lower() != ".exe":
+            return None
+        if Path(spec["runtimeFile"]).resolve() != runtime_path.resolve():
+            return None
+        source_nonce = str(spec.get("sourceNonce") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", source_nonce):
+            return None
+        started = _process_creation_filetime(os.getpid())
+        prepared = datetime.fromisoformat(spec["preparedAt"].replace("Z", "+00:00"))
+        if prepared.tzinfo is None or started <= int(spec["sourceStartFileTime"]):
+            return None
+        prepared_filetime = int((prepared.timestamp() + 11644473600) * 10_000_000)
+        if started < prepared_filetime or prepared > datetime.now(timezone.utc):
+            return None
+        runtime = _read_json(runtime_path, 65536)
+        if not isinstance(runtime, dict):
+            return None
+        nonce = str(runtime.get("runtimeNonce") or "")
+        if (runtime.get("appId") != "openai-agent-manager" or runtime.get("pid") != os.getpid()
+                or runtime.get("uiReady") is not True or runtime.get("independentLifecycle") is not True
+                or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", nonce) or secrets.compare_digest(nonce, source_nonce)):
+            return None
+        port = runtime.get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+            return None
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.7)
+        try:
+            connection.request("GET", "/api/health")
+            response = connection.getresponse()
+            if response.status != 200:
+                return None
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                return None
+            health = json.loads(raw)
+        finally:
+            connection.close()
+        if (not isinstance(health, dict) or health.get("ok") is not True
+                or health.get("appId") != "openai-agent-manager" or health.get("runtimePid") != os.getpid()
+                or health.get("uiReady") is not True or health.get("independentLifecycle") is not True
+                or not secrets.compare_digest(str(health.get("runtimeNonce") or ""), nonce)):
+            return None
+        digest, size = spec.get("sha256"), spec.get("size")
+        if (not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                or isinstance(size, bool) or not isinstance(size, int) or size <= 0):
+            return None
+        with target.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size != size or hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                return None
+        # Recheck discovery after HTTP/file I/O, so a concurrent restart cannot
+        # splice the health response from one instance into another's record.
+        current_runtime = _read_json(runtime_path, 65536)
+        if current_runtime != runtime or _process_creation_filetime(os.getpid()) != started:
+            return None
+        return {"ready": True, "pid": os.getpid(), "runtimeNonce": nonce,
+                "startFileTime": str(started), "sha256": digest, "verifiedAt": datetime.now(timezone.utc).isoformat()}
+    except (UpdateError, OSError, ValueError, TypeError, KeyError, http.client.HTTPException):
+        return None
 
 
 def prepare_install(service, *, target, state_dir, shutdown_status, source_pid, source_nonce="", runtime_file=None):
@@ -152,10 +245,11 @@ function Read-Json([string]$path) {
     if ((Get-Item -LiteralPath $path).Length -gt 65536) { throw 'Oversized update metadata.' }
     return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json)
 }
-function Save-Result([string]$state, [string]$message, $restart = $null) {
+function Save-Result([string]$state, [string]$message, $restart = $null, [string]$code = '', [string]$detail = '') {
     $result = @{state=$state; message=$message; version=$script:installSpec.version;
         installId=$script:installSpec.installId; helperPid=$PID; at=[DateTime]::UtcNow.ToString('o');
-        backup=$script:backup; restart=$restart}
+        backup=$script:backup; restart=$restart; code=$code; detail=$detail;
+        verification=@{reason=$script:readinessReason; startedAt=$script:restartStartedAt}}
     $temporary = Join-Path $script:helperRoot ('.result-' + [Guid]::NewGuid().ToString('N') + '.json')
     [IO.File]::WriteAllText($temporary, ($result | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
     if ([IO.File]::Exists($script:resultFile)) { [IO.File]::Replace($temporary, $script:resultFile, [NullString]::Value) }
@@ -235,14 +329,21 @@ function Replace-InstalledFile([string]$replacement, [int]$timeoutSeconds = 10) 
     } while ($true)
 }
 function Test-ManagerReady([DateTime]$started) {
+    $script:readinessReason = 'runtime_metadata_unavailable'
     try {
         $runtime = Read-Json ([string]$script:installSpec.runtimeFile)
-        if ($runtime.appId -cne 'openai-agent-manager' -or $runtime.uiReady -ne $true -or
-            $runtime.independentLifecycle -ne $true -or $runtime.runtimeNonce -ceq $script:installSpec.sourceNonce -or
+        $script:readinessReason = 'runtime_identity_mismatch'
+        if ($runtime.appId -cne 'openai-agent-manager' -or $runtime.runtimeNonce -ceq $script:installSpec.sourceNonce -or
             [string]$runtime.runtimeNonce -notmatch '^[A-Za-z0-9_-]{16,128}$' -or
-            [int]$runtime.port -lt 1 -or [int]$runtime.port -gt 65535) { return $null }
+            [int]$runtime.pid -le 0 -or [int]$runtime.port -lt 1 -or [int]$runtime.port -gt 65535) { return $null }
+        $script:readinessReason = 'ui_not_ready'
+        if ($runtime.uiReady -isnot [bool] -or $runtime.uiReady -ne $true) { return $null }
+        $script:readinessReason = 'lifecycle_not_independent'
+        if ($runtime.independentLifecycle -isnot [bool] -or $runtime.independentLifecycle -ne $true) { return $null }
+        $script:readinessReason = 'process_identity_mismatch'
         $process = Get-Process -Id ([int]$runtime.pid) -ErrorAction Stop
         if ($process.MainModule.FileName -ine $script:installTarget -or $process.StartTime.ToUniversalTime() -lt $started.AddSeconds(-1)) { return $null }
+        $script:readinessReason = 'health_unavailable'
         $request = [Net.HttpWebRequest]::Create('http://127.0.0.1:' + [string]$runtime.port + '/api/health')
         $request.Proxy = $null; $request.Timeout = 1500; $request.ReadWriteTimeout = 1500; $request.AllowAutoRedirect = $false
         $response = $request.GetResponse()
@@ -255,9 +356,12 @@ function Test-ManagerReady([DateTime]$started) {
                 $health = (-join $buffer[0..($count - 1)]) | ConvertFrom-Json
             } finally { $reader.Dispose() }
         } finally { $response.Dispose() }
-        if ($health.ok -eq $true -and $health.appId -ceq 'openai-agent-manager' -and
+        $script:readinessReason = 'health_identity_mismatch'
+        if ($health.ok -is [bool] -and $health.ok -eq $true -and $health.appId -ceq 'openai-agent-manager' -and
             $health.runtimePid -eq $runtime.pid -and $health.runtimeNonce -ceq $runtime.runtimeNonce -and
-            $health.uiReady -eq $true -and $health.independentLifecycle -eq $true) {
+            $health.uiReady -is [bool] -and $health.uiReady -eq $true -and
+            $health.independentLifecycle -is [bool] -and $health.independentLifecycle -eq $true) {
+            $script:readinessReason = 'ready'
             return @{ready=$true; pid=$runtime.pid; runtimeNonce=$runtime.runtimeNonce}
         }
     } catch { }
@@ -299,20 +403,27 @@ function New-ManagerStartInfo {
     $info.EnvironmentVariables['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
     return $info
 }
-function Start-VerifiedManager([int]$timeoutSeconds = 45) {
+function Start-ManagerProcess($info) {
+    return [Diagnostics.Process]::Start($info)
+}
+function Start-VerifiedManager([int]$timeoutSeconds = 180) {
     $started = [DateTime]::UtcNow
+    $script:restartStartedAt = $started.ToString('o')
+    $script:readinessTimedOut = $false
     $info = New-ManagerStartInfo
-    $script:launchedProcess = [Diagnostics.Process]::Start($info)
+    $script:launchedProcess = Start-ManagerProcess $info
     $deadline = $started.AddSeconds($timeoutSeconds)
     do {
         $ready = Test-ManagerReady $started
         if ($null -ne $ready) { return $ready }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
+    $script:readinessTimedOut = $true
     throw 'Started manager did not publish a verified ready window and service.'
 }
 function Invoke-Install {
     $script:installSpec = $null; $script:backup = $null; $script:launchedProcess = $null
+    $script:readinessTimedOut = $false; $script:readinessReason = $null; $script:restartStartedAt = $null
     $script:resultFile = Join-Path $script:helperRoot 'result.json'
     $sibling = $null; $replaced = $false; $restart = $null
     try {
@@ -349,14 +460,20 @@ function Invoke-Install {
         Replace-InstalledFile $sibling
         $sibling = $null; $replaced = $true
         Assert-Hash $script:installTarget $spec.sha256 $spec.size
-        Save-Result 'installed' 'Update installed; verifying restarted Agent Manager.'
+        Save-Result 'installed' '更新已安装，正在确认窗口和服务就绪。' $null 'verifying_startup'
         $restart = Start-VerifiedManager
-        Save-Result 'complete' 'Updated manager window and service are ready.' $restart
+        Assert-Hash $script:installTarget $spec.sha256 $spec.size
+        Save-Result 'complete' '更新已完成，窗口和服务已就绪。' $restart 'update_ready'
     } catch {
         $failure = $_.Exception.Message
         if ($replaced) {
             try {
                 if (($null -ne $script:launchedProcess -and -not $script:launchedProcess.HasExited) -or @(Get-TargetProcesses).Count -gt 0) {
+                    if ($script:readinessTimedOut) {
+                        Assert-Hash $script:installTarget $script:installSpec.sha256 $script:installSpec.size
+                        Save-Result 'installed' '更新已安装，启动状态尚未确认。' @{ready=$false} 'startup_unverified' $failure
+                        return
+                    }
                     throw 'New manager is still running; backup retained for safe manual recovery.'
                 }
                 Assert-Hash $script:backup $script:installSpec.originalSha256 $script:installSpec.originalSize
@@ -370,7 +487,7 @@ function Invoke-Install {
                 $failure += ' Rollback/restart: ' + $_.Exception.Message
             }
         }
-        Save-Result 'failed' $failure $restart
+        Save-Result 'failed' '更新未完成，请查看安装详情。' $restart 'install_failed' $failure
     } finally {
         if ($sibling -and [IO.File]::Exists($sibling)) { [IO.File]::Delete($sibling) }
     }

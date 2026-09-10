@@ -172,8 +172,11 @@ export function buildResetRadarViewModel(reset = {}, { now = Date.now() } = {}) 
     && sourceCheckedAt <= Number(now) + ALERT_CLOCK_SKEW_MS;
   const checkAt = timestamp(monitor.lastRunAt || monitor.lastSuccessAt);
   const checkStale = checkAt !== null && Number(now) - checkAt > ALERT_MAX_AGE_MS;
-  const resetHistory = (Array.isArray(reset.resetHistory) ? reset.resetHistory : [])
-    .filter((entry) => entry && (entry.completed === true || entry.aggregate === true));
+  const resetHistory = (Array.isArray(reset.verifiedResetHistory) ? reset.verifiedResetHistory : [])
+    .filter((entry) => entry?.completed === true && entry.verification === "official_source" && !entry.aggregate
+      && ["date", "minute", "second"].includes(entry.occurrencePrecision)
+      && Number.isFinite(Date.parse(entry.occurredAt)) && safeRadarUrl(entry.url))
+    .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt));
   const latestResetEvent = resetHistory.filter(entry => entry.resetType === "full-reset" && !entry.aggregate
     && ["date", "minute", "second"].includes(entry.occurrencePrecision) && Number.isFinite(Date.parse(entry.occurredAt)))
     .sort((a, b) => Date.parse(b.occurredAt) - Date.parse(a.occurredAt))[0] || null;

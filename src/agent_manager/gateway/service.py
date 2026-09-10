@@ -1096,6 +1096,7 @@ _CODEX_SESSION_BACKFILL_LOCK = threading.Lock()
 _CODEX_SESSION_BACKFILL_WORKERS: dict[str, threading.Thread] = {}
 _CODEX_SESSION_BACKFILL_STOPS: dict[str, threading.Event] = {}
 _CODEX_SESSION_BACKFILL_DISABLED: set[str] = set()
+_CODEX_SESSION_BACKFILL_RESULTS: dict[str, dict] = {}
 
 
 def _codex_session_role(payload: dict) -> str:
@@ -1527,16 +1528,49 @@ def _codex_session_resume_digest(path: Path, offset: int) -> str:
     return digest.hexdigest()[:32]
 
 
-def _codex_backfill_progress(files: dict) -> dict:
+def _codex_session_activation_state(raw_activations: list) -> tuple[list, str, str]:
+    """Use the same attribution authority for live scans and historical pages."""
+    activations = sorted(
+        ((epoch, _bounded_text(item.get("accountId"), 200))
+         for item in raw_activations
+         if isinstance(item, dict)
+         and (epoch := _timestamp_epoch(item.get("timestamp"))) is not None
+         and _bounded_text(item.get("accountId"), 200)),
+        key=lambda item: item[0],
+    )
+    def fingerprint(items):
+        return hashlib.sha256(json.dumps(items, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+    legacy_fingerprint = fingerprint(activations)
+    # Reopening the manager can record the already-active account again.
+    activations = [item for index, item in enumerate(activations)
+                   if index == 0 or item[1] != activations[index - 1][1]]
+    return activations, fingerprint(activations), legacy_fingerprint
+
+
+def _codex_backfill_progress(files: dict, *, cache_path: Path | None = None) -> dict:
     pending = [entry for entry in files.values()
                if isinstance(entry, dict) and entry.get("partialHistory")]
     targets = sum(max(0, int(entry.get("processedOffset") or 0)) for entry in pending)
     scanned = sum(min(max(0, int((entry.get("historyBackfill") or {}).get("offset") or 0)),
                       max(0, int(entry.get("processedOffset") or 0))) for entry in pending)
-    return {"pendingFiles": len(pending), "scannedBytes": scanned,
+    progress = {"pendingFiles": len(pending), "scannedBytes": scanned,
             "targetBytes": targets, "remainingBytes": max(0, targets - scanned),
             "chunkBytes": CODEX_SESSION_BACKFILL_CHUNK_BYTES,
             "status": "pending" if pending else "complete"}
+    if cache_path is not None:
+        worker_key = str(cache_path.resolve())
+        with _CODEX_SESSION_BACKFILL_LOCK:
+            worker = _CODEX_SESSION_BACKFILL_WORKERS.get(worker_key)
+            running = bool(worker and worker.is_alive())
+            disabled = worker_key in _CODEX_SESSION_BACKFILL_DISABLED
+            result = _CODEX_SESSION_BACKFILL_RESULTS.get(worker_key, {})
+            progress.update(workerRunning=running, failedFiles=0, reason=None)
+            if pending:
+                progress.update(failedFiles=result.get("failedFiles", 0), reason=result.get("reason"))
+                last_status = result.get("status")
+                progress["status"] = ("paused" if disabled else "running" if running
+                                      else last_status if last_status in {"retry", "blocked"} else "pending")
+    return progress
 
 
 def _codex_backfill_entry_revision(entry: dict) -> tuple:
@@ -1549,7 +1583,8 @@ def _codex_backfill_entry_revision(entry: dict) -> tuple:
 def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
                                      sessions_root: Path | None = None,
                                      cache_path: Path | None = None,
-                                     stop_event: threading.Event | None = None) -> dict:
+                                     stop_event: threading.Event | None = None,
+                                     excluded_files: set[str] | None = None) -> dict:
     """Rebuild one bounded historical page, without adding to live counters.
 
     Parsing runs outside the snapshot lock. A compare-and-swap rejects the page
@@ -1577,7 +1612,8 @@ def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
         cached = load()
         files = cached.get("files", {})
         candidates = [(key, entry) for key, entry in files.items()
-                      if isinstance(entry, dict) and entry.get("partialHistory")]
+                      if isinstance(entry, dict) and entry.get("partialHistory")
+                      and key not in (excluded_files or ())]
         if not candidates:
             return {**_codex_backfill_progress(files), "status": "idle"}
         key, entry = min(candidates, key=lambda item: (
@@ -1585,29 +1621,23 @@ def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
         revision = _codex_backfill_entry_revision(entry)
         authority = cached.get("activationFingerprint")
         schema = cached.get("schemaVersion")
+    def failure(status, reason):
+        return {"status": status, "reason": reason, "fileKey": key}
     try:
         path = next((candidate for candidate in sessions_root.rglob("*.jsonl")
                      if hashlib.sha256(candidate.relative_to(sessions_root).as_posix().encode("utf-8"))
                      .hexdigest()[:32] == key), None)
         if path is None:
-            return {"status": "retry", "reason": "source_missing"}
+            return failure("retry", "source_missing")
         stat = path.stat()
         target = int(entry.get("processedOffset") or 0)
         if (stat.st_size != entry.get("size") or stat.st_mtime_ns != entry.get("mtimeNs")
                 or target > stat.st_size or not entry.get("resumeDigest")
                 or _codex_session_resume_digest(path, target) != entry["resumeDigest"]):
-            return {"status": "retry", "reason": "source_changed"}
-        activations = sorted(
-            ((epoch, _bounded_text(item.get("accountId"), 200))
-             for item in core.account_activation_timeline()
-             if isinstance(item, dict)
-             and (epoch := _timestamp_epoch(item.get("timestamp"))) is not None
-             and _bounded_text(item.get("accountId"), 200)),
-            key=lambda item: item[0],
-        )
-        fingerprint = hashlib.sha256(json.dumps(activations, separators=(",", ":")).encode()).hexdigest()[:24]
+            return failure("retry", "source_changed")
+        activations, fingerprint, _ = _codex_session_activation_state(core.account_activation_timeline())
         if authority != fingerprint:
-            return {"status": "retry", "reason": "attribution_changed"}
+            return failure("retry", "attribution_changed")
         shadow = entry.get("historyBackfill")
         shadow = shadow if isinstance(shadow, dict) else {}
         offset = int(shadow.get("offset") or 0)
@@ -1622,7 +1652,7 @@ def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
         if stop_event is not None and stop_event.is_set():
             return {"status": "cancelled"}
         if not parsed.get("parseSuccess") or parsed_offset <= offset:
-            return {"status": "blocked", "reason": "incomplete_or_unreadable_jsonl"}
+            return failure("blocked", "incomplete_or_unreadable_jsonl")
         shadow_records = _merge_codex_session_usage_records(shadow.get("records", []), parsed["records"])
         cutoff = datetime.now(USAGE_TIMEZONE).date().toordinal() - USAGE_STATS_RETENTION_DAYS + 1
         shadow_records = [record for record in shadow_records
@@ -1636,7 +1666,7 @@ def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
                        "updatedAt": time.time()}
         final_stat = path.stat()
         if final_stat.st_size != stat.st_size or final_stat.st_mtime_ns != stat.st_mtime_ns:
-            return {"status": "retry", "reason": "source_changed_during_parse"}
+            return failure("retry", "source_changed_during_parse")
         with _CODEX_SESSION_USAGE_LOCK, _exclusive_usage_file_lock(
                 cache_path.with_suffix(cache_path.suffix + ".lock")):
             if stop_event is not None and stop_event.is_set():
@@ -1647,7 +1677,7 @@ def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
                     or current.get("activationFingerprint") != authority
                     or current.get("schemaVersion") != schema
                     or _codex_backfill_entry_revision(current_entry) != revision):
-                return {"status": "retry", "reason": "concurrent_index_change"}
+                return failure("retry", "concurrent_index_change")
             promoted = parsed_offset == target and parsed.get("lineAligned") is True
             if promoted:
                 current_entry.update(records=shadow_records, recentRequests=shadow_recent,
@@ -1662,15 +1692,15 @@ def codex_session_usage_backfill_step(*, max_bytes: int | None = None,
         return {**progress, "status": "promoted" if promoted else "progressed",
                 "processedBytes": parsed_offset - offset}
     except (OSError, TypeError, ValueError, OverflowError):
-        return {"status": "blocked", "reason": "backfill_unavailable"}
+        return failure("blocked", "backfill_unavailable")
 
 
 def request_codex_session_usage_backfill(*, restart: bool = False) -> bool:
     """Start at most one cooperative background worker for this cache path.
 
     Each page is bounded and yields between writes. A changed/unreadable source
-    stops the worker; the next normal snapshot refresh can reschedule after its
-    live cursor has caught up. No historical source file is modified.
+    is attempted once per pass so it cannot starve other files. A later snapshot
+    can reschedule deferred files. No historical source file is modified.
     """
     sessions_root = Path(core.CODEX_HOME) / "sessions"
     cache_path = Path(core.STATE_DIR) / CODEX_SESSION_USAGE_CACHE_FILE
@@ -1684,17 +1714,38 @@ def request_codex_session_usage_backfill(*, restart: bool = False) -> bool:
         if existing and existing.is_alive():
             return False
         stop_event = threading.Event()
+        _CODEX_SESSION_BACKFILL_RESULTS.pop(worker_key, None)
         def run():
+            failed_files: set[str] = set()
+            outcome = {"status": "pending"}
             try:
                 while not stop_event.is_set():
                     result = codex_session_usage_backfill_step(
-                        sessions_root=sessions_root, cache_path=cache_path, stop_event=stop_event)
-                    if result.get("status") not in {"progressed", "promoted"} or not result.get("pendingFiles"):
+                        sessions_root=sessions_root, cache_path=cache_path, stop_event=stop_event,
+                        excluded_files=failed_files)
+                    if result.get("status") in {"retry", "blocked"}:
+                        file_key = result.get("fileKey")
+                        if file_key:
+                            failed_files.add(file_key)
+                        # Preserve an actual failure even if later files progress.
+                        if outcome.get("status") != "blocked":
+                            outcome = {"status": result["status"], "reason": result.get("reason")}
+                        if not file_key:
+                            break
+                    elif result.get("status") not in {"progressed", "promoted"} or not result.get("pendingFiles"):
+                        if not failed_files:
+                            outcome = {"status": "complete" if not result.get("pendingFiles") else "pending"}
                         break
                     stop_event.wait(CODEX_SESSION_BACKFILL_PAUSE_SECONDS)
+            except Exception:
+                outcome = {"status": "blocked", "reason": "backfill_unavailable"}
             finally:
                 with _CODEX_SESSION_BACKFILL_LOCK:
                     if _CODEX_SESSION_BACKFILL_WORKERS.get(worker_key) is threading.current_thread():
+                        if stop_event.is_set():
+                            outcome = {"status": "paused", "reason": "cancelled"}
+                        _CODEX_SESSION_BACKFILL_RESULTS[worker_key] = {
+                            **outcome, "failedFiles": len(failed_files)}
                         _CODEX_SESSION_BACKFILL_WORKERS.pop(worker_key, None)
                         _CODEX_SESSION_BACKFILL_STOPS.pop(worker_key, None)
         worker = threading.Thread(target=run, name="codex-usage-history-backfill", daemon=True)
@@ -1745,26 +1796,7 @@ def codex_session_usage_snapshot() -> dict:
         raw_activations = core.account_activation_timeline()
     except Exception:
         raw_activations = []
-    activations = sorted(
-        (
-            (epoch, _bounded_text(item.get("accountId"), 200))
-            for item in raw_activations
-            if isinstance(item, dict)
-            and (epoch := _timestamp_epoch(item.get("timestamp"))) is not None
-            and _bounded_text(item.get("accountId"), 200)
-        ),
-        key=lambda item: item[0],
-    )
-    # Reopening the manager may record the already-active account again. Such
-    # redundant entries do not change attribution and must not reset counters.
-    legacy_activation_fingerprint = hashlib.sha256(
-        json.dumps(activations, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:24]
-    activations = [item for index, item in enumerate(activations)
-                   if index == 0 or item[1] != activations[index - 1][1]]
-    activation_fingerprint = hashlib.sha256(
-        json.dumps(activations, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:24]
+    activations, activation_fingerprint, legacy_activation_fingerprint = _codex_session_activation_state(raw_activations)
     with _CODEX_SESSION_USAGE_LOCK, _exclusive_usage_file_lock(
             cache_path.with_suffix(cache_path.suffix + ".lock")):
         cached: dict[str, Any] = {"schemaVersion": CODEX_SESSION_USAGE_CACHE_SCHEMA, "files": {}}
@@ -2127,7 +2159,7 @@ def codex_session_usage_snapshot() -> dict:
                 "indexedFiles": len(next_files),
                 "partialFiles": partial_files,
                 "pendingBytes": pending_bytes,
-                "backfill": _codex_backfill_progress(next_files),
+                "backfill": _codex_backfill_progress(next_files, cache_path=cache_path),
                 "boundedScanBytesPerFile": CODEX_SESSION_INCREMENT_MAX_BYTES,
                 "tokenSemantics": "official Codex token_count events; cached/reasoning are subsets",
             },

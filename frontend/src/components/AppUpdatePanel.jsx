@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, Download, Loader2, RefreshCw } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import "./AppUpdatePanel.css";
 import { loadAppUpdate, rememberAppUpdate, subscribeAppUpdate } from "../appUpdateResource.js";
+import UpdateAction from "./UpdateAction.jsx";
+import { updateFailureMessage } from "../updateFeedback.js";
 
 const labels = { unconfigured: "此构建尚未绑定发布仓库", config_error: "发布源读取失败", not_checked: "等待检查更新", checking: "正在检查", check_failed: "检查失败，可重试", current: "已是最新版" };
 
-export default function AppUpdatePanel({ api, notify, refreshKey = 0 }) {
+export default function AppUpdatePanel({ api, notify, refreshKey = 0, refreshing = false, disabled = false, onBusyChange }) {
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -35,10 +37,13 @@ export default function AppUpdatePanel({ api, notify, refreshKey = 0 }) {
     rememberAppUpdate(api, next);
     setStatus(next);
     if (next.installation?.state === "failed") {
-      installStarted.current = false; setBusy(""); setError(next.installation.message || "更新未完成，请重试");
+      installStarted.current = false; setBusy(value => value === "install" ? "" : value);
     }
-    if (["waiting_for_exit", "installed"].includes(next.installation?.state)) {
+    if (["waiting_for_exit", "installed"].includes(next.installation?.state) && next.installation?.code !== "startup_unverified") {
       installStarted.current = true; setBusy("install");
+    }
+    if (next.installation?.state === "complete" || next.installation?.code === "startup_unverified") {
+      installStarted.current = false; setBusy(value => value === "install" ? "" : value);
     }
     if (next.download?.autoInstallQueued) autoInstall.current = false;
     if (next.download?.state === "ready" && autoInstall.current) {
@@ -71,6 +76,7 @@ export default function AppUpdatePanel({ api, notify, refreshKey = 0 }) {
     check(true);
   }, [check, refreshKey]);
   const downloading = status?.download?.state === "downloading";
+  useEffect(() => { onBusyChange?.(Boolean(busy || downloading)); }, [busy, downloading, onBusyChange]);
   useEffect(() => {
     if (!downloading && busy !== "install" && !(status?.download?.autoInstallQueued && status?.download?.state === "ready" && status?.installation?.state !== "failed")) return undefined;
     let polling = false;
@@ -97,14 +103,19 @@ export default function AppUpdatePanel({ api, notify, refreshKey = 0 }) {
     finally { inFlight.current = false; if (!installStarted.current) setBusy(""); }
   };
   const progress = Math.min(100, Math.round((status?.download?.downloadedBytes || 0) / (status?.download?.totalBytes || 1) * 100));
-  const failure = error || status?.error || status?.download?.error || (status?.installation?.state === "failed" ? status.installation.message : "");
-  const message = busy === "install" ? "正在恢复配置并重启…" : downloading ? `下载并校验 ${progress}%` : failure || (status?.updateAvailable ? `可更新到 ${status.latestRelease?.version}` : labels[status?.state] || "正在读取版本");
+  const installFailed = status?.installation?.state === "failed";
+  const startupUnverified = status?.installation?.code === "startup_unverified";
+  const failure = updateFailureMessage(error || status?.error || status?.download?.error || (installFailed ? status.installation.message : ""), { installation: installFailed });
+  const checking = refreshing || busy === "check" || status?.state === "checking";
+  const activity = busy === "install" ? "重启中" : downloading ? `下载中 ${progress}%` : busy === "download" ? "准备更新" : checking ? "检查中" : "";
+  const message = activity ? (busy === "install" ? "正在完成更新并重启" : downloading ? `正在下载并校验 ${progress}%` : checking ? "正在检查更新" : "正在准备更新") : failure || (startupUnverified ? "更新已安装，启动状态尚未确认" : status?.updateAvailable ? `可更新到 ${status.latestRelease?.version}` : labels[status?.state] || "正在读取版本");
   return <article className="update-component manager-update" aria-label="Agent Manager 更新">
     <span className="update-icon manager"><RefreshCw size={20} /></span>
-    <div className="update-copy"><small>AGENT MANAGER</small><strong>{status?.currentVersion || "—"}</strong><p className={failure ? "update-error" : ""} title={message} role="status">{message}</p></div>
-    {downloading || busy ? <span className="status-pill"><Loader2 size={14} className="spin" />{downloading ? `${progress}%` : busy === "install" ? "重启中" : "处理中"}</span>
-      : status?.canDownload || status?.canInstall ? <button className="button primary compact" onClick={update} title="下载校验后关闭 Codex、恢复配置，并重启管理器"><Download size={14} />{status.installSupported ? "一键更新" : "下载更新"}</button>
-      : <button className="button secondary compact" onClick={() => check(true)} disabled={!status?.configured}>{status?.state === "current" ? <Check size={14} /> : <RefreshCw size={14} />}{status?.state === "current" ? "已是最新版" : "检查更新"}</button>}
+    <div className="update-copy"><small>AGENT MANAGER</small><strong>{status?.currentVersion || "—"}</strong><p className={failure && !activity ? "update-error" : ""} role="status">{message}</p></div>
+    <UpdateAction busy={activity} current={!failure && !startupUnverified && status?.state === "current"}
+      disabled={disabled || !status?.configured} download={Boolean(status?.canDownload || status?.canInstall)}
+      label={status?.canDownload || status?.canInstall ? (status.installSupported ? "一键更新" : "下载更新") : "检查更新"}
+      onClick={status?.canDownload || status?.canInstall ? update : () => check(true)} />
     {downloading && <progress className="manager-update-progress" max="100" value={progress} aria-label={`下载进度 ${progress}%`} />}
     {downloading && <button className="button subtle compact manager-update-cancel" onClick={async () => { autoInstall.current = false; try { const r = await api("/api/app-update/cancel", { method: "POST", body: "{}" }); accept(r.status); } catch (e) { setError(e.message); } }}>取消</button>}
   </article>;

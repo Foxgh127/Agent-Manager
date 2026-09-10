@@ -2998,6 +2998,9 @@ class RadarService:
             "error": error,
             "available": bool(data),
         }
+        if name == "reset":
+            from .reset_history import verified_reset_history
+            result["data"]["verifiedResetHistory"] = verified_reset_history()
         if refresh_result:
             changed = set(refresh_result.get("changedSections") or [])
             result["cached"] = name not in changed

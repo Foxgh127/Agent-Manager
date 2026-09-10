@@ -201,25 +201,24 @@ function ScoreHistoryDetails({ entries, formatDate }) {
   );
 }
 
-function ResetEventHistory({ entries, formatDate }) {
+function ResetEventHistory({ entries }) {
+  if (!entries.length) return null;
   return (
     <section className="reset-radar-event-history" aria-labelledby="reset-event-history-title">
-      <header><h4 id="reset-event-history-title">历史重置与重置卡</h4><span>{entries.length} 条公开记录</span></header>
-      <p>以下时间均为北京时间。发生时间与帖子发布时间分别记录；未公布的时刻不做推算。</p>
-      {!entries.length ? <p className="reset-radar-empty">暂无可核验的已完成事件，刷新后自动保存公开记录。</p> : (
+      <header><h4 id="reset-event-history-title">已核实的重置记录</h4><span>{entries.length} 条</span></header>
+      <p>仅列官方明确记载的发生日期，按来源日期倒序。来源未注明时区，不换算为北京时间；记录不代表完整历史。</p>
+      {(
         <ol>{entries.map((event, index) => {
           const url = safeRadarUrl(event.url);
           return <li key={event.eventId || `${event.publishedAt}-${index}`}>
             <div className="reset-radar-event-type">
-              <strong>{event.resetType === "reset-card" ? "重置卡" : "硬重置"}{event.aggregate ? ` · 月度统计 ${event.reportedCount ?? event.count ?? "—"} 次` : ""}</strong>
-              <small>{event.discrepancy ? "来源口径存在差异" : event.aggregate ? "来源汇总，非逐次时间记录" : event.confirmation === "official-post-mirror" ? "官方帖子转录" : "公开来源已报告"}</small>
+              <strong>{event.resetType === "reset-card" ? "重置卡" : "硬重置"}</strong>
+              <small>{event.sourceLabel || "官方来源"}</small>
             </div>
             <h5><LocalizedInline record={event} field="title" fallback="公开重置事件" /></h5>
             <dl>
               <div><dt>发生时间</dt><dd>{formatResetOccurrence(event)}</dd></div>
-              <div><dt>帖子发布</dt><dd>{event.publishedAt ? formatResetOccurrence({ occurredAt: event.publishedAt, occurrencePrecision: "second" }) : "发布时间未公布"}</dd></div>
             </dl>
-            {event.discrepancy && <p>来源月表统计 {event.reportedCount ?? event.count} 次，说明文字记为 {event.noteCount ?? "未知"} 次；各次日期尚待核对。</p>}
             {url && <a href={url} target="_blank" rel="noreferrer">核对来源<ExternalLink size={12} aria-hidden="true" /></a>}
           </li>;
         })}</ol>
@@ -417,11 +416,7 @@ export default function ResetRadarPanel({
         <ScoreHistoryDetails entries={model.scoreHistory} formatDate={formatDate} />
       </div>
 
-      <ResetEventHistory entries={model.resetHistory} formatDate={formatDate} />
-
-      {model.latestResetEvent && (
-        <p className="reset-radar-footnote">最近公开重置记录：{formatResetOccurrence(model.latestResetEvent)}。</p>
-      )}
+      <ResetEventHistory entries={model.resetHistory} />
 
       <footer className="reset-radar-footer">
         <span>来源：{plainText(sectionState.source, "OpenAI 公开活动与社区预测")}</span>

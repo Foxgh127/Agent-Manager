@@ -21,7 +21,7 @@ def test_exact_installed_family_and_check_has_no_apply_flag():
         return SimpleNamespace(returncode=0, stdout="'ChatGPT' is already up to date", stderr="")
     status = updates.check(DESKTOP, runner=runner, executable="store.exe")
     assert status["updateAvailable"] is False
-    assert calls == [["store.exe", "update", "OpenAI.Codex_2p2nqsd0c76g0"]]
+    assert calls == [["store.exe", "update", "OpenAI.Codex_2p2nqsd0c76g0", "--apply", "false"]]
     assert status["manualInApp"] is False
 
 
@@ -53,3 +53,29 @@ def test_timeout_is_unknown_not_latest():
     def run(*args): raise subprocess.TimeoutExpired("store", 50)
     result = updates.check(DESKTOP, runner=run, executable="store.exe")
     assert result["updateAvailable"] is None and result["updateState"] == "check_failed"
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_available_update_survives_noninteractive_install_prompt(code):
+    output = ("Checking updates for ChatGPT…\nUpdate available for 'ChatGPT'\n"
+              "Would you like to apply the update? [y/n] (y):\n"
+              "Failed to read input in non-interactive mode.")
+    result = updates.check(DESKTOP, runner=lambda *args: SimpleNamespace(
+        returncode=code, stdout=output, stderr=""), executable="store.exe")
+    assert result["updateAvailable"] is True
+    assert result["updateState"] == "available"
+    assert "Would you" not in result["message"]
+
+
+def test_prompt_failure_does_not_hide_an_actual_store_error():
+    result = updates.parse_store_check("Update available\nError: product metadata failed\n"
+        "Failed to read input in non-interactive mode.")
+    assert result["updateAvailable"] is None
+
+
+def test_runner_never_allows_an_install_prompt_to_read_user_input(monkeypatch):
+    def run(*args, **kwargs):
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(updates.subprocess, "run", run)
+    updates._run(["store.exe", "update", "family", "--apply", "false"], 50)

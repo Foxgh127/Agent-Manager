@@ -114,6 +114,96 @@ class UsageBackfillTests(unittest.TestCase):
         self.finish()
         self.assertEqual(self.scan(20)['totals']['totalTokens'], 300)
 
+    def test_same_account_restart_uses_the_same_authority_and_resumes_saved_page(self):
+        self.seed()
+        self.scan()
+        self.assertEqual(web2api.codex_session_usage_backfill_step()['status'], 'progressed')
+        saved = next(iter(self.document()['files'].values()))['historyBackfill']['offset']
+        # Manager startup records the already-active account again. This does
+        # not change attribution, including when it happens between pages.
+        self.activations.append({'timestamp': self.start.isoformat(), 'accountId': 'a'})
+        refreshed = self.scan(10)
+        self.assertEqual(next(iter(self.document()['files'].values()))['historyBackfill']['offset'], saved)
+        self.assertEqual(refreshed['coverage']['backfill']['status'], 'pending')
+        self.assertFalse(refreshed['coverage']['backfill']['workerRunning'])
+        step = web2api.codex_session_usage_backfill_step()
+        self.assertEqual(step['status'], 'progressed')
+        self.assertGreater(next(iter(self.document()['files'].values()))['historyBackfill']['offset'], saved)
+        self.finish()
+        self.assertEqual(self.scan(20)['totals']['totalTokens'], 300)
+
+    def test_repeated_same_account_startup_before_bootstrap_does_not_block_history(self):
+        self.activations.extend([
+            {'timestamp': (self.start - timedelta(hours=2)).isoformat(), 'accountId': 'a'},
+            {'timestamp': self.start.isoformat(), 'accountId': 'a'},
+        ])
+        self.seed()
+        first = self.scan()
+        self.assertEqual(first['coverage']['backfill']['pendingFiles'], 1)
+        self.finish()
+        final = self.scan(10)
+        self.assertEqual(final['totals']['totalTokens'], 300)
+        self.assertEqual(final['liveCoverage']['epoch'], first['liveCoverage']['epoch'])
+
+    def run_worker(self):
+        self.assertTrue(web2api.request_codex_session_usage_backfill())
+        worker_key = str((self.state / web2api.CODEX_SESSION_USAGE_CACHE_FILE).resolve())
+        with web2api._CODEX_SESSION_BACKFILL_LOCK:
+            worker = web2api._CODEX_SESSION_BACKFILL_WORKERS.get(worker_key)
+        if worker:
+            worker.join(5)
+            self.assertFalse(worker.is_alive(), 'worker must stop after a bounded pass')
+        return web2api._codex_backfill_progress(
+            self.document()['files'], cache_path=self.state / web2api.CODEX_SESSION_USAGE_CACHE_FILE)
+
+    def test_changed_oldest_file_does_not_starve_other_files_and_retries_after_refresh(self):
+        paths = {self.seed('one.jsonl'), self.seed('two.jsonl')}
+        self.scan()
+        import hashlib
+        oldest = min(paths, key=lambda path: hashlib.sha256(path.name.encode()).hexdigest()[:32])
+        self.write(oldest.name, [self.event(5, 200, 500)], append=True)
+        progress = self.run_worker()
+        self.assertEqual(progress['pendingFiles'], 1)
+        self.assertEqual(progress['status'], 'retry')
+        self.assertEqual(progress['reason'], 'source_changed')
+        self.assertEqual(progress['failedFiles'], 1)
+        self.assertFalse(progress['workerRunning'])
+        self.scan(10)
+        self.assertEqual(self.run_worker()['status'], 'complete')
+        self.assertEqual(self.scan(20)['totals']['totalTokens'], 800)
+
+    def test_unreadable_file_is_reported_without_stopping_healthy_history(self):
+        bad = self.seed('bad.jsonl')
+        self.seed('good.jsonl')
+        self.scan()
+        original = web2api._parse_codex_session_usage_file
+        attempts = []
+        def parse(path, *args, **kwargs):
+            if path == bad:
+                attempts.append(path)
+                return {'parseSuccess': False, 'offset': kwargs.get('start_offset', 0)}
+            return original(path, *args, **kwargs)
+        with patch.object(web2api, '_parse_codex_session_usage_file', side_effect=parse):
+            progress = self.run_worker()
+        self.assertEqual(attempts, [bad], 'failed files must be attempted once per worker pass')
+        self.assertEqual(progress['pendingFiles'], 1)
+        self.assertEqual(progress['failedFiles'], 1)
+        self.assertEqual(progress['status'], 'blocked')
+        self.assertEqual(progress['reason'], 'incomplete_or_unreadable_jsonl')
+        self.assertFalse(progress['workerRunning'])
+        self.assertEqual(self.run_worker()['status'], 'complete')
+        self.assertEqual(self.scan(10)['totals']['totalTokens'], 600)
+
+    def test_unexpected_worker_failure_does_not_leave_a_running_claim(self):
+        self.seed()
+        self.scan()
+        with patch.object(web2api, 'codex_session_usage_backfill_step', side_effect=RuntimeError('failed')):
+            progress = self.run_worker()
+        self.assertEqual(progress['status'], 'blocked')
+        self.assertEqual(progress['reason'], 'backfill_unavailable')
+        self.assertFalse(progress['workerRunning'])
+        self.assertEqual(self.run_worker()['status'], 'complete')
+
     def test_live_appends_continue_during_backfill_without_live_epoch_reset(self):
         self.seed()
         baseline = self.scan()['liveCoverage']
@@ -208,6 +298,9 @@ class UsageBackfillTests(unittest.TestCase):
             self.assertTrue(web2api.request_codex_session_usage_backfill())
             self.assertTrue(entered.wait(2))
             self.assertFalse(web2api.request_codex_session_usage_backfill())
+            progress = self.scan(5)['coverage']['backfill']
+            self.assertEqual(progress['status'], 'running')
+            self.assertTrue(progress['workerRunning'])
             with web2api._CODEX_SESSION_BACKFILL_LOCK:
                 worker = next(iter(web2api._CODEX_SESSION_BACKFILL_WORKERS.values()))
             release.set()
@@ -238,6 +331,9 @@ class UsageBackfillTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertEqual(self.document(), before)
         self.assertTrue(web2api.stop_codex_session_usage_backfill())
+        progress = self.scan(10)['coverage']['backfill']
+        self.assertEqual(progress['status'], 'paused')
+        self.assertFalse(progress['workerRunning'])
         self.assertTrue(web2api.request_codex_session_usage_backfill(restart=True))
         with web2api._CODEX_SESSION_BACKFILL_LOCK:
             worker = next(iter(web2api._CODEX_SESSION_BACKFILL_WORKERS.values()))

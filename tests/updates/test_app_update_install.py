@@ -213,6 +213,46 @@ function Start-VerifiedManager {
         self.assertEqual(Path(result["backup"]).read_bytes(), self.original)
         self.assertFalse(result["restart"]["ready"])
 
+    def test_powershell_live_startup_timeout_keeps_installed_state_and_backup(self):
+        self.prepare()
+        result = self.run_powershell("""
+. (Join-Path $PSScriptRoot 'install.ps1')
+function Get-SourceProcess { return @{present=$true} }
+function Wait-ForSourceExit { }
+function Get-TargetProcesses { }
+function Start-ManagerProcess { return @{HasExited=$false} }
+function Test-ManagerReady { $script:readinessReason = 'ui_not_ready'; return $null }
+$actualStart = ${function:Start-VerifiedManager}
+function Start-VerifiedManager { & $actualStart -timeoutSeconds 0 }
+""")
+        self.assertEqual(result["state"], "installed", result)
+        self.assertEqual(result["code"], "startup_unverified")
+        self.assertEqual(result["verification"]["reason"], "ui_not_ready")
+        self.assertFalse(result["restart"]["ready"])
+        self.assertEqual(self.target.read_bytes(), self.updated)
+        self.assertEqual(Path(result["backup"]).read_bytes(), self.original)
+
+    def test_powershell_waits_for_late_ready_without_launching_again(self):
+        self.prepare()
+        result = self.run_powershell("""
+. (Join-Path $PSScriptRoot 'install.ps1')
+function Get-SourceProcess { return @{present=$true} }
+function Wait-ForSourceExit { }
+function Get-TargetProcesses { }
+$script:launchCount = 0; $script:probeCount = 0
+function Start-ManagerProcess { $script:launchCount += 1; return @{HasExited=$false} }
+function Test-ManagerReady {
+    $script:probeCount += 1
+    if ($script:probeCount -lt 3) { return $null }
+    return @{ready=$true; launches=$script:launchCount; probes=$script:probeCount}
+}
+$actualStart = ${function:Start-VerifiedManager}
+function Start-VerifiedManager { & $actualStart -timeoutSeconds 2 }
+""")
+        self.assertEqual(result["state"], "complete", result)
+        self.assertEqual(result["restart"]["launches"], 1)
+        self.assertEqual(result["restart"]["probes"], 3)
+
     def test_powershell_parent_exit_timeout_never_replaces(self):
         self.prepare()
         # Use the actual waiting implementation with an always-present mock.
@@ -225,7 +265,7 @@ function Get-TargetProcesses { }
 function Start-VerifiedManager { throw 'must not execute' }
 """)
         self.assertEqual(result["state"], "failed", result)
-        self.assertIn("not safely exited", result["message"])
+        self.assertIn("not safely exited", result["detail"])
         self.assertEqual(self.target.read_bytes(), self.original)
 
     def test_powershell_sharing_lock_retries_then_replaces(self):
@@ -251,7 +291,7 @@ function Invoke-AtomicReplacement([string]$replacement, [string]$target, [string
 """)
         self.assertEqual(result["state"], "failed", result)
         self.assertEqual(self.target.read_bytes(), b"concurrent target replacement")
-        self.assertIn("verification failed", result["message"])
+        self.assertIn("verification failed", result["detail"])
 
     def test_real_helper_rejects_wrong_source_executable_before_exit(self):
         if os.name != "nt":
@@ -262,7 +302,8 @@ function Invoke-AtomicReplacement([string]$replacement, [string]$target, [string
             installer.launch_install(prepared, ready_timeout=5)
         self.assertIn(rejected.exception.code, {"helper_preflight_failed", "helper_launch_failed"})
         if rejected.exception.code == "helper_preflight_failed":
-            self.assertIn("Source process identity changed", str(rejected.exception))
+            result = json.loads(prepared["statusFile"].read_text(encoding="utf-8-sig"))
+            self.assertIn("Source process identity changed", result["detail"])
         self.assertEqual(self.target.read_bytes(), self.original)
 
     def test_powershell_restart_readiness_requires_live_matching_health_nonce(self):

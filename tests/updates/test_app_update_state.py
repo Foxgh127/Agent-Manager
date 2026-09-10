@@ -65,3 +65,19 @@ def test_monitor_failure_releases_lock_and_is_visible(tmp_path):
         assert not service._operation.locked()
         assert service.status()['installation']['message']=='restore blocked'
     finally: service.close()
+
+
+def test_malformed_install_spec_preserves_helper_failure(tmp_path):
+    install_id = 'a' * 48
+    root = tmp_path / 'app-update-install'
+    directory = root / install_id
+    directory.mkdir(parents=True)
+    path = directory / 'result.json'
+    path.write_text(json.dumps({'installId': install_id, 'state': 'failed', 'message': 'original failure'}))
+    (directory / 'install.json').write_text('not valid JSON')
+    (root / 'latest.json').write_text(json.dumps({'installId': install_id, 'path': str(path)}))
+    service = make_service(tmp_path)
+    try:
+        assert service.status()['installation']['message'] == 'original failure'
+    finally:
+        service.close()

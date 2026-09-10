@@ -13,6 +13,7 @@ import { Modal, ConfirmDialog } from "./components/Dialog.jsx";
 import RecoveryPanel from "./components/RecoveryPanel.jsx";
 import ConfigRecoveryPanel from "./components/ConfigRecoveryPanel.jsx";
 import AppUpdatePanel from "./components/AppUpdatePanel.jsx";
+import UpdateAction from "./components/UpdateAction.jsx";
 import { loadAppUpdate } from "./appUpdateResource.js";
 import RelayOriginNotice from "./components/RelayOriginNotice.jsx";
 import SessionSyncModal from "./components/SessionSyncModal.jsx";
@@ -21,7 +22,7 @@ import AccountReauthModal from "./components/AccountReauthModal.jsx";
 import { quotaIsCurrent } from "./quotaFreshness.js";
 import { contextBudget } from "./contextBudget.js";
 import { createConfirmationQueue } from "./confirmationQueue.js";
-import { usageSourceKey, usageSourceLabels } from "./usageViewModel.js";
+import { usageSourceKey, usageSourceLabels, usageBackfillState } from "./usageViewModel.js";
 import { applyDashboardMoveResult } from "./dashboardMove.js";
 import { normalizeUsageRange, resolveUsageRange, filterUsageRecordsByRange, usageRecordDateKey } from "./usageRange.js";
 import DiscreteSlider from "./components/DiscreteSlider.jsx";
@@ -10080,14 +10081,14 @@ function UsageView({ data, notify, confirm, embedded = false }) {
   const [exportResult, setExportResult] = useState(null);
   const [detailPage, setDetailPage] = useState(1);
   const usageLoadInFlight = useRef(false);
-  const load = useCallback(async (force = false) => {
+  const load = useCallback(async (force = false, background = false) => {
     if (usageLoadInFlight.current) return;
     if (!force && usageResourceCache) {
       setPayload(usageResourceCache);
       setLoading(false);
       return;
     }
-    setLoading(true);
+    if (!background) setLoading(true);
     usageLoadInFlight.current = true;
     setError("");
     try {
@@ -10117,14 +10118,17 @@ function UsageView({ data, notify, confirm, embedded = false }) {
       : gatewayPayload;
   const usageReadWarnings = [gatewayPayload?.lastError, effectiveUsageSource !== "gateway" ? gatewayPayload?.codexSessionsError : null].filter(Boolean);
   const sessionCoverage = effectiveUsageSource !== "gateway" ? sessionPayload?.coverage : null;
-  const historyPendingFiles = Number(sessionPayload?.coverage?.backfill?.pendingFiles) || 0;
+  const historyBackfill = usageBackfillState(sessionCoverage);
   useEffect(() => {
-    if (!historyPendingFiles) return undefined;
+    if (!historyBackfill.pollDelayMs) return undefined;
+    let attempts = 0;
     const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") load(true);
-    }, 5000);
+      if (document.visibilityState !== "visible") return;
+      if (++attempts >= historyBackfill.maxUnchangedPolls) window.clearInterval(timer);
+      load(true, true);
+    }, historyBackfill.pollDelayMs);
     return () => window.clearInterval(timer);
-  }, [historyPendingFiles, load]);
+  }, [historyBackfill.progressKey, historyBackfill.pollDelayMs, historyBackfill.maxUnchangedPolls, load]);
   useEffect(() => {
     setAccountFilter("all");
     setModelFilter("all");
@@ -10298,7 +10302,7 @@ function UsageView({ data, notify, confirm, embedded = false }) {
       <UsageRangeControls value={usageRange} onChange={setUsageRange} onCommit={commitUsageRange} now={rangeNow} />
       <ResourceState loading={loading && !payload} error={error} onRetry={() => load(true)} label="正在汇总本地请求…" />
       {usageReadWarnings.map((warning, index) => <p key={index} className="usage-coverage-note" role="status">{warning}；当前显示仍可读取的统计。</p>)}
-      {Number(sessionCoverage?.partialFiles) > 0 && <p className="usage-coverage-note" role="status">{historyPendingFiles > 0 ? `正在后台补全历史记录 · 剩余 ${historyPendingFiles} 个文件` : `正在读取新增记录 · 剩余 ${formatBytes(sessionCoverage.pendingBytes || 0)}`}</p>}
+      {Number(sessionCoverage?.partialFiles) > 0 && <p className="usage-coverage-note" role="status">{historyBackfill.text || `新增记录尚未读完 · 剩余 ${formatBytes(sessionCoverage.pendingBytes || 0)}`}</p>}
       {exportResult && <p className="usage-export-result">JSON 汇总已保存：<code>{exportResult.path}</code></p>}
       {payload && <>
         <div className="usage-kpis">
@@ -10377,7 +10381,7 @@ function hasAvailableUpdate(component) {
 
 function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
   const loadGenerationRef = useRef(0);
-  const [appRefreshKey, setAppRefreshKey] = useState(0);
+  const [managerWorking, setManagerWorking] = useState(false);
   const [updates, setUpdates] = useState(null);
   const [checks, setChecks] = useState(null);
   const [validation, setValidation] = useState(null);
@@ -10405,10 +10409,11 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
           body: JSON.stringify({ runDoctor: false }),
         })
       : Promise.resolve(null);
-    const [updateResult, checkResult, validationResult] = await Promise.allSettled([
+    const [updateResult, checkResult, validationResult, managerResult] = await Promise.allSettled([
       updateRequest,
       api(force ? "/api/emergency/checks?force=1" : "/api/emergency/checks"),
       validationRequest,
+      force ? loadAppUpdate(api, { force: true }) : Promise.resolve(null),
     ]);
     if (generation !== loadGenerationRef.current) return;
     const nextUpdates = updateResult.status === "fulfilled" ? updateResult.value : null;
@@ -10416,7 +10421,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
     const nextValidation = validationResult.status === "fulfilled"
       ? validationResult.value?.validation || null
       : null;
-    const nextError = [updateResult, checkResult, validationResult]
+    const nextError = [updateResult, checkResult, validationResult, managerResult]
       .filter((item) => item.status === "rejected")
       .map((item) => item.reason?.message)
       .filter(Boolean)
@@ -10450,7 +10455,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
   const desktopHasUpdate = hasAvailableUpdate(desktop);
   const cliHasUpdate = hasAvailableUpdate(cli);
   const desktopMessage = desktop.updateState === "check_failed"
-    ? "上次检查未成功，可点击刷新状态重试"
+    ? "检查未成功，请重试"
     : /checking updates/i.test(String(desktop.message || ""))
       ? "尚未取得明确的更新结果"
       : desktop.message || "刷新状态后检查更新";
@@ -10460,6 +10465,9 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
     cli.installed === false ||
     ["missing", "not_found", "not-found", "absent"].includes(cliStatus) ||
     /未安装|未检测到|not found|missing/i.test(String(cli.message || ""));
+  const actionsDisabled = loading || Boolean(working) || managerWorking;
+  const desktopActivity = working === "desktop" ? "更新中" : loading ? "检查中" : "";
+  const cliActivity = ["cli", "cli-deploy"].includes(working) ? (working === "cli-deploy" ? "部署中" : "更新中") : loading ? "检查中" : "";
   const configurationPending = ["waiting", "starting"].includes(data.configurationSession?.status);
   const diagnosticItems = firstArray(checks, ["checks", "items", "results"])
     .filter(item => !configurationPending || item.id !== "generated_configuration");
@@ -10589,37 +10597,39 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
       <header>
         <span><HardDriveDownload size={19} /></span>
         <div><h2>版本与维护</h2><p>查看和更新 Codex Desktop、CLI 与 Agent Manager</p></div>
-        <button className="button secondary compact" onClick={() => { setAppRefreshKey(value => value + 1); load(true); }} disabled={loading || working}><RefreshCw className={loading ? "spin" : ""} size={14} />刷新状态</button>
+        <button className="button secondary compact" onClick={() => load(true)} disabled={actionsDisabled}><RefreshCw className={loading ? "spin" : ""} size={14} />{loading ? "刷新中" : "刷新状态"}</button>
       </header>
       {error && <div className="inline-notice warning"><AlertTriangle size={16} /><span>{error}</span></div>}
       {configurationPending && <div className="inline-notice"><Loader2 className="spin" size={16} /><span>正在激活临时配置，完成后自动核对同步状态。</span></div>}
       {checks?.stale && <div className="inline-notice"><Clock3 size={16} /><span>完整诊断缓存已过期；生成配置已重新核对，可点击“刷新状态”更新其他检查。</span></div>}
       <div className="update-grid">
-        <AppUpdatePanel api={api} notify={notify} refreshKey={appRefreshKey} />
+        <AppUpdatePanel api={api} notify={notify} refreshing={loading} disabled={Boolean(working)} onBusyChange={setManagerWorking} />
         <article className="update-component">
           <span className="update-icon codex"><img src="/codex-official.png" alt="" /></span>
-          <div className="update-copy"><small>CODEX DESKTOP</small><strong>{desktop.currentVersion || desktop.installedVersion || "未检测"}</strong><p title={desktop.message}>{desktopHasUpdate === true ? `可更新到 ${desktop.latestVersion || desktop.availableVersion || "新版本"}` : desktopHasUpdate === false ? "Microsoft Store 确认已是最新版" : desktopMessage}</p></div>
-          {desktopHasUpdate === true && desktop.canAutoUpdate ? <button className="button secondary compact" disabled={Boolean(working)} onClick={() => action("desktop", () => api("/api/updates/desktop", { method: "POST", body: "{}", timeoutMs: 960000 }), "Desktop 更新检查完成", false)}>{working === "desktop" ? <Loader2 className="spin" size={14} /> : <Download size={14} />}一键更新</button> : desktopHasUpdate === false ? <span className="status-pill success"><Check size={13} />已是最新版</span> : <button className="button secondary compact" disabled={loading || Boolean(working)} onClick={() => load(true)}><RefreshCw size={14} />检查更新</button>}
+          <div className="update-copy"><small>CODEX DESKTOP</small><strong>{desktop.currentVersion || desktop.installedVersion || "未检测"}</strong><p role="status">{desktopActivity ? (loading ? "正在检查更新" : "正在安装更新") : desktopHasUpdate === true ? `可更新到 ${desktop.latestVersion || desktop.availableVersion || "新版本"}` : desktopHasUpdate === false ? "已是最新版" : desktopMessage}</p></div>
+          <UpdateAction busy={desktopActivity} disabled={actionsDisabled} current={desktopHasUpdate === false}
+            download={desktopHasUpdate === true && desktop.canAutoUpdate} label={desktopHasUpdate === true && desktop.canAutoUpdate ? "一键更新" : "检查更新"}
+            onClick={desktopHasUpdate === true && desktop.canAutoUpdate ? () => action("desktop", () => api("/api/updates/desktop", { method: "POST", body: "{}", timeoutMs: 960000 }), "Desktop 更新检查完成", false) : () => load(true)} />
 
         </article>
         <article className="update-component">
           <span className="update-icon cli"><Bot size={20} /></span>
-          <div className="update-copy"><small>CODEX CLI</small><strong>{cli.currentVersion || cli.installedVersion || (cliMissing ? "尚未安装" : "未检测")}</strong><p>{cliMissing ? "需要时可复用桌面运行时或部署官方 CLI" : cliHasUpdate === true ? `可更新到 ${cli.latestVersion || cli.availableVersion || cli.version || "最新版"}` : cliHasUpdate === false ? "独立 CLI" : cli.message || "刷新状态后确认版本"}</p></div>
-          {cliMissing ? <button className="button primary compact" disabled={working === "cli-deploy"} onClick={async () => {
+          <div className="update-copy"><small>CODEX CLI</small><strong>{cli.currentVersion || cli.installedVersion || (cliMissing ? "尚未安装" : "未检测")}</strong><p role="status">{cliActivity ? (loading ? "正在检查更新" : working === "cli-deploy" ? "正在部署运行时" : "正在安装更新") : cliMissing ? "需要时可部署官方 CLI" : cliHasUpdate === true ? `可更新到 ${cli.latestVersion || cli.availableVersion || cli.version || "最新版"}` : cliHasUpdate === false ? "已是最新版" : "刷新状态后确认版本"}</p></div>
+          {cliMissing ? <UpdateAction busy={cliActivity} disabled={actionsDisabled} download label="一键部署" onClick={async () => {
             const approved = await confirm({ title: "一键部署 Codex CLI？", message: "将先复用 Codex Desktop 内置运行时，再按环境选择官方安装方式并完成版本回验。", detail: "不会把 codex.cmd、codex.bat 或 codex.ps1 写入 CODEX_CLI_PATH；失败会保留现有环境并返回具体原因。", confirmLabel: "开始部署" });
             if (approved) await action("cli-deploy", () => api("/api/codex-runtime/deploy", {
               method: "POST",
               body: "{}",
               timeoutMs: 600_000,
             }), "Codex CLI 已部署并通过检查");
-          }}>{working === "cli-deploy" ? <Loader2 className="spin" size={14} /> : <Download size={14} />}一键部署</button> : cliHasUpdate === true ? <button className="button secondary compact" disabled={working === "cli"} onClick={async () => {
+          }} /> : cliHasUpdate === true ? <UpdateAction busy={cliActivity} disabled={actionsDisabled} download label="更新 CLI" onClick={async () => {
             const approved = await confirm({ title: "更新 Codex CLI？", message: "将更新独立的 npm Codex CLI，不会重启 Codex Desktop。", detail: "不会创建或修改 CODEX_CLI_PATH；桌面端继续自动使用安装包内的原生 codex.exe。", confirmLabel: "更新 CLI" });
             if (approved) await action("cli", () => api("/api/updates/cli", {
               method: "POST",
               body: "{}",
               timeoutMs: 600_000,
             }), "Codex CLI 已更新");
-          }}><Download size={14} />更新 CLI</button> : cliHasUpdate === false ? <span className="status-pill success"><Check size={13} />已是最新版</span> : <span className="status-pill">待刷新</span>}
+          }} /> : <UpdateAction busy={cliActivity} disabled={actionsDisabled} current={cliHasUpdate === false} onClick={() => load(true)} />}
         </article>
       </div>
       <div className={cx("repair-section", healthy && "healthy")}>

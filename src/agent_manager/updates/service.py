@@ -503,6 +503,8 @@ class AppUpdateService:
         self._download = {"state": "idle", "downloadedBytes": 0, "totalBytes": 0}
         self._installation = {"state": "idle"}
         self._installation_expected_id = None
+        self._installation_verified = None
+        self._installation_probe_at = 0.0
         try:
             cache = _read_json(self.cache_path, MAX_METADATA_BYTES)
             if isinstance(cache, dict):
@@ -936,10 +938,63 @@ class AppUpdateService:
                 return
             if result.get("state") not in {"waiting_for_exit", "installed", "complete", "failed"}:
                 return
+            result = self._reconcile_installation_result(path, result)
             with self._lock:
-                self._installation = {key: result[key] for key in ("state", "message", "backup", "restart") if key in result}
+                self._installation = self._installation_view(result)
         except (UpdateError, OSError, ValueError):
             return
+
+    @staticmethod
+    def _installation_view(result):
+        return {key: result[key] for key in ("state", "code", "message", "detail", "backup", "restart",
+                "version", "at", "verification", "previousState") if key in result}
+
+    def _reconcile_installation_result(self, path, result):
+        """Keep helper evidence intact; a later live proof supersedes its timeout."""
+        if not self.install_supported or result.get("state") not in {"installed", "failed"}:
+            return result
+        try:
+            spec = _read_json(path.with_name("install.json"), 65536)
+        except (UpdateError, OSError, ValueError):
+            return result
+        if (not isinstance(spec, dict) or spec.get("installId") != result.get("installId")
+                or path.parent.name != spec.get("installId")):
+            return result
+        from agent_manager.updates.installer import installation_is_historical, verify_current_installation
+        if installation_is_historical(spec, current_version=self.current_version):
+            return {**result, "state": "idle", "code": "previous_installation", "message": "",
+                    "detail": str(result.get("detail") or result.get("message") or "")[:1000],
+                    "previousState": result["state"], "version": spec.get("version")}
+        try:
+            # Reuse the expensive hash only while the executable and discovery
+            # file retain the exact identities observed by the earlier proof.
+            stamps = []
+            for evidence_path in (Path(spec["target"]), self.config_path.parent / "app-runtime.json"):
+                info = _regular_path(evidence_path, missing=False).stat()
+                stamps.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+            fingerprint = _fingerprint({"spec": spec, "stamps": stamps})
+        except (UpdateError, OSError, ValueError, TypeError, KeyError):
+            return result
+        with self._lock:
+            cached = self._installation_verified
+            proof = cached[1] if cached and cached[0] == fingerprint else None
+            if not proof:
+                now = time.monotonic()
+                if now - self._installation_probe_at < 2.0:
+                    return result
+                self._installation_probe_at = now
+        if not proof:
+            proof = verify_current_installation(spec, current_version=self.current_version,
+                                                runtime_file=self.config_path.parent / "app-runtime.json")
+            if not proof:
+                return result
+            with self._lock:
+                self._installation_verified = (fingerprint, proof)
+        return {**result, "state": "complete", "code": "update_ready_reconciled",
+                "message": "更新已完成，已确认当前版本的窗口和服务就绪。",
+                "detail": str(result.get("message") or "")[:1000], "previousState": result["state"],
+                "version": spec["version"], "restart": proof,
+                "verification": {"method": "current_process_health_and_sha256", "at": proof["verifiedAt"]}}
 
     def monitor_installation(self, result_path, install_id):
         """The caller transfers its acquired operation lock to this monitor."""
@@ -950,7 +1005,7 @@ class AppUpdateService:
         self._installation_expected_id = install_id
 
         def watch():
-            deadline = time.monotonic() + 420
+            deadline = time.monotonic() + 600
             try:
                 while not self._closed and time.monotonic() < deadline:
                     try:
@@ -960,8 +1015,8 @@ class AppUpdateService:
                     if isinstance(result, dict) and result.get("installId") == install_id:
                         state = str(result.get("state") or "")
                         with self._lock:
-                            self._installation = {key: result[key] for key in ("state", "message", "backup", "restart") if key in result}
-                        if state in {"complete", "failed"}:
+                            self._installation = self._installation_view(result)
+                        if state in {"complete", "failed"} or result.get("code") == "startup_unverified":
                             return
                     time.sleep(0.5)
                 if not self._closed:

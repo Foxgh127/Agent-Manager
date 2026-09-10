@@ -30,7 +30,8 @@ export function loadAppUpdate(api, { force = false } = {}) {
   if (!force) return entry.check || (entry.status ? Promise.resolve(entry.status) : read(api));
   if (!entry.check) entry.check = (async () => {
     const current = await read(api);
-    if (!current?.configured || current.download?.state === 'downloading' || ['waiting_for_exit', 'installed'].includes(current.installation?.state)) return current;
+    if (!current?.configured || current.download?.state === 'downloading' ||
+        (['waiting_for_exit', 'installed'].includes(current.installation?.state) && current.installation?.code !== 'startup_unverified')) return current;
     const result = await api('/api/app-update/check', { method: 'POST', body: '{}', timeoutMs: 60000 });
     return publish(api, result.status);
   })().catch(error => {

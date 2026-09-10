@@ -23,11 +23,15 @@ def package_family(desktop: dict) -> str | None:
 
 def parse_store_check(output: str) -> dict:
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output).strip()
-    if re.search(r"\berror\b|could not|cannot |failed|错误|失败|无法", text, re.I):
-        return {"updateAvailable": None, "updateState": "check_failed", "message": text[-600:]}
+    # Store CLI can ask to apply even with --apply false, then report EOF on
+    # redirected stdin. That final prompt failure does not invalidate its check.
+    # Ignore only this exact message; other failures must remain unknown.
+    checked_text = re.sub(r"Failed to read input in non-interactive mode\.?", "", text, flags=re.I)
+    if re.search(r"\berror\b|could not|cannot |failed|错误|失败|无法", checked_text, re.I):
+        return {"updateAvailable": None, "updateState": "check_failed", "message": "检查未成功，请重试。"}
     if re.search(r"already up.to.date|no updates? (?:are )?available|已是最新|没有可用更新", text, re.I):
         return {"updateAvailable": False, "updateState": "current", "message": "Microsoft Store 确认已是最新版"}
-    if re.search(r"updates? (?:is |are )?available|updates? found|new version|有可用更新|可更新到", text, re.I):
+    if re.search(r"updates? (?:is |are )?available|updates? found|new version|有可用更新|可更新到", checked_text, re.I):
         versions = re.findall(r"\b\d+\.\d+\.\d+(?:\.\d+)?\b", text)
         return {"updateAvailable": True, "updateState": "available", "availableVersion": versions[-1] if versions else None,
                 "message": "Microsoft Store 发现可用更新"}
@@ -36,7 +40,8 @@ def parse_store_check(output: str) -> dict:
 
 def _run(command: list[str], timeout: float):
     return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                          stdin=subprocess.DEVNULL, timeout=timeout,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def check(desktop: dict | None, *, runner=None, executable=None) -> dict:
@@ -52,9 +57,12 @@ def check(desktop: dict | None, *, runner=None, executable=None) -> dict:
     if not family or not store:
         return {**result, "updateState": "external_unavailable", "message": "当前系统没有可用的 Store CLI，可打开 Microsoft Store 更新"}
     try:
-        completed = (runner or _run)([store, "update", family], 50)
-        parsed = parse_store_check((completed.stdout or "") + "\n" + (completed.stderr or ""))
-        if completed.returncode:
+        completed = (runner or _run)([store, "update", family, "--apply", "false"], 50)
+        output = (completed.stdout or "") + "\n" + (completed.stderr or "")
+        parsed = parse_store_check(output)
+        expected_prompt_abort = (parsed.get("updateAvailable") is True and
+            "Failed to read input in non-interactive mode" in output)
+        if completed.returncode and not expected_prompt_abort:
             parsed = {"updateAvailable": None, "updateState": "check_failed", "message": "Microsoft Store 检查失败，请重试。"}
         return {**result, **parsed}
     except (OSError, subprocess.TimeoutExpired):
