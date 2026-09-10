@@ -47,7 +47,10 @@ class CalibrationRuntimeTests(unittest.TestCase):
         public={key:value for key,value in private.items() if key!="fingerprint"}
         with patch.object(core,"read_json",return_value={"accounts":[private]}), patch.object(estimator,"read_summaries",return_value={"a":{"status":"calibrated"}}) as read:
             sampler.decorate([public])
-        read.assert_called_once_with([private])
+        read.assert_called_once()
+        sampled = read.call_args.args[0][0]
+        self.assertEqual({key: sampled[key] for key in private}, private)
+        self.assertEqual(len(sampled['calibrationWorkloadScope']), 64)
         self.assertEqual(public["quotaEstimate"]["status"],"calibrated")
         self.assertNotIn("fingerprint",public)
 

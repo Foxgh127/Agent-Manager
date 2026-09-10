@@ -708,6 +708,10 @@ class ManagerRuntime:
             thread.join(timeout=2.0)
 
     def state(self) -> dict:
+        # Pair first-paint status with the lifecycle observed before its reads.
+        # If activation finishes mid-request, the client will still poll and
+        # replace this pre-activation snapshot once, instead of keeping it.
+        session = _app.json.loads(_app.json.dumps(self.configuration_session))
         try:
             state = _app.core.public_state()
         except Exception as exc:
@@ -744,7 +748,7 @@ class ManagerRuntime:
         state["web2apiStatus"] = self.web2api.status()
         state["oauthStatus"] = self.oauth.state()
         state["relayLoginStatus"] = self.relay_portal.public_state()
-        state["configurationSession"] = _app.json.loads(_app.json.dumps(self.configuration_session))
+        state["configurationSession"] = session
         with self.account_refresh_lock:
             state["accountRefreshStatus"] = _app.json.loads(_app.json.dumps(self.account_refresh_status))
             state["accountAutoRefreshStatus"] = _app.json.loads(_app.json.dumps(self.account_auto_refresh_status))

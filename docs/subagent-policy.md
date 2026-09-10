@@ -12,6 +12,10 @@ Codex catalog 的 `display_name` 使用原生模型 ID，例如 `gpt-6-astra`。
 
 ## 策略结构
 
+应用里的“调用策略提示词”只显示所选策略正文。Codex“说明”展示的是完整说明，其中还包含自动生成的调用协议、子代理生命周期规则和实际路由；所以两处长度不同是正常的。对应的 `Editable call strategy` 正文应一致。如果正文不同，再检查是否保存并同步、是否使用同一个 `CODEX_HOME`，以及是否有 `AGENTS.override.md` 或项目说明覆盖。[Codex 说明文件发现规则](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
+
+Codex 在运行开始时加载说明。已开始的任务不应被假定会立即采用刚编辑的内容；必要时在保存同步后开启新任务验证。不要用完整生成说明替换应用中的策略正文，否则会重复嵌套规则。
+
 调度策略由三部分生成：调用协议、所选策略正文、生命周期及有序路由。`OPTIMAL_ADAPTIVE_INSTRUCTIONS` 是自动模式的应用内置正文；`SUBAGENT_LIFECYCLE_SAFETY` 负责统一生命周期；`_render_managed_agent()` 给 worker 输出契约。Codex V2 mode hint 接收策略正文，完整的调用协议、生命周期和实际路由同时写入管理块。
 
 | 阶段 | 执行要求 | 验收依据 |

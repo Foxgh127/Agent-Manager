@@ -474,7 +474,10 @@ class CodexMaintenanceServiceTests(unittest.TestCase):
             "needsManualCheck": False,
         }
         core.atomic_write_json(maintenance.DIAGNOSTICS_CACHE_FILE, healthy)
-        with patch.object(maintenance, "_repair_generated_configuration") as repair:
+        with (
+            patch.object(maintenance, "_repair_generated_configuration") as repair,
+            patch.object(core, "configuration_status", return_value={"fullyApplied": True}),
+        ):
             result = maintenance.apply_emergency_repairs(["generated_configuration"])
         self.assertTrue(result["noop"])
         self.assertFalse(result["rechecked"])

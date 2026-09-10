@@ -8,3 +8,4 @@
 .quota-estimate details { margin-top: 7px; color: var(--muted); font-size: 10px; }
 .quota-estimate summary { cursor: pointer; width: fit-content; }
 .quota-estimate details p { margin: 8px 0 0; line-height: 1.6; }
+.quota-estimate > .quota-estimate-usd { margin-top: 7px; }

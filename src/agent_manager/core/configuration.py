@@ -202,6 +202,13 @@ def _apply_configuration_locked(
 
 
 def configuration_status(settings: dict | None = None) -> dict:
+    # Apply writes several files under this lock. A health read must observe
+    # either side of that transaction, never its partially written contents.
+    with _core.CONFIG_FILE_LOCK:
+        return _configuration_status_locked(settings)
+
+
+def _configuration_status_locked(settings: dict | None = None) -> dict:
     settings = settings or _core.load_settings()
     config = _core.read_toml(_core.CONFIG_FILE)
     expected = _core.tomllib.loads(_core.build_codex_config(settings))
@@ -213,10 +220,10 @@ def configuration_status(settings: dict | None = None) -> dict:
         and config.get("model_catalog_json") == expected.get("model_catalog_json")
     )
     agents_text = _core.AGENTS_FILE.read_text(encoding="utf-8") if _core.AGENTS_FILE.exists() else ""
-    strategy_active = (
-        _core.MANAGED_BLOCK_START in agents_text
-        and f"(`{settings['activeStrategyId']}`)" in agents_text
-    )
+    # Native policy legitimately has no managed block. Compare the rendered
+    # result instead of requiring a marker (or accepting any stale same-ID
+    # block after its routes have been edited).
+    strategy_active = agents_text == _core.build_agents_file(settings)
     workspace = settings.get("modelWorkspace", _core._default_model_workspace())
     selected_records = _core.selected_model_records(settings)
     return {

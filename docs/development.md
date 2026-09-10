@@ -37,4 +37,16 @@ npm test --prefix frontend
 
 `scripts/clean.ps1` 只清理明确的项目生成物和旧目录；正在使用或无法安全处理的路径会被保留并报告。用户 Codex 数据目录不在项目清理范围。配置备份保留由应用中的独立服务负责。
 
+生成目录统一约定：`artifacts/build/` 为构建中间文件，`artifacts/publish/` 为发布暂存，`artifacts/checks/` 为本轮测试日志，`artifacts/reports/` 为本轮审查材料，`artifacts/preview/` 为隔离界面预览和测试下载。长期保留的结论整理到 `docs/`，不要把一次性诊断脚本留在项目根目录。
+
+```powershell
+./scripts/clean.ps1 -Preview                 # 先显示范围，不删除
+./scripts/clean.ps1                          # 清理构建中间文件和缓存
+./scripts/clean.ps1 -ReportsOnly             # 清理检查、审查和预览材料
+./scripts/clean.ps1 -IncludeDependencies     # 另清前端依赖和可重新生成的资源
+./scripts/clean.ps1 -LegacyRelease           # 另清已退役 release/，先结束其中程序
+```
+
+需要清理某个旧诊断目录时，使用 `python scripts/cleanup_project.py --reports-only --report-path artifacts/某个诊断目录` 预览，再加 `--apply`。自选路径必须是 `artifacts/` 下的明确文件或子目录，拒绝整个 `artifacts/`、源码和外部路径。所有删除都逐文件检查身份，不跟随符号链接或 Windows 重解析点；archives/reports 范围不会顺带清理源码字节码。
+
 不要删除仍在使用的 `.venv` 或依赖目录后继续运行开发服务器。清理依赖后按 README 重新安装即可。

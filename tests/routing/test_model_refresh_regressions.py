@@ -28,6 +28,7 @@ class ModelRefreshRegressions(unittest.TestCase):
         self.settings["accounts"] = [self.account]
         for name, value in {
             "CODEX_HOME": self.root, "CONFIG_FILE": self.root / "config.toml",
+            "STATE_DIR": self.root / "agent-manager",
             "MODELS_CACHE_FILE": self.root / "models_cache.json",
             "MODEL_CACHE": {"at": 0.0, "models": None, "raw": None},
             "CODEX_VERSION_CACHE": {"at": 0.0, "value": None},
@@ -35,6 +36,9 @@ class ModelRefreshRegressions(unittest.TestCase):
             p = patch.object(core, name, value)
             p.start()
             self.addCleanup(p.stop)
+        prefix = patch.object(core, "codex_prefix", return_value=[])
+        prefix.start()
+        self.addCleanup(prefix.stop)
 
     def test_official_visibility_and_live_capabilities_are_not_invented(self):
         result = core._parse_official_model_catalog({"models": [

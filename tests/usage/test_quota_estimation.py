@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -137,8 +140,78 @@ class QuotaEstimationTests(unittest.TestCase):
         result = self.observe(6, 72, 1_180_000,
                               local=self.local(6, 1_180_000, coverageComplete=False))
         self.assertEqual(result['reason'], 'local_coverage_incomplete')
+        self.assertEqual(result['sampleCount'], 5)
+        self.assertEqual(result['localCumulativeTokens'], 1_150_000)
         result = self.observe(7, 69, 1_210_000)
+        self.assertEqual(result['sampleCount'], 5)
+        # The incomplete 60K interval is never added. Only the following full
+        # interval extends the persisted fit.
+        result = self.observe(8, 66, 1_240_000)
+        self.assertEqual(result['sampleCount'], 6)
+        self.assertEqual(result['estimatedTotalTokens']['estimate'], 1_000_000)
+
+    def test_real_fresh_process_reads_warm_calibration_and_continues(self):
+        self.calibrated()
+        script = '''import json, sys
+from pathlib import Path
+import agent_manager.core as core
+import agent_manager.usage.estimation as estimator
+core.STATE_DIR = Path(sys.argv[1])
+account, local = json.loads(sys.argv[2]), json.loads(sys.argv[3])
+before = estimator.read_summary(account, now=1800001800)
+after = estimator.observe(account, local, now=1800001800)
+print(json.dumps({'before':before, 'after':after}))
+'''
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2] / 'src'))
+        process = subprocess.run([sys.executable, '-c', script, self.tmp.name,
+                                  json.dumps(self.account(6, 72)), json.dumps(self.local(6, 1_180_000))],
+                                 env=env, capture_output=True, text=True, check=True, timeout=20)
+        result = json.loads(process.stdout)
+        self.assertEqual(result['before']['sampleCount'], 5)
+        self.assertEqual(result['before']['localCumulativeTokens'], 1_150_000)
+        self.assertEqual(result['after']['sampleCount'], 6)
+
+    def test_rebuilt_counter_keeps_valid_samples_without_bridging_zero(self):
+        self.calibrated()
+        result = self.observe(6, 72, 0, local=self.local(6, 0, coverageEpoch='fresh-counter'))
+        self.assertEqual(result['sampleCount'], 5)
+        self.assertEqual(result['retainedObservedTokens'], 150_000)
+        result = self.observe(7, 69, 30_000, local=self.local(7, 30_000, coverageEpoch='fresh-counter'))
+        self.assertEqual(result['sampleCount'], 6)
+        self.assertEqual(result['estimatedTotalTokens']['estimate'], 1_000_000)
+
+    def test_changed_workload_keeps_history_separate(self):
+        self.calibrated()
+        account = self.account(6, 72, calibrationWorkloadScope='different-effort')
+        result = self.observe(6, 72, 1_180_000, account=account)
+        self.assertEqual(result['reason'], 'workload_changed')
         self.assertEqual(result['sampleCount'], 0)
+        self.assertEqual(result['historicalSampleCount'], 5)
+        self.assertEqual(result['retainedSampleCount'], 5)
+
+    def test_regain_during_counter_change_does_not_reuse_fit(self):
+        self.calibrated()
+        result = self.observe(6, 95, 0, local=self.local(6, 0, coverageEpoch='fresh-counter'))
+        self.assertEqual(result['reason'], 'quota_regained')
+        self.assertEqual(result['sampleCount'], 0)
+        self.assertEqual(result['historicalSampleCount'], 5)
+
+    def test_dollar_fit_requires_matching_priced_token_intervals(self):
+        from agent_manager.usage.pricing import PRICE_VERSION
+        for step in range(4):
+            local = self.local(step, 100_000 + step * 30_000)
+            local['apiEquivalent'] = {'status': 'available', 'sourceHistoryComplete': True,
+                                     'priceVersion': PRICE_VERSION, 'pricedTokens': local['cumulativeTokens'],
+                                     'knownUsd': 1 + step * 0.3}
+            result = self.observe(step, 90 - step * 3, local['cumulativeTokens'], local=local)
+        self.assertEqual(result['estimatedTotalUsd']['estimate'], 10)
+        self.assertEqual(result['estimatedRemainingUsd']['estimate'], 8.1)
+        self.assertEqual(result['usdSampleCount'], 3)
+        local = self.local(4, 220_000)
+        local['apiEquivalent'] = {'status': 'available', 'sourceHistoryComplete': True,
+                                 'priceVersion': PRICE_VERSION, 'pricedTokens': 999_999, 'knownUsd': 20}
+        result = self.observe(4, 78, 220_000, local=local)
+        self.assertEqual(result['usdSampleCount'], 3)
 
     def test_counter_regression_and_generation_change_reset(self):
         self.calibrated()

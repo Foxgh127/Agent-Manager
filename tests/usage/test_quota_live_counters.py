@@ -76,6 +76,17 @@ class QuotaLiveCountersTests(unittest.TestCase):
         self.write('one.jsonl', [self.event(5, 200, 300)], append=True)
         self.assertEqual(self.scan(30)['liveCoverage']['accounts'], {'a': 200})
 
+    def test_reopening_same_account_keeps_live_generation_and_totals(self):
+        self.write('one.jsonl', [self.meta(), self.event(-10)])
+        first = self.scan()['liveCoverage']
+        self.write('one.jsonl', [self.event(5, cumulative=200)], append=True)
+        second = self.scan(10)['liveCoverage']
+        self.activations.append({'timestamp': (self.start + timedelta(seconds=11)).isoformat(), 'accountId': 'a'})
+        reopened = self.scan(20)['liveCoverage']
+        self.assertEqual(reopened['epoch'], first['epoch'])
+        self.assertEqual(reopened['accounts'], second['accounts'])
+        self.assertGreater(reopened['accounts']['a'], 0)
+
     def test_permanent_partial_history_does_not_block_future_intervals(self):
         filler = {'type': 'response_item', 'payload': {'text': 'x' * 4000}}
         self.write('large.jsonl', [self.meta(), filler, self.event(-10)])

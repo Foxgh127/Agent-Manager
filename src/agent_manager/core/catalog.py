@@ -3,11 +3,73 @@ from __future__ import annotations
 from agent_manager import core as _core
 
 
+_PROBE_LOCK = _core.threading.RLock()
+_PERSISTED_PROBE_TTL = 24 * 60 * 60
+_FAILED_PROBE_RETRY_SECONDS = 30
+_MODEL_PROBE_FAILURE = {}
+
+
+def _installation_identity() -> list | None:
+    """Bind cached capabilities to the actual executable, including wrappers."""
+    try:
+        prefix = _core.codex_prefix()
+        identity = []
+        for argument in prefix:
+            path = _core.Path(argument)
+            if path.is_file():
+                stat = path.stat()
+                identity.append([str(path.resolve()), stat.st_size, stat.st_mtime_ns])
+            else:
+                identity.append(str(argument))
+        return identity if any(isinstance(item, list) for item in identity) else None
+    except Exception:
+        return None
+
+
+def _read_probe_cache(kind: str, identity: list | None):
+    if identity is None:
+        return None
+    try:
+        path = _core.STATE_DIR / f"codex-{kind}-probe-cache.json"
+        with path.open("rb") as handle:
+            raw = handle.read(_core.CODEX_CONFIG_MAX_BYTES + 1)
+        if len(raw) > _core.CODEX_CONFIG_MAX_BYTES:
+            return None
+        cache = _core.json.loads(raw)
+        age = _core.time.time() - float(cache.get("at", 0))
+        if cache.get("identity") == identity and 0 <= age < _PERSISTED_PROBE_TTL:
+            return cache.get("value")
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _write_probe_cache(kind: str, identity: list | None, value) -> None:
+    if identity is None:
+        return
+    try:
+        _core.atomic_write_json(_core.STATE_DIR / f"codex-{kind}-probe-cache.json",
+                                {"identity": identity, "at": _core.time.time(), "value": value})
+    except OSError:
+        pass
+
+
 def codex_version() -> str:
+    with _PROBE_LOCK:
+        return _codex_version_locked()
+
+
+def _codex_version_locked() -> str:
     with _core.MODEL_CACHE_LOCK:
         cached = _core.CODEX_VERSION_CACHE.get("value")
         if isinstance(cached, str) and _core.time.monotonic() - float(_core.CODEX_VERSION_CACHE.get("at", 0)) < 3_600:
             return cached
+    identity = _installation_identity()
+    value = _read_probe_cache("version", identity)
+    if isinstance(value, str) and _core.re.search(r"\d+\.\d+\.\d+", value):
+        with _core.MODEL_CACHE_LOCK:
+            _core.CODEX_VERSION_CACHE.update({"at": _core.time.monotonic(), "value": value})
+        return value
     try:
         result = _core.run_codex_capture(["--version"], timeout=10)
         value = result.stdout.strip() if result.returncode == 0 else "Codex unavailable"
@@ -15,6 +77,8 @@ def codex_version() -> str:
         value = "Codex unavailable"
     with _core.MODEL_CACHE_LOCK:
         _core.CODEX_VERSION_CACHE.update({"at": _core.time.monotonic(), "value": value})
+    if value != "Codex unavailable":
+        _write_probe_cache("version", identity, value)
     return value
 
 
@@ -24,6 +88,12 @@ def invalidate_codex_version_cache() -> None:
     with _core.MODEL_CACHE_LOCK:
         _core.CODEX_VERSION_CACHE.update({"at": 0.0, "value": None})
         _core.MODEL_CACHE.update({"at": 0.0, "raw": None, "models": None})
+    _MODEL_PROBE_FAILURE.clear()
+    for kind in ("version", "models"):
+        try:
+            (_core.STATE_DIR / f"codex-{kind}-probe-cache.json").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 
@@ -36,6 +106,13 @@ def _codex_supports_mcp_optional_startup_grace() -> bool:
 
 
 def _raw_local_model_catalog(force: bool = False) -> dict:
+    # Single-flight across dashboard, activation and health readers. Failed
+    # probes are throttled too, so an unavailable CLI cannot cost 30 s per read.
+    with _PROBE_LOCK:
+        return _raw_local_model_catalog_locked(force)
+
+
+def _raw_local_model_catalog_locked(force: bool = False) -> dict:
     # Never use `debug models` without --bundled: it honors our own generated
     # model_catalog_json and can indefinitely recycle old selections as truth.
     try:
@@ -52,27 +129,41 @@ def _raw_local_model_catalog(force: bool = False) -> dict:
             and _core.time.monotonic() - float(_core.MODEL_CACHE["at"]) < _core.MODEL_CACHE_TTL_SECONDS
         ):
             return _core.json.loads(_core.json.dumps(cached))
+    identity = _installation_identity()
+    persisted = None if force else _read_probe_cache("models", identity)
     payload = None
     try:
         with _core.MODELS_CACHE_FILE.open("rb") as cache_file:
             raw = cache_file.read(_core.CODEX_CONFIG_MAX_BYTES + 1)
         if len(raw) <= _core.CODEX_CONFIG_MAX_BYTES:
             candidate = _core.json.loads(raw.decode("utf-8-sig"))
-            if (isinstance(candidate, dict) and isinstance(candidate.get("models"), list)
+            if (payload is None and not force and isinstance(candidate, dict) and isinstance(candidate.get("models"), list)
                     and candidate["models"]
                     and not _core._timestamp_is_stale(candidate.get("fetched_at"), _core.MODEL_CACHE_TTL_SECONDS)
                     and candidate.get("client_version") == _core._codex_client_version()):
                 payload = {"models": candidate["models"]}
     except (OSError, ValueError):
         pass
+    if payload is None and isinstance(persisted, dict) and isinstance(persisted.get("models"), list):
+        payload = persisted
     if payload is None:
-        completed = _core.run_codex_capture(["debug", "models", "--bundled"], timeout=30)
-        if completed.returncode != 0:
-            raise _core.ManagerError(_core._redact_sensitive_text(completed.stderr, limit=320) or "无法读取 Codex 原生模型目录，请更新 Codex 运行时。")
+        failure_key = (str(_core.STATE_DIR), str(identity))
+        if (not force and _MODEL_PROBE_FAILURE.get("key") == failure_key
+                and _core.time.monotonic() - _MODEL_PROBE_FAILURE.get("at", 0) < _FAILED_PROBE_RETRY_SECONDS):
+            raise _core.ManagerError(_MODEL_PROBE_FAILURE["error"])
         try:
+            completed = _core.run_codex_capture(["debug", "models", "--bundled"], timeout=30)
+            if completed.returncode != 0:
+                raise _core.ManagerError(_core._redact_sensitive_text(completed.stderr, limit=320) or "无法读取 Codex 原生模型目录，请更新 Codex 运行时。")
             payload = _core.json.loads(completed.stdout)
-        except _core.json.JSONDecodeError as exc:
-            raise _core.ManagerError("Codex 返回了无效模型目录。") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+                raise _core.ManagerError("Codex 返回的模型目录格式无效。")
+        except Exception as exc:
+            detail = _core._redact_sensitive_text(exc, limit=320)
+            _MODEL_PROBE_FAILURE.update({"key": failure_key, "at": _core.time.monotonic(), "error": detail})
+            raise _core.ManagerError(detail) from exc
+        _MODEL_PROBE_FAILURE.clear()
+        _write_probe_cache("models", identity, payload)
     if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
         raise _core.ManagerError("Codex 返回的模型目录格式无效。")
     with _core.MODEL_CACHE_LOCK:

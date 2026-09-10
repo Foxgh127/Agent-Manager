@@ -54,6 +54,7 @@ FILE_NAME = 'quota-estimation-v99.json'
 SCHEMA = 1
 MAX_ACCOUNTS = 256
 MAX_SAMPLES = 48
+MAX_HISTORY = 8
 MAX_FILE_BYTES = 2_000_000
 MAX_AGE_SECONDS = 900
 MAX_ALIGNMENT_SECONDS = 120
@@ -102,6 +103,34 @@ def _scope(account: dict, usage: dict, weekly: dict, plan: str, reset_at: float,
     return _hash([canonical_plan.casefold(), account.get('subscriptionStartedAt'),
                   usage.get('subscriptionExpiresAt') or account.get('subscriptionExpiresAt'),
                   weekly.get('limitId') or 'codex', reset_at, duration])
+
+
+def _history_fields(result: dict, state: dict) -> dict:
+    """Expose retained evidence even when current quota/coverage is unavailable."""
+    samples = state.get('samples') or []
+    history = state.get('history') or []
+    archived = [sample for segment in history for sample in segment.get('samples', [])]
+    result.update(sampleCount=len(samples), historicalSampleCount=len(archived),
+                  retainedSampleCount=len(samples) + len(archived),
+                  retainedObservedTokens=sum(s.get('tokens', 0) for s in samples + archived),
+                  calibrationObservedAt=state.get('lastAt'),
+                  calibrationStartedAt=state.get('startAt'),
+                  windowResetAt=state.get('resetAt'),
+                  historyScopeCount=len(history),
+                  workloadScopeKnown=bool(state.get('workloadScope')))
+    if samples:
+        result['lastValidSampleAt'] = samples[-1].get('endAt')
+    elif archived:
+        result['lastValidSampleAt'] = max(s.get('endAt', 0) for s in archived)
+    return result
+
+
+def _archive(state: dict) -> list:
+    history = list(state.get('history') or [])
+    if state.get('samples'):
+        history.append({key: state.get(key) for key in
+                        ('scope', 'workloadScope', 'resetAt', 'startAt', 'lastAt', 'samples')})
+    return history[-MAX_HISTORY:]
 
 
 def _path() -> Path:
@@ -160,13 +189,51 @@ def _load(path: Path) -> dict:
         return {}
 
 
-def _save(path: Path, accounts: dict) -> None:
-    accounts = dict(sorted(accounts.items(), key=lambda pair: _number(pair[1].get('lastAt')) or 0,
-                           reverse=True)[:MAX_ACCOUNTS])
-    encoded = json.dumps({'schemaVersion': SCHEMA, 'accounts': accounts}, allow_nan=False,
-                         separators=(',', ':')).encode('utf-8')
-    if len(encoded) > MAX_FILE_BYTES:
-        raise ValueError('quota estimation store too large')
+def _save(path: Path, accounts: dict, *, keep_identity: str | None = None) -> None:
+    def recent(pair):
+        return max(_number(pair[1].get('lastAt')) or 0,
+                   _number((pair[1].get('measurement') or {}).get('at')) or 0)
+    ordered = sorted(accounts.items(), key=recent, reverse=True)
+    # Pending observations can have an old official timestamp; explicitly
+    # protect the account being written instead of assuming it sorts newest.
+    ordered.sort(key=lambda pair: pair[0] != keep_identity)
+    accounts = dict(ordered[:MAX_ACCOUNTS])
+    def encode():
+        return json.dumps({'schemaVersion': SCHEMA, 'accounts': accounts}, allow_nan=False,
+                          separators=(',', ':')).encode('utf-8')
+    encoded = encode()
+    while len(encoded) > MAX_FILE_BYTES:
+        archives = [(segment.get('lastAt') or segment.get('startAt') or 0, key, index)
+                    for key, state in accounts.items()
+                    for index, segment in enumerate(state.get('history') or [])]
+        if archives:
+            _, key, index = min(archives, key=lambda item: _number(item[0]) or 0)
+            state = accounts[key]
+            state['history'].pop(index)
+            state['prunedHistoryCount'] = int(state.get('prunedHistoryCount') or 0) + 1
+        else:
+            evictable = [pair for pair in accounts.items() if pair[0] != keep_identity]
+            if evictable and len(accounts) > 1:
+                accounts.pop(min(evictable, key=recent)[0])
+            else:
+                # A single heavily sampled account must also keep accepting
+                # writes. Trim oldest intervals but retain its latest evidence.
+                state = next(iter(accounts.values()), {})
+                pricing = [state.get('anchorPricing') or {},
+                           (state.get('measurement') or {}).get('apiEquivalent') or {}]
+                verbose = next((item for item in pricing if item.get('breakdown') or item.get('unknownModels')), None)
+                if verbose is not None:
+                    # These are presentation details; counters, price version,
+                    # coverage and USD totals remain intact for paired deltas.
+                    verbose.pop('breakdown', None)
+                    verbose.pop('unknownModels', None)
+                    verbose['detailsTruncated'] = True
+                elif len(state.get('samples') or []) > 1:
+                    state['samples'].pop(0)
+                    state['prunedSampleCount'] = int(state.get('prunedSampleCount') or 0) + 1
+                else:
+                    raise ValueError('quota estimation minimum state exceeds store limit')
+        encoded = encode()
     fd, temporary = tempfile.mkstemp(prefix='.quota-estimation-', suffix='.tmp', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as handle:
@@ -242,8 +309,11 @@ def _measurement(account: dict, local: Any) -> dict | None:
     tokens, at = _number(local.get('cumulativeTokens')), _epoch(local.get('observedAt'))
     if tokens is None or tokens < 0 or at is None:
         return None
-    return {'tokens': int(tokens), 'at': at,
-            'complete': local.get('coverageComplete') is True and not local.get('usageMissingCount')}
+    result = {'tokens': int(tokens), 'at': at,
+              'complete': local.get('coverageComplete') is True and not local.get('usageMissingCount')}
+    if isinstance(local.get('apiEquivalent'), dict):
+        result['apiEquivalent'] = local['apiEquivalent']
+    return result
 
 
 def _with_measurement(result: dict, measurement: dict | None) -> dict:
@@ -252,6 +322,8 @@ def _with_measurement(result: dict, measurement: dict | None) -> dict:
                       localCumulativeKTokens=measurement['tokens'] / 1000,
                       localObservedAt=measurement.get('at'),
                       localCoverageComplete=measurement.get('complete') is True)
+        if isinstance(measurement.get('apiEquivalent'), dict):
+            result['apiEquivalent'] = measurement['apiEquivalent']
     return result
 
 
@@ -273,7 +345,8 @@ def _pending_observation(account: dict, local: Any, reason: str,
                 if 'anchorAt' not in state:
                     state.setdefault('pendingReason', reason)
                 state.setdefault('lastAt', measurement['at'])
-                _save(path, accounts)
+                _save(path, accounts, keep_identity=_identity(account))
+            result = _with_measurement(_history_fields(result, state), state.get('measurement'))
     except (OSError, TimeoutError, ValueError, TypeError):
         pass
     return result
@@ -291,7 +364,7 @@ def _fit(samples: list[dict]) -> tuple[list[dict], int]:
 
 def _summary(state: dict, remaining: float, cumulative: float) -> dict:
     samples = state['samples']
-    result = _base('insufficient_intervals', remaining)
+    result = _history_fields(_base('insufficient_intervals', remaining), state)
     result.update(localObservedTokens=max(0, int(cumulative - state['startTokens'])),
                   localCumulativeTokens=int(cumulative), localCumulativeKTokens=cumulative / 1000,
                   localCoverageComplete=True, observedAt=state['lastAt'],
@@ -323,6 +396,28 @@ def _summary(state: dict, remaining: float, cumulative: float) -> dict:
                   estimatedUsedTokens=quantity(100 - remaining, QUANTIZATION_PP),
                   estimatedRemainingTokens=quantity(remaining, QUANTIZATION_PP),
                   workloadVariationRatio=round(spread, 4))
+    # USD has its own evidence gate: only paired cost deltas whose measured
+    # token delta exactly matches the complete calibration interval are used.
+    from agent_manager.usage.pricing import PRICE_VERSION
+    usd_samples = [dict(item, tokens=item['usd']) for item in samples
+                   if _number(item.get('usd')) and item.get('priceVersion') == PRICE_VERSION]
+    result['usdSampleCount'] = len(usd_samples)
+    if len(usd_samples) >= MIN_SAMPLES:
+        priced, _ = _fit(usd_samples)
+        if len(priced) >= MIN_SAMPLES and sum(item['drop'] for item in priced) >= MIN_DROP_PP:
+            middle = statistics.median(item['tokens'] / item['drop'] for item in priced)
+            variation = statistics.median(abs(item['tokens'] / item['drop'] - middle) for item in priced)
+            low = min(statistics.median(item['tokens'] / (item['drop'] + QUANTIZATION_PP) for item in priced),
+                      max(0, middle - 2.5 * variation))
+            high = max(statistics.median(item['tokens'] / (item['drop'] - QUANTIZATION_PP) for item in priced),
+                       middle + 2.5 * variation)
+            for key, percent, uncertainty in [('estimatedTotalUsd', 100, 0),
+                                             ('estimatedUsedUsd', 100 - remaining, QUANTIZATION_PP),
+                                             ('estimatedRemainingUsd', remaining, QUANTIZATION_PP)]:
+                result[key] = {'estimate': round(middle * percent, 6),
+                               'lower': round(low * max(0, percent - uncertainty), 6),
+                               'upper': round(high * min(100, percent + uncertainty), 6)}
+            result['usdPriceVersion'] = PRICE_VERSION
     return result
 
 
@@ -347,7 +442,10 @@ def read_summary(account: dict, *, now: float | None = None, _states: dict | Non
         measurement = {'tokens': state['lastTokens'], 'at': state.get('lastLocalAt'),
                        'complete': not state.get('pendingReason')}
     def pending(reason, remaining=None):
-        return _with_measurement(_base(reason, remaining), measurement)
+        result = _with_measurement(_history_fields(_base(reason, remaining), state), measurement)
+        if reason in {'quota_window_or_plan_changed', 'workload_changed', 'quota_regained'}:
+            result.update(sampleCount=0, historicalSampleCount=result['retainedSampleCount'])
+        return result
     usage = account.get('usage') if isinstance(account.get('usage'), dict) else {}
     weekly = usage.get('weekly') if isinstance(usage.get('weekly'), dict) else {}
     remaining = _number(weekly.get('remainingPercent'))
@@ -366,6 +464,8 @@ def read_summary(account: dict, *, now: float | None = None, _states: dict | Non
         return pending('awaiting_paired_observations', remaining)
     if state.get('scope') and state.get('scope') != _scope(account, usage, weekly, plan, reset_at, duration):
         return pending('quota_window_or_plan_changed', remaining)
+    if state.get('workloadScope', '') != account.get('calibrationWorkloadScope', ''):
+        return pending('workload_changed', remaining)
     if state.get('pendingReason'):
         return pending(state['pendingReason'], remaining)
     if remote_at < (_number(state.get('lastAt')) or 0):
@@ -437,22 +537,33 @@ def observe(account: dict, usage_snapshot: dict | None, *, now: float | None = N
         with _LOCK, _file_lock(path):
             accounts = _load(path)
             previous = accounts.get(identity)
+            if previous and remote_at < (_number(previous.get('lastAt')) or 0):
+                return _with_measurement(_history_fields(_base('duplicate_or_out_of_order_quota', remaining), previous), previous.get('measurement'))
             if local_reason:
                 # A partial/backfilled interval cannot be bridged by a later total.
                 measurement = _measurement(account, local)
-                accounts[identity] = {'scope': scope, 'pendingReason': local_reason,
-                                      'lastAt': remote_at, 'measurement': measurement}
-                _save(path, accounts)
-                return _with_measurement(_base(local_reason, remaining), measurement)
-            if previous and previous.get('pendingReason'):
-                previous = None
+                state = previous or {}
+                state.update(pendingReason=local_reason, needsAnchor=True)
+                # A scanner bootstrap may temporarily report zero. Retain the
+                # last complete measurement until a new complete series exists.
+                if measurement and (not state.get('measurement') or measurement['complete']):
+                    state['measurement'] = measurement
+                accounts[identity] = state
+                _save(path, accounts, keep_identity=identity)
+                return _with_measurement(_history_fields(_base(local_reason, remaining), state), state.get('measurement'))
             epoch_hash = _hash(str(coverage_epoch))
             reset_reason = None
             if previous:
                 if previous.get('scope') != scope:
                     reset_reason = 'quota_window_or_plan_changed'
+                elif previous.get('workloadScope', '') != account.get('calibrationWorkloadScope', ''):
+                    reset_reason = 'workload_changed'
+                elif remaining > (_number(previous.get('lastRemaining')) or 0):
+                    reset_reason = 'quota_regained'
                 elif previous.get('coverageEpoch') != epoch_hash:
                     reset_reason = 'local_counter_generation_changed'
+                elif previous.get('needsAnchor'):
+                    reset_reason = 'coverage_resumed'
                 elif (remote_at == (_number(previous.get('lastAt')) or 0)
                       and remaining == previous.get('lastRemaining')
                       and tokens == previous.get('lastTokens')):
@@ -462,16 +573,22 @@ def observe(account: dict, usage_snapshot: dict | None, *, now: float | None = N
                 elif remote_at <= (_number(previous.get('lastAt')) or 0):
                     result = _base('duplicate_or_out_of_order_quota', remaining)
                     return result
-                elif remaining > (_number(previous.get('lastRemaining')) or 0):
-                    reset_reason = 'quota_regained'
                 elif tokens < (_number(previous.get('lastTokens')) or 0):
                     reset_reason = 'local_counter_decreased'
                 elif local_at <= (_number(previous.get('lastLocalAt')) or 0):
                     return _base('duplicate_or_out_of_order_local', remaining)
             if not previous or reset_reason:
+                reusable = bool(previous and previous.get('scope') == scope and
+                                previous.get('workloadScope', '') == account.get('calibrationWorkloadScope', '') and
+                                reset_reason in {'local_counter_generation_changed', 'local_counter_decreased', 'coverage_resumed'})
                 state = {'scope': scope, 'coverageEpoch': epoch_hash, 'resetAt': reset_at,
-                         'startAt': remote_at, 'startTokens': tokens, 'samples': [],
-                         'anchorAt': remote_at, 'anchorRemaining': remaining, 'anchorTokens': tokens}
+                         'workloadScope': account.get('calibrationWorkloadScope', ''),
+                         'startAt': previous['startAt'] if reusable and 'startAt' in previous else remote_at,
+                         'startTokens': tokens,
+                         'samples': list(previous.get('samples') or []) if reusable else [],
+                         'history': list(previous.get('history') or []) if reusable else _archive(previous or {}),
+                         'anchorAt': remote_at, 'anchorRemaining': remaining, 'anchorTokens': tokens,
+                         'anchorPricing': local.get('apiEquivalent')}
             else:
                 state = previous
                 raw_samples = state.get('samples')
@@ -479,27 +596,47 @@ def observe(account: dict, usage_snapshot: dict | None, *, now: float | None = N
                     not isinstance(item, dict) or not _number(item.get('tokens')) or
                     (_number(item.get('drop')) or 0) <= QUANTIZATION_PP for item in raw_samples):
                     accounts.pop(identity, None)
-                    _save(path, accounts)
+                    _save(path, accounts, keep_identity=identity)
                     return _base('invalid_calibration_state', remaining)
                 drop = state['anchorRemaining'] - remaining
                 delta = tokens - state['anchorTokens']
                 if drop > QUANTIZATION_PP:
                     if delta > 0:
+                        sample = {'tokens': delta, 'drop': drop, 'startAt': state['anchorAt'], 'endAt': remote_at}
+                        old_price, new_price = state.get('anchorPricing') or {}, local.get('apiEquivalent') or {}
+                        if (old_price.get('status') in {'available', 'partial'}
+                                and new_price.get('status') in {'available', 'partial'}
+                                and old_price.get('sourceHistoryComplete') and new_price.get('sourceHistoryComplete')
+                                and old_price.get('priceVersion')
+                                and old_price.get('priceVersion') == new_price.get('priceVersion')
+                                and _number(old_price.get('knownUsd')) is not None
+                                and _number(new_price.get('knownUsd')) is not None
+                                and all(price.get('status') != 'partial' or all(key in price for key in ('unpricedTokens', 'invalidRowCount'))
+                                        for price in (old_price, new_price))
+                                and all(_number(old_price.get(key, 0)) is not None
+                                        and _number(old_price.get(key, 0)) == _number(new_price.get(key, 0))
+                                        for key in ('unpricedTokens', 'invalidRowCount'))
+                                and (_number(new_price.get('pricedTokens')) or 0) - (_number(old_price.get('pricedTokens')) or 0) == delta):
+                            usd_delta = (_number(new_price.get('knownUsd')) or 0) - (_number(old_price.get('knownUsd')) or 0)
+                            if usd_delta > 0:
+                                sample.update(usd=usd_delta, priceVersion=new_price['priceVersion'])
                         state['samples'] = (state['samples'] + [
-                            {'tokens': delta, 'drop': drop, 'startAt': state['anchorAt'], 'endAt': remote_at}
+                            sample
                         ])[-MAX_SAMPLES:]
                     else:
                         # Remote decline with no local tokens establishes unobserved
                         # consumption/accounting lag: invalidate instead of fitting 0.
+                        state['history'] = _archive(state)
                         state['samples'] = []
                         state['startTokens'] = tokens
                         state['startAt'] = remote_at
                         reset_reason = 'quota_drop_without_local_usage'
-                    state.update(anchorAt=remote_at, anchorRemaining=remaining, anchorTokens=tokens)
+                    state.update(anchorAt=remote_at, anchorRemaining=remaining, anchorTokens=tokens,
+                                 anchorPricing=local.get('apiEquivalent'))
             state.update(lastAt=remote_at, lastLocalAt=local_at, lastRemaining=remaining,
                          lastTokens=tokens, measurement=_measurement(account, local))
             accounts[identity] = state
-            _save(path, accounts)
+            _save(path, accounts, keep_identity=identity)
             result = _summary(state, remaining, tokens)
             if reset_reason:
                 result['reason'] = reset_reason

@@ -391,8 +391,8 @@ function refreshStartupResourcesOnce() {
   if (startupResourceRefreshPromise) return startupResourceRefreshPromise;
   startupResourceRefreshPromise = Promise.allSettled([
     api("/api/radar"),
-    api("/api/updates/check", { method: "POST", body: "{}" }),
-    api("/api/emergency/checks?force=1"),
+    api("/api/updates"),
+    api("/api/emergency/checks"),
   ]).then(async ([radar, updates, checks]) => {
     if (radar.status === "fulfilled") {
       radarResourceCache = { loaded: true, payload: radar.value, error: "" };
@@ -412,11 +412,11 @@ function refreshStartupResourcesOnce() {
       checks: checks.status === "fulfilled" ? checks.value : null,
       error: maintenanceErrors.join("；"),
     };
-    // A forced diagnostics pass already refreshes the installed-skill
-    // inventory. Reuse that cache so startup never scans the same skills twice.
+    // Startup reads persistent inventories. Full discovery and remote catalog
+    // refresh remain explicit actions on the corresponding management page.
     const [installed, catalog] = await Promise.allSettled([
-      api(checks.status === "fulfilled" ? "/api/skills" : "/api/skills?force=1"),
-      api("/api/skills/catalog?force=1"),
+      api("/api/skills"),
+      api("/api/skills/catalog"),
     ]);
     const skillErrors = [installed, catalog]
       .filter((item) => item.status === "rejected")
@@ -7652,7 +7652,7 @@ function OrchestrationView({
               <label className="field prompt-field">
                 <span>
                   调用策略提示词{" "}
-                  <small>系统会自动附加“必须实际调用”和三级回退协议</small>
+                  <small>此处显示策略正文；同步时会附加调用规则、生命周期和实际路由</small>
                 </span>
                 <textarea
                   aria-label="调用策略提示词"
@@ -7669,6 +7669,7 @@ function OrchestrationView({
                 {routing.strategyId === "parallel_first"
                   ? "自定义提示词负责判断何时、调用哪个等级；Agent 注册与失败回退由软件生成。"
                   : "当前模式使用经过优化的固定策略，避免无意义委派和重复消耗 Token；选择“自定义模式”后才可编辑。"}
+                Codex“说明”展示同步后的完整内容，因此篇幅不同，策略正文应保持一致。
               </p>
             </div>
           )}
@@ -10356,6 +10357,7 @@ function hasAvailableUpdate(component) {
 }
 
 function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
+  const loadGenerationRef = useRef(0);
   const [appRefreshKey, setAppRefreshKey] = useState(0);
   const [updates, setUpdates] = useState(null);
   const [checks, setChecks] = useState(null);
@@ -10364,6 +10366,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
   const [working, setWorking] = useState("");
   const [error, setError] = useState("");
   const load = useCallback(async (force = false) => {
+    const generation = ++loadGenerationRef.current;
     if (!force && maintenanceResourceCache) {
       setUpdates(maintenanceResourceCache.updates);
       setChecks(maintenanceResourceCache.checks);
@@ -10388,6 +10391,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
       api(force ? "/api/emergency/checks?force=1" : "/api/emergency/checks"),
       validationRequest,
     ]);
+    if (generation !== loadGenerationRef.current) return;
     const nextUpdates = updateResult.status === "fulfilled" ? updateResult.value : null;
     const nextChecks = checkResult.status === "fulfilled" ? checkResult.value : null;
     const nextValidation = validationResult.status === "fulfilled"
@@ -10411,16 +10415,14 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
     setLoading(false);
   }, []);
   useEffect(() => {
-    let active = true;
-    if (maintenanceResourceCache) load(false);
-    else
-      refreshStartupResourcesOnce().then(() => {
-        if (active) load(false);
-      });
+    // Re-read local diagnostics on entry and after activation: the in-memory
+    // startup promise may contain a pre-activation configuration warning.
+    maintenanceResourceCache = null;
+    load(false);
     return () => {
-      active = false;
+      ++loadGenerationRef.current;
     };
-  }, [load]);
+  }, [load, data.configurationSession?.status]);
   const desktop = updateComponent(updates, "desktop");
   const cli = updateComponent(updates, "cli");
   const desktopHasUpdate = hasAvailableUpdate(desktop);
@@ -10431,7 +10433,9 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
     cli.installed === false ||
     ["missing", "not_found", "not-found", "absent"].includes(cliStatus) ||
     /未安装|未检测到|not found|missing/i.test(String(cli.message || ""));
-  const diagnosticItems = firstArray(checks, ["checks", "items", "results"]);
+  const configurationPending = ["waiting", "starting"].includes(data.configurationSession?.status);
+  const diagnosticItems = firstArray(checks, ["checks", "items", "results"])
+    .filter(item => !configurationPending || item.id !== "generated_configuration");
   const validationErrors = Array.isArray(validation?.errors) ? validation.errors : [];
   const validationWarnings = Array.isArray(validation?.warnings) ? validation.warnings : [];
   const validationRepairIds = validationErrors.some((message) =>
@@ -10466,8 +10470,8 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
   // same configuration mismatch a second time.
   const configurationHealthy = generatedConfigurationCheck
     ? checkIsHealthy(generatedConfigurationCheck)
-    : data.status?.fullyApplied !== false;
-  const healthy = Boolean(checkItems.length) && !issues.length && configurationHealthy;
+    : configurationPending || data.status?.fullyApplied !== false;
+  const healthy = !configurationPending && Boolean(checkItems.length) && !issues.length && configurationHealthy;
   const checked = Boolean(checkItems.length) || !configurationHealthy;
   const modelCount = data.settings.modelWorkspace.mode === "aggregate"
     ? data.selectedModelKeys.length
@@ -10561,6 +10565,8 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
         <button className="button secondary compact" onClick={() => { setAppRefreshKey(value => value + 1); load(true); }} disabled={loading || working}><RefreshCw className={loading ? "spin" : ""} size={14} />刷新状态</button>
       </header>
       {error && <div className="inline-notice warning"><AlertTriangle size={16} /><span>{error}</span></div>}
+      {configurationPending && <div className="inline-notice"><Loader2 className="spin" size={16} /><span>正在激活临时配置，完成后自动核对同步状态。</span></div>}
+      {checks?.stale && <div className="inline-notice"><Clock3 size={16} /><span>完整诊断缓存已过期；生成配置已重新核对，可点击“刷新状态”更新其他检查。</span></div>}
       <div className="update-grid">
         <AppUpdatePanel api={api} notify={notify} refreshKey={appRefreshKey} />
         <article className="update-component">
@@ -10590,7 +10596,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
         </article>
       </div>
       <div className={cx("repair-section", healthy && "healthy")}>
-        <div className="repair-heading"><span>{healthy ? <ShieldCheck size={18} /> : <ShieldAlert size={18} />}</span><div><strong>{!checked ? "尚未检查配置" : healthy ? "Codex 配置健康" : "Codex 配置需要处理"}</strong><small>{!checked ? "刷新状态后查看具体检查结果" : healthy ? `配置已同步 · ${modelCount} 个当前可用模型 · ${data.codexVersion || "版本已检测"}` : issues.length ? `发现 ${issues.length} 个配置或运行问题 · ${canRepair ? "可以自动修复" : "请按下方提示处理"}` : "配置尚未同步，请重新检查后应用"}</small></div>{!healthy && canRepair ? <button className="button primary" disabled={working === "repair"} onClick={repair}>{working === "repair" ? <Loader2 className="spin" size={15} /> : <Wrench size={15} />}修复问题</button> : !healthy ? <span className={cx("status-pill", checked && "warning")}>{checked ? "需按提示处理" : "待检查"}</span> : null}</div>
+        <div className="repair-heading"><span>{healthy ? <ShieldCheck size={18} /> : <ShieldAlert size={18} />}</span><div><strong>{configurationPending ? "正在激活临时配置" : !checked ? "尚未检查配置" : healthy ? "Codex 配置健康" : "Codex 配置需要处理"}</strong><small>{configurationPending ? "激活完成后自动核对；其他诊断结果仍列于下方" : !checked ? "刷新状态后查看具体检查结果" : healthy ? `配置已同步 · ${modelCount} 个当前可用模型 · ${data.codexVersion || "版本已检测"}` : issues.length ? `发现 ${issues.length} 个配置或运行问题 · ${canRepair ? "可以自动修复" : "请按下方提示处理"}` : "配置尚未同步，请重新检查后应用"}</small></div>{!healthy && canRepair ? <button className="button primary" disabled={working === "repair"} onClick={repair}>{working === "repair" ? <Loader2 className="spin" size={15} /> : <Wrench size={15} />}修复问题</button> : !healthy ? <span className={cx("status-pill", checked && "warning")}>{checked ? "需按提示处理" : "待检查"}</span> : null}</div>
         {!healthy && <div className="repair-checks">
           {checkItems.map((item, index) => {
             const ok = item.ok ?? item.healthy ?? item.status === "ok";
@@ -11274,6 +11280,11 @@ export default function App() {
       try {
         const result = await api("/api/app-lifecycle");
         if (stopped) return;
+        if (result.configurationSession?.active) {
+          maintenanceResourceCache = null;
+          await reload();
+          return;
+        }
         updateData((current) => {
           if (!current) return current;
           return {
@@ -11301,6 +11312,7 @@ export default function App() {
     data?.configurationSession?.active,
     data?.configurationSession?.status,
     updateData,
+    reload,
   ]);
   // Radar, skill catalog and repair scans are intentionally lazy. Starting
   // them beside /api/state made opening Codex and the first navigation compete

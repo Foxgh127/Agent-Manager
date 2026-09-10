@@ -42,6 +42,7 @@ DIAGNOSTICS_CACHE_FILE = core.STATE_DIR / "diagnostics-cache.json"
 SKILL_TRASH_DIR = core.STATE_DIR / "skills-trash"
 UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 UPDATE_CACHE_STALE_SECONDS = 7 * 24 * 60 * 60
+DIAGNOSTICS_CACHE_STALE_SECONDS = 24 * 60 * 60
 MAX_SKILL_FILE_BYTES = 1_000_000
 # Asset-heavy skills can legitimately contain several thousand templates,
 # icons or reference fragments.  Keep the independent entry/byte ceilings as
@@ -1668,12 +1669,15 @@ def _normalize_cached_diagnostics(cached: dict) -> dict:
     )
     checks = []
     overlay_seen = False
+    config_status = None
     for raw in cached.get("checks", []):
         if not isinstance(raw, dict):
             continue
         if raw.get("id") == "runtime_overlay":
             item = dict(live_overlay_check)
             overlay_seen = True
+        elif raw.get("id") == "generated_configuration":
+            item, config_status = _live_configuration_check()
         else:
             item = dict(raw)
         status = str(item.get("status") or "warning")
@@ -1692,6 +1696,8 @@ def _normalize_cached_diagnostics(cached: dict) -> dict:
         status = str(item.get("status") or "warning")
         counts[status] = counts.get(status, 0) + 1
     repairable_count = sum(1 for item in checks if item.get("autoFixable"))
+    checked_at = _parse_time(cached.get("checkedAt"))
+    stale = checked_at is None or (_now() - checked_at).total_seconds() > DIAGNOSTICS_CACHE_STALE_SECONDS
     normalized = {
         **cached,
         "schemaVersion": 2,
@@ -1701,13 +1707,32 @@ def _normalize_cached_diagnostics(cached: dict) -> dict:
         "repairableCount": repairable_count,
         "enableRepair": repairable_count > 0,
         "cached": True,
-        "needsManualCheck": False,
+        "needsManualCheck": stale,
+        "stale": stale,
     }
     normalized["configurationStatus"] = merge_configuration_diagnostics(
-        cached.get("configurationStatus") if isinstance(cached.get("configurationStatus"), dict) else None,
+        config_status,
         normalized,
     )
     return normalized
+
+
+def _live_configuration_check() -> tuple[dict, dict | None]:
+    try:
+        status = core.configuration_status()
+        healthy = bool(status.get("fullyApplied"))
+        return _check(
+            "generated_configuration", "生成配置一致性", "ok" if healthy else "warning",
+            "模型与子代理配置已同步。" if healthy else "生成配置需要重新同步。",
+            autoFixable=not healthy, action="reapply_configuration", data=status,
+            checkedAt=_iso(),
+        ), status
+    except Exception as exc:
+        return _check(
+            "generated_configuration", "生成配置一致性", "error",
+            f"无法验证生成配置：{core._redact_sensitive_text(exc, limit=260)}",
+            autoFixable=False, action="manual_configuration_repair", checkedAt=_iso(),
+        ), None
 
 
 def merge_configuration_diagnostics(configuration_status: dict | None, diagnostics: dict | None) -> dict:
@@ -1721,6 +1746,7 @@ def merge_configuration_diagnostics(configuration_status: dict | None, diagnosti
         "repairableCount": int(diagnostics.get("repairableCount") or 0),
         "enableRepair": bool(diagnostics.get("enableRepair")),
         "diagnosticsCached": bool(diagnostics.get("cached")),
+        "diagnosticsStale": bool(diagnostics.get("stale")),
         "diagnosticsNeedsManualCheck": bool(diagnostics.get("needsManualCheck")),
     }
 

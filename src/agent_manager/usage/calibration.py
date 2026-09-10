@@ -6,6 +6,22 @@ import threading
 import time
 import agent_manager.core as core
 import agent_manager.usage.estimation
+from agent_manager.usage.pricing import snapshot_equivalent
+
+
+def with_workload_scope(accounts, settings):
+    """Hash only workload configuration, never credentials or mutable quotas."""
+    config = core.read_toml(core.CONFIG_FILE)
+    workload = {
+        'config': {key: config.get(key) for key in ('model', 'model_reasoning_effort', 'service_tier')},
+        'profiles': [{key: item.get(key) for key in ('id', 'model', 'effort')}
+                     for item in settings.get('mainProfiles', []) if isinstance(item, dict)],
+        'activeProfile': settings.get('activeMainProfileId'),
+        'routes': (settings.get('subagentRouting') or {}).get('routes'),
+        'defaultModel': (settings.get('modelWorkspace') or {}).get('defaultModelKey'),
+    }
+    scope = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
+    return [{**account, 'calibrationWorkloadScope': scope} for account in accounts]
 
 
 def combined_observation(account: dict, snapshot: dict) -> dict:
@@ -30,6 +46,7 @@ def combined_observation(account: dict, snapshot: dict) -> dict:
         "coverageComplete":bool(live.get("complete") and live.get("epoch") and valid_gateway),
         "coverageEpoch":epoch, "usageMissingCount":0,
         "scope":"native_direct_main_plus_gateway_reported",
+        "apiEquivalent": snapshot_equivalent(account_id, snapshot),
     }
 
 
@@ -61,9 +78,10 @@ class QuotaCalibrationSampler:
             return
         if getattr(self.runtime,"configuration_session",{}).get("status") in {"waiting","starting"}:
             return
-        accounts = self.eligible(accounts if accounts is not None else core.load_settings().get("accounts",[]))
+        settings = core.load_settings() if accounts is None else core.read_json(core.SETTINGS_FILE, {})
+        accounts = self.eligible(with_workload_scope(accounts if accounts is not None else settings.get("accounts",[]), settings))
         if not accounts: return
-        key = tuple(sorted((str(a["id"]),str(a.get("fingerprint") or ""),str(a["usage"].get("updatedAt"))) for a in accounts))
+        key = tuple(sorted((str(a["id"]),str(a.get("fingerprint") or ""),str(a["usage"].get("updatedAt")),a['calibrationWorkloadScope']) for a in accounts))
         with self.lock:
             if key == self.last_key or time.monotonic() - self.last_at < 20 or (self.thread and self.thread.is_alive()):
                 return
@@ -100,6 +118,7 @@ class QuotaCalibrationSampler:
                 current = by_id.get(str(public.get("id")))
                 if current and all(not public.get(k) or not current.get(k) or str(public[k]).casefold() == str(current[k]).casefold() for k in ("email","accountId")):
                     trusted.append(current)
+            trusted = with_workload_scope(trusted, settings)
             summaries = agent_manager.usage.estimation.read_summaries(trusted)
             for account in selected:
                 account["quotaEstimate"] = summaries.get(str(account["id"]))

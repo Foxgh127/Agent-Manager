@@ -62,6 +62,7 @@ class BackendDiagnosticsCoreTests(unittest.TestCase):
                 patch.object(core, "AGENTS_FILE", agents_file),
                 patch.object(core, "read_toml", return_value={"model": "gpt-a"}),
                 patch.object(core, "build_codex_config", return_value='model = "gpt-a"\n'),
+                patch.object(core, "build_agents_file", return_value=agents_file.read_text(encoding="utf-8")),
                 patch.object(
                     core,
                     "selected_model_records",

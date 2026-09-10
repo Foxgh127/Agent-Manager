@@ -199,6 +199,8 @@ def public_state() -> dict:
         "configPath": str(_core.CONFIG_FILE),
         "status": _core.configuration_status(settings),
         "auth": connections["auth"],
-        "historySummary": _core.history_inventory(),
+        # History has its own on-demand endpoint; no dashboard consumes this
+        # inventory. Walking every session on each state read delays startup.
+        "historySummary": {"deferred": True},
     }
 

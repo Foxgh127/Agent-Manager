@@ -1747,6 +1747,13 @@ def codex_session_usage_snapshot() -> dict:
         ),
         key=lambda item: item[0],
     )
+    # Reopening the manager may record the already-active account again. Such
+    # redundant entries do not change attribution and must not reset counters.
+    legacy_activation_fingerprint = hashlib.sha256(
+        json.dumps(activations, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    activations = [item for index, item in enumerate(activations)
+                   if index == 0 or item[1] != activations[index - 1][1]]
     activation_fingerprint = hashlib.sha256(
         json.dumps(activations, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:24]
@@ -1763,8 +1770,9 @@ def codex_session_usage_snapshot() -> dict:
             pass
         old_files = cached.get("files", {})
         next_files: dict[str, dict] = {}
-        activation_changed = cached.get("activationFingerprint") != activation_fingerprint
-        changed = cache_schema != CODEX_SESSION_USAGE_CACHE_SCHEMA or activation_changed
+        activation_changed = cached.get("activationFingerprint") not in {
+            activation_fingerprint, legacy_activation_fingerprint}
+        changed = cache_schema != CODEX_SESSION_USAGE_CACHE_SCHEMA or cached.get("activationFingerprint") != activation_fingerprint
         raw_live = cached.get("liveCoverage")
         live = raw_live if isinstance(raw_live, dict) else {}
         live_valid = bool(
