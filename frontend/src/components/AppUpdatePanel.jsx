@@ -105,7 +105,7 @@ export default function AppUpdatePanel({ api, notify, refreshKey = 0, refreshing
   const progress = Math.min(100, Math.round((status?.download?.downloadedBytes || 0) / (status?.download?.totalBytes || 1) * 100));
   const installFailed = status?.installation?.state === "failed";
   const startupUnverified = status?.installation?.code === "startup_unverified";
-  const failure = updateFailureMessage(error || status?.error || status?.download?.error || (installFailed ? status.installation.message : ""), { installation: installFailed });
+  const failure = updateFailureMessage(error || status?.error || status?.download?.error || (installFailed ? (status.installation.detail || status.installation.message) : ""), { installation: installFailed });
   const checking = refreshing || busy === "check" || status?.state === "checking";
   const activity = busy === "install" ? "重启中" : downloading ? `下载中 ${progress}%` : busy === "download" ? "准备更新" : checking ? "检查中" : "";
   const message = activity ? (busy === "install" ? "正在完成更新并重启" : downloading ? `正在下载并校验 ${progress}%` : checking ? "正在检查更新" : "正在准备更新") : failure || (startupUnverified ? "更新已安装，启动状态尚未确认" : status?.updateAvailable ? `可更新到 ${status.latestRelease?.version}` : labels[status?.state] || "正在读取版本");

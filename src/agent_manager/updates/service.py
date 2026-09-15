@@ -941,6 +941,25 @@ class AppUpdateService:
                 return
             if result.get("state") not in {"waiting_for_exit", "installed", "complete", "failed"}:
                 return
+            # A failed attempt for an older release must not mask a newer
+            # release discovered after restart. Keep the helper evidence on
+            # disk, but expose it as history and leave the current release
+            # actionable. Failures for the current release remain visible.
+            with self._lock:
+                latest = dict(self._latest) if self._fresh and isinstance(self._latest, dict) else None
+            if result.get("state") == "failed" and latest:
+                try:
+                    if Version.parse(result.get("version")) < Version.parse(latest.get("version")):
+                        with self._lock:
+                            self._installation = {
+                                "state": "idle",
+                                "previousState": "failed",
+                                "previousVersion": result.get("version"),
+                                "previousMessage": str(result.get("detail") or result.get("message") or "")[:1000],
+                            }
+                        return
+                except UpdateError:
+                    pass
             result = self._reconcile_installation_result(path, result)
             with self._lock:
                 self._installation = self._installation_view(result)

@@ -81,3 +81,28 @@ def test_malformed_install_spec_preserves_helper_failure(tmp_path):
         assert service.status()['installation']['message'] == 'original failure'
     finally:
         service.close()
+
+
+def test_failed_install_for_older_release_is_history_after_new_check(tmp_path):
+    install_id = 'c' * 32
+    root = tmp_path / 'app-update-install'
+    directory = root / ('d' * 24)
+    directory.mkdir(parents=True)
+    result_path = directory / 'result.json'
+    result_path.write_text(json.dumps({
+        'installId': install_id,
+        'version': '9.11.2',
+        'state': 'failed',
+        'message': 'old failure',
+        'detail': 'previous release did not exit',
+    }))
+    (root / 'latest.json').write_text(json.dumps({'installId': install_id, 'path': str(result_path)}))
+    service = make_service(tmp_path)
+    service._latest = {'version': '9.12.0'}
+    service._fresh = True
+    try:
+        installation = service.status()['installation']
+        assert installation['state'] == 'idle'
+        assert installation['previousVersion'] == '9.11.2'
+    finally:
+        service.close()

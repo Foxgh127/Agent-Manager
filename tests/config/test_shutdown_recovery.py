@@ -302,6 +302,35 @@ class ShutdownRecoveryTests(unittest.TestCase):
         self.assertFalse((self.root / "agents/cam_simple_1.toml").exists())
         self.assertFalse(core.RUNTIME_OVERLAY_FILE.exists())
 
+    def test_orphan_managed_agent_matching_applied_content_is_adopted(self):
+        current = b'name = "cam_simple_1"\nmodel = "gpt-6-astra"\n'
+        target = self.root / "agents" / "cam_simple_1.toml"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(current)
+        payload = {
+            "schemaVersion": 1,
+            "sessionId": "orphan-agent",
+            "codexHome": str(self.root),
+            "ownerPid": 0,
+            "files": {
+                "agents/cam_simple_1.toml": {
+                    "kind": "managed_agent",
+                    "baseline": None,
+                    "baselineHash": core._overlay_value_hash(None),
+                    "capturedHash": core._overlay_value_hash(None),
+                    "appliedHash": core._overlay_value_hash(current),
+                }
+            },
+            "environment": {},
+        }
+        core.RUNTIME_OVERLAY_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        with patch.object(core, "_require_codex_process_scan_known", return_value=[]):
+            result = core.restore_runtime_configuration_overlay()
+        self.assertTrue(result["restored"], result)
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_bytes(), current)
+        self.assertFalse(core.RUNTIME_OVERLAY_FILE.exists())
+
     def test_shutdown_false_completion_keeps_server_and_mutex(self):
         server = server_stub(SimpleNamespace(close=Mock(return_value={
             "completed": False, "restorationComplete": False, "errors": ["conflict"], "blocked": "restoration",

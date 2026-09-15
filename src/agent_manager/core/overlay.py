@@ -455,6 +455,24 @@ def restore_runtime_configuration_overlay(force: bool = False) -> dict:
                 kind = str(record.get("kind") or "")
                 replacement = baseline
                 safe = force or current_hash in expected
+                # A managed agent file can be generated on a first run before
+                # a user baseline exists. If the file still exactly matches
+                # the manager-applied fingerprint, there is no user edit to
+                # overwrite and no baseline to restore. Adopt the file as the
+                # durable configuration and remove only the stale journal
+                # record so shutdown can finish cleanly.
+                orphan_managed_agent = (
+                    kind == "managed_agent"
+                    and baseline is None
+                    and "ownerPid" in payload
+                    and int(payload.get("ownerPid") or 0) == 0
+                    and current is not None
+                    and current_hash == str(record.get("appliedHash") or "")
+                )
+                if orphan_managed_agent:
+                    restored_files += 1
+                    payload["files"].pop(relative, None)
+                    continue
                 if not safe and current is not None and kind == "config":
                     replacement = _core._merge_runtime_config_restore(current, baseline)
                     safe = True
