@@ -467,11 +467,30 @@ def _frontmatter(skill_md: Path) -> tuple[dict[str, str], list[str]]:
     if end < 0:
         return {}, ["SKILL.md frontmatter 没有结束标记。"]
     result: dict[str, str] = {}
-    for raw_line in text[3:end].splitlines():
+    frontmatter_lines = text[3:end].splitlines()
+    index = 0
+    while index < len(frontmatter_lines):
+        raw_line = frontmatter_lines[index]
         match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$", raw_line.strip())
         if not match:
+            index += 1
             continue
-        value = match.group(2).strip().strip('"\'')
+        key, raw_value = match.group(1), match.group(2).strip()
+        if raw_value in {">", "|-", ">-", "|+", ">+"}:
+            block: list[str] = []
+            cursor = index + 1
+            while cursor < len(frontmatter_lines):
+                candidate = frontmatter_lines[cursor]
+                if candidate and not candidate[0].isspace():
+                    break
+                block.append(candidate.strip())
+                cursor += 1
+            separator = "\n" if raw_value.startswith("|") else " "
+            value = separator.join(item for item in block if item)
+            index = cursor
+        else:
+            value = raw_value.strip('"\'')
+            index += 1
         result[match.group(1)] = value
     if not result.get("name"):
         errors.append("frontmatter 缺少 name。")
@@ -515,6 +534,38 @@ def _scope_for_path(skill_md: Path, cwd: Path) -> tuple[str, bool, str]:
     return "unknown", False, "external"
 
 
+def _skill_group_metadata(name: str, description: str) -> dict[str, str | bool]:
+    """Return stable family metadata used by the manager UI.
+
+    A skill directory is still the unit of enable/disable/delete operations.
+    ``groupKey`` only describes presentation and routing: it lets a suite such
+    as PaperSpine show one expandable entry while keeping every module's own
+    path, fingerprint, and action target intact.
+    """
+    normalized = str(name or "").strip().casefold()
+    internal_paperspine = "internal /paperspine step" in str(description or "").casefold()
+    if normalized == "paper-spine" or normalized.startswith("paper-spine-") or internal_paperspine:
+        suffix = normalized.removeprefix("paper-spine-")
+        return {
+            "groupKey": "paper-spine",
+            "groupName": "PaperSpine",
+            "skillRoot": "paper-spine",
+            "skillRootName": "PaperSpine",
+            "rootPath": "paper-spine",
+            "isModule": normalized != "paper-spine",
+            "moduleName": suffix.replace("-", " ").title() if suffix else "Orchestrator",
+        }
+    return {
+        "groupKey": normalized or "unknown",
+        "groupName": str(name or "未命名技能"),
+        "skillRoot": normalized or "unknown",
+        "skillRootName": str(name or "未命名技能"),
+        "rootPath": normalized or "unknown",
+        "isModule": False,
+        "moduleName": "",
+    }
+
+
 def _skill_record(
     skill_md: Path,
     cwd: Path,
@@ -544,10 +595,25 @@ def _skill_record(
         mutable = False
         fingerprint = ""
         has_scripts = False
+    group = _skill_group_metadata(
+        str(source.get("name") or metadata.get("name") or skill_md.parent.name),
+        str(source.get("description") or metadata.get("description") or ""),
+    )
+    source_root = next(
+        (source.get(key) for key in ("skillRoot", "rootPath", "rootDirectory", "packageRoot") if source.get(key)),
+        None,
+    )
+    if source_root:
+        group["skillRoot"] = str(source_root)
+        group["rootPath"] = str(source_root)
+        group["skillRootName"] = str(
+            source.get("skillRootName") or source.get("rootName") or source.get("packageName") or group["groupName"]
+        )
     return {
         "id": _skill_id(skill_md),
         "name": str(source.get("name") or metadata.get("name") or skill_md.parent.name),
         "description": str(source.get("description") or metadata.get("description") or ""),
+        **group,
         "path": str(skill_md),
         "directory": str(skill_md.parent),
         "scope": scope,
@@ -648,6 +714,25 @@ def _empty_skill_inventory(cwd: Path) -> dict:
     }
 
 
+def _annotate_skill_groups(records: list[dict]) -> list[dict]:
+    """Add presentation totals while preserving per-skill action records."""
+    totals: dict[str, int] = {}
+    enabled: dict[str, int] = {}
+    for item in records:
+        key = str(item.get("groupKey") or item.get("name") or "unknown")
+        totals[key] = totals.get(key, 0) + 1
+        if item.get("enabled"):
+            enabled[key] = enabled.get(key, 0) + 1
+    return [
+        {
+            **item,
+            "groupSize": totals.get(str(item.get("groupKey") or item.get("name") or "unknown"), 1),
+            "groupEnabledCount": enabled.get(str(item.get("groupKey") or item.get("name") or "unknown"), 0),
+        }
+        for item in records
+    ]
+
+
 def _cached_skill_inventory(cwd: Path) -> dict:
     payload = _safe_json(SKILLS_CACHE_FILE, {})
     workspaces = payload.get("workspaces", {}) if isinstance(payload, dict) else {}
@@ -656,6 +741,7 @@ def _cached_skill_inventory(cwd: Path) -> dict:
         return _empty_skill_inventory(cwd)
     return {
         **cached,
+        "skills": _annotate_skill_groups(list(cached.get("skills", []))),
         "cwd": str(cwd),
         "cached": True,
         "needsManualRefresh": False,
@@ -693,6 +779,7 @@ def _update_cached_skill(cwd: Path, record: dict | None, skill_id: str) -> None:
             str(item.get("path", "")).casefold(),
         )
     )
+    records = _annotate_skill_groups(records)
     _store_skill_inventory(
         cwd,
         {
@@ -725,6 +812,7 @@ def list_skills(cwd: str | Path | None = None, force: bool = False) -> dict:
     for item in fallback:
         by_path.setdefault(_path_key(item["path"]), item)
     records = sorted(by_path.values(), key=lambda item: (item["scope"], item["name"].casefold(), item["path"].casefold()))
+    records = _annotate_skill_groups(records)
     result = {
         "skills": records,
         "count": len(records),

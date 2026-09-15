@@ -46,6 +46,33 @@ class CodexMaintenanceServiceTests(unittest.TestCase):
         )
         return skill
 
+    def test_internal_paperspine_modules_share_one_ui_skill_root(self):
+        self.create_skill("paper-spine")
+        module = self.root / "skills" / "paper-spine-build"
+        module.mkdir(parents=True)
+        (module / "SKILL.md").write_text(
+            "---\nname: paper-spine-build\ndescription: Builds papers. (internal /paperspine step)\n---\n",
+            encoding="utf-8",
+        )
+        with patch.object(core, "codex_app_server_request", side_effect=core.ManagerError("offline")):
+            records = maintenance.list_skills(cwd=self.root, force=True)["skills"]
+        by_name = {record["name"]: record for record in records}
+        self.assertEqual(by_name["paper-spine"]["skillRoot"], "paper-spine")
+        self.assertEqual(by_name["paper-spine-build"]["skillRoot"], "paper-spine")
+        self.assertEqual(by_name["paper-spine-build"]["skillRootName"], "PaperSpine")
+        self.assertEqual(by_name["paper-spine"]["groupSize"], 2)
+
+    def test_frontmatter_reads_folded_descriptions_for_skill_discovery(self):
+        skill = self.root / "skills" / "folded"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: folded\ndescription: >-\n  First trigger phrase.\n  Second boundary phrase.\n---\n",
+            encoding="utf-8",
+        )
+        with patch.object(core, "codex_app_server_request", side_effect=core.ManagerError("offline")):
+            record = maintenance.list_skills(cwd=self.root, force=True)["skills"][0]
+        self.assertEqual(record["description"], "First trigger phrase. Second boundary phrase.")
+
     def test_live_manager_overlay_is_not_reported_as_repairable_orphan(self):
         core.atomic_write_json(core.RUNTIME_OVERLAY_FILE, {})
         payload = {

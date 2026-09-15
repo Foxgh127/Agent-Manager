@@ -56,6 +56,7 @@ import {
   CheckSquare,
   ChevronLeft,
   ChevronDown,
+  ChevronUp,
   ChevronRight,
   CircleGauge,
   Clock3,
@@ -9776,6 +9777,50 @@ function skillDescriptionText(item) {
   return match?.[1] || `${skillCategoryLabel(item?.category)}类 Codex 扩展。`;
 }
 
+// A skill can expose several SKILL.md entries (for example, a plugin's
+// module directories). Keep those entries together using the skill root when
+// the API provides it, falling back to the first directory below `skills/`.
+function skillRootKey(item) {
+  const explicit = item?.skillRoot || item?.rootPath || item?.rootDirectory || item?.packageRoot;
+  if (explicit) return String(explicit);
+  const raw = String(item?.directory || item?.path || "").replace(/\\/g, "/");
+  const marker = raw.toLowerCase().lastIndexOf("/skills/");
+  if (marker >= 0) {
+    const suffix = raw.slice(marker + 8).split("/").filter(Boolean);
+    if (suffix.length) return `${raw.slice(0, marker + 8)}${suffix[0]}`;
+  }
+  return raw || String(item?.id || item?.name || "unknown");
+}
+
+function groupSkills(items) {
+  const groups = new Map();
+  items.forEach((item) => {
+    const key = skillRootKey(item);
+    if (!groups.has(key)) groups.set(key, { key, items: [], name: "" });
+    const group = groups.get(key);
+    group.items.push(item);
+    group.name ||= skillDisplayText(item, ["skillRootName", "rootName", "packageName"]);
+  });
+  return [...groups.values()].map((group) => {
+    if (!group.name) {
+      const parts = group.key.replace(/\\/g, "/").split("/").filter(Boolean);
+      group.name = parts[parts.length - 1] || "未命名技能";
+    }
+    return group;
+  });
+}
+
+function skillGroupCountLabel(group) {
+  return group.items.length > 1 ? `${group.items.length} 个模块` : "独立技能";
+}
+
+function skillGroupStateLabel(group, tab) {
+  if (tab !== "installed") return "官方目录";
+  const enabled = group.items.filter((item) => item.enabled !== false).length;
+  const issues = group.items.filter((item) => item.error || item.errors?.length).length;
+  return `${enabled}/${group.items.length} 启用${issues ? ` · ${issues} 个问题` : ""}`;
+}
+
 function ResourceState({ loading, error, onRetry, label = "正在读取…" }) {
   if (loading)
     return (
@@ -9810,6 +9855,8 @@ function SkillsView({ notify, confirm, embedded = false }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [workingId, setWorkingId] = useState("");
+  const [expandedGroups, setExpandedGroups] = useState(() => new Set());
+  const [installedFilter, setInstalledFilter] = useState("all");
   const load = useCallback(async (force = false) => {
     if (!force && skillsResourceCache) {
       setInstalledPayload(skillsResourceCache.installedPayload);
@@ -9854,17 +9901,27 @@ function SkillsView({ notify, confirm, embedded = false }) {
   const catalog = firstLongestArray(catalogPayload, ["items", "plugins", "catalog", "skills"]);
   const activeItems = tab === "installed" ? installed : catalog;
   const normalizedQuery = query.trim().toLowerCase();
-  const filteredItems = activeItems.filter((item) => !normalizedQuery || [
-    skillNameText(item, ""), skillDescriptionText(item), item.name, item.displayName, item.description,
-    item.category, skillCategoryLabel(item.category), item.scopeLabel, item.scope, item.path,
-  ].some((value) => String(value || "").toLowerCase().includes(normalizedQuery)));
-  const skillPageCount = Math.max(1, Math.ceil(filteredItems.length / SKILL_PAGE_SIZE));
+  const filteredItems = activeItems.filter((item) => {
+    const matchesQuery = !normalizedQuery || [
+      skillNameText(item, ""), skillDescriptionText(item), item.name, item.displayName, item.description,
+      item.category, skillCategoryLabel(item.category), item.scopeLabel, item.scope, item.path,
+    ].some((value) => String(value || "").toLowerCase().includes(normalizedQuery));
+    if (!matchesQuery) return false;
+    if (tab !== "installed" || installedFilter === "all") return true;
+    if (installedFilter === "enabled") return item.enabled !== false;
+    if (installedFilter === "disabled") return item.enabled === false;
+    if (installedFilter === "issues") return Boolean(item.error || item.errors?.length);
+    if (installedFilter === "mutable") return item.mutable !== false;
+    return true;
+  });
+  const skillGroups = groupSkills(filteredItems);
+  const skillPageCount = Math.max(1, Math.ceil(skillGroups.length / SKILL_PAGE_SIZE));
   const safeSkillPage = Math.min(page, skillPageCount);
-  const visibleSkills = filteredItems.slice((safeSkillPage - 1) * SKILL_PAGE_SIZE, safeSkillPage * SKILL_PAGE_SIZE);
+  const visibleGroups = skillGroups.slice((safeSkillPage - 1) * SKILL_PAGE_SIZE, safeSkillPage * SKILL_PAGE_SIZE);
   const installedNames = new Set(
     installed.map((item) => String(skillNameText(item, item.id || "")).toLowerCase()),
   );
-  useEffect(() => { setPage(1); }, [tab, query]);
+  useEffect(() => { setPage(1); setExpandedGroups(new Set()); }, [tab, query]);
   useEffect(() => { setPage((current) => Math.min(current, skillPageCount)); }, [skillPageCount]);
   const perform = async (id, action, successMessage, refreshMode = "force") => {
     setWorkingId(id);
@@ -9965,6 +10022,13 @@ function SkillsView({ notify, confirm, embedded = false }) {
       </div>
       <div className="skill-toolbar">
         <label className="search-input"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、说明、范围或路径" /></label>
+        <select className="skill-filter" value={tab === "installed" ? installedFilter : "all"} onChange={(event) => setInstalledFilter(event.target.value)} disabled={tab !== "installed"} aria-label="本地技能状态筛选">
+          <option value="all">全部状态</option>
+          <option value="enabled">已启用</option>
+          <option value="disabled">已停用</option>
+          <option value="issues">有问题</option>
+          <option value="mutable">可管理</option>
+        </select>
         <span>显示 {filteredItems.length} / {activeItems.length}</span>
       </div>
       <ResourceState loading={loading && !installedPayload && !catalogPayload} error={error && !installedPayload && !catalogPayload ? error : ""} onRetry={() => load(true)} label="正在扫描技能与官方目录…" />
@@ -9973,7 +10037,20 @@ function SkillsView({ notify, confirm, embedded = false }) {
       )}
       {tab === "installed" ? (
         <div className="skill-grid">
-          {visibleSkills.map((skill) => {
+          {visibleGroups.map((group) => {
+            const expanded = expandedGroups.has(group.key);
+            const groupItems = expanded ? group.items : group.items.slice(0, 1);
+            return <section key={group.key} className="skill-group">
+              <button className="skill-group-header" type="button" onClick={() => setExpandedGroups((current) => {
+                const next = new Set(current);
+                if (next.has(group.key)) next.delete(group.key); else next.add(group.key);
+                return next;
+              })} aria-expanded={expanded}>
+                <span><strong>{group.name}</strong><small>{skillGroupCountLabel(group)} · {skillGroupStateLabel(group, tab)}</small></span>
+                {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              </button>
+              <div className="skill-group-items">
+          {groupItems.map((skill) => {
             const id = skill.id || skill.path || skill.name;
             const mutable = skill.mutable !== false && !["builtin", "plugin-cache", "system"].includes(skill.scope);
             const skillName = skillNameText(skill, id);
@@ -10006,11 +10083,27 @@ function SkillsView({ notify, confirm, embedded = false }) {
               </article>
             );
           })}
+              </div>
+            </section>;
+          })}
           {!loading && !filteredItems.length && <div className="empty-state"><span><BookOpen size={28} /></span><h3>{query ? "没有匹配的技能" : "尚未发现可管理技能"}</h3><p>{query ? "尝试更短的关键词，或切换到官方目录。" : "安装后的用户技能会显示在这里；内置与插件缓存仅展示，不允许误删。"}</p></div>}
         </div>
       ) : (
         <div className="skill-grid catalog-grid">
-          {visibleSkills.map((item) => {
+          {visibleGroups.map((group) => {
+            const expanded = expandedGroups.has(group.key);
+            const groupItems = expanded ? group.items : group.items.slice(0, 1);
+            return <section key={group.key} className="skill-group">
+              <button className="skill-group-header" type="button" onClick={() => setExpandedGroups((current) => {
+                const next = new Set(current);
+                if (next.has(group.key)) next.delete(group.key); else next.add(group.key);
+                return next;
+              })} aria-expanded={expanded}>
+                <span><strong>{group.name}</strong><small>{skillGroupCountLabel(group)} · {skillGroupStateLabel(group, tab)}</small></span>
+                {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              </button>
+              <div className="skill-group-items">
+          {groupItems.map((item) => {
             const id = item.id || item.name || item.slug;
             const itemName = skillNameText(item, id);
             const itemDescription = skillDescriptionText(item);
@@ -10032,6 +10125,9 @@ function SkillsView({ notify, confirm, embedded = false }) {
                 </footer>
               </article>
             );
+          })}
+              </div>
+            </section>;
           })}
           {!loading && !filteredItems.length && <div className="empty-state"><span><Boxes size={28} /></span><h3>{query ? "没有匹配的官方插件" : "官方目录暂时不可用"}</h3><p>{query ? "清除搜索后查看完整目录。" : "可以稍后刷新；已安装技能不受影响。"}</p></div>}
         </div>

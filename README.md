@@ -4,7 +4,7 @@
 
 **个人练手项目，代码、界面、文档和开发工作由 Codex 完成，仅供个人学习与测试。** 本项目不是 OpenAI、Anthropic 或任何中转站的官方产品，不提供生产服务承诺。
 
-一个面向 Windows 的本地 AI 开发工作台：管理 Codex 账号与 API、组织模型和子代理、维护会话与配置。当前版本 **1.1.2**。
+一个面向 Windows 的本地 AI 开发工作台：管理 Codex 账号与 API、组织模型和子代理、维护会话与配置。当前版本 **1.1.7**。
 
 [下载安装包](https://github.com/Foxgh127/Agent-Manager/releases/latest) · [版本说明](docs/release-notes.md) · [使用与故障处理](docs/usage.md) · [开发与发布](docs/development.md) · [设计与资料](docs/architecture.md)
 
