@@ -2212,28 +2212,33 @@ def _capture_repair_environment(enabled: bool) -> dict[str, str | None]:
 
 def _restore_repair_environment(snapshot: dict[str, str | None]) -> list[str]:
     errors = []
-    for name, value in snapshot.items():
-        try:
-            if value is None:
-                core._remove_user_environment(name)
-            else:
-                core._sync_user_environment(name, value)
-            if core._read_user_environment(name) != value:
-                raise core.ManagerError("环境变量回滚校验失败。")
-        except Exception as exc:
-            errors.append(f"环境变量 {name}：{str(exc)[:300]}")
+    with core._environment_change_batch():
+        for name, value in snapshot.items():
+            try:
+                if value is None:
+                    core._remove_user_environment(name)
+                else:
+                    core._sync_user_environment(name, value)
+                if core._read_user_environment(name) != value:
+                    raise core.ManagerError("环境变量回滚校验失败。")
+            except Exception as exc:
+                errors.append(f"环境变量 {name}：{str(exc)[:300]}")
     return errors
 
 
 def _repair_generated_configuration(files: dict[Path, str] | None = None) -> dict:
-    files = files or _generated_configuration_files()
-    changed_paths = []
-    for path, content in files.items():
-        before = path.read_text(encoding="utf-8") if path.is_file() else ""
-        if before == content:
-            continue
-        core.atomic_write_text(path, content)
-        changed_paths.append(path)
+    # Build and write the expected set under the same configuration lock used
+    # by health checks and Apply. A quota refresh or account switch can no
+    # longer change settings between the comparison and the repair write.
+    with core.SWITCH_OPERATION_LOCK, core.CONFIG_FILE_LOCK:
+        files = files or _generated_configuration_files()
+        changed_paths = []
+        for path, content in files.items():
+            before = path.read_text(encoding="utf-8") if path.is_file() else ""
+            if before == content:
+                continue
+            core.atomic_write_text(path, content)
+            changed_paths.append(path)
     return {"changed": bool(changed_paths), "files": [str(path) for path in changed_paths]}
 
 

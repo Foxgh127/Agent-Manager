@@ -30,6 +30,7 @@ class ManagerRuntime:
         self.account_auto_refresh_stop = _app.threading.Event()
         self.account_auto_refresh_wake = _app.threading.Event()
         self.account_auto_refresh_thread: _app.threading.Thread | None = None
+        self.account_auto_refresh_start_grace_seconds = 15.0
         self.mail_health_stop = _app.threading.Event()
         self.mail_health_wake = _app.threading.Event()
         self.mail_health_thread: _app.threading.Thread | None = None
@@ -426,6 +427,15 @@ class ManagerRuntime:
         refresh_on_start = True
         while not self.account_auto_refresh_stop.is_set():
             if refresh_on_start:
+                # Let the first state response and WebView settle before any
+                # remote quota/model request. This also keeps an offline start
+                # fully usable instead of competing with the initial paint.
+                grace = getattr(self, "account_auto_refresh_start_grace_seconds", None)
+                if grace is not None:
+                    self.account_auto_refresh_wake.wait(max(0.0, float(grace)))
+                    self.account_auto_refresh_wake.clear()
+                    if self.account_auto_refresh_stop.is_set():
+                        return
                 try:
                     self._account_auto_refresh_tick()
                 except Exception as exc:
@@ -914,6 +924,8 @@ class ManagerRuntime:
                         key: visibility[key] for key in ("changed", "status", "partial", "deferredSessions", "catalogMissing", "catalogBlocked", "remainingActions", "message", "reason") if key in visibility
                     }
             record["error"] = _app.core._redact_sensitive_text(error, limit=360) if error is not None else None
+            if error is None and isinstance(result, dict):
+                record["result"] = _app.json.loads(_app.json.dumps(result))
             if isinstance(result, dict) and isinstance(result.get("performance"), dict):
                 performance = result["performance"]
                 record["elapsedMs"] = int(performance.get("totalMs") or 0)
@@ -926,6 +938,41 @@ class ManagerRuntime:
             record["updatedAt"] = _app.core.now_iso()
             record["_updatedMonotonic"] = now
             return self.switch_operation_status(operation_id)
+
+    def start_switch_operation(self, operation_id: str, task, *, on_complete=None) -> None:
+        """Run a switch outside the request thread and publish one durable result.
+
+        Account/provider switches close Codex, rewrite several files and wait
+        for readiness. Keeping that work in a daemon worker makes the HTTP
+        request short and lets the UI reconnect to the operation after a
+        transient local socket or WebView restart.
+        """
+        def worker() -> None:
+            try:
+                result = task()
+            except Exception as exc:
+                try:
+                    self.finish_switch_operation(operation_id, error=exc)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.finish_switch_operation(operation_id, result=result)
+                except Exception:
+                    pass
+            finally:
+                if on_complete is not None:
+                    try:
+                        on_complete()
+                    except Exception:
+                        pass
+
+        thread = _app.threading.Thread(
+            target=worker,
+            name=f"codex-agent-manager-switch-{str(operation_id)[:18]}",
+            daemon=True,
+        )
+        thread.start()
 
     def switch_operation_status(self, operation_id: str) -> dict:
         with self.switch_operation_lock:

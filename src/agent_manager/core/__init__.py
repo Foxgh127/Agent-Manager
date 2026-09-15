@@ -1181,6 +1181,7 @@ from .rendering import (
     preview_apply,
 )
 from .overlay import (
+    _environment_change_batch,
     _broadcast_user_environment_change,
     _read_user_environment,
     _sync_user_environment,

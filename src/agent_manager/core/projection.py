@@ -148,7 +148,7 @@ def public_connections_state() -> dict:
 
     settings = _core.load_settings()
     try:
-        local_models = _core.local_model_catalog()
+        local_models = _core.local_model_catalog(allow_probe=False)
     except Exception:
         local_models = []
     return _core._public_connections_state(settings, local_models)
@@ -176,7 +176,7 @@ def public_state() -> dict:
             }
         )
     try:
-        local_models = _core.local_model_catalog()
+        local_models = _core.local_model_catalog(allow_probe=False)
         model_error = None
     except Exception as exc:
         local_models = []
@@ -194,7 +194,7 @@ def public_state() -> dict:
         "difficultyMeta": _core.DIFFICULTY_META,
         "efforts": list(_core.VALID_EFFORTS),
         "sandboxes": list(_core.VALID_SANDBOXES),
-        "codexVersion": _core.codex_version(),
+        "codexVersion": _core.codex_version(allow_probe=False),
         "codexHome": str(_core.CODEX_HOME),
         "configPath": str(_core.CONFIG_FILE),
         "status": _core.configuration_status(settings),

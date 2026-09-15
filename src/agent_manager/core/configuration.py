@@ -121,16 +121,17 @@ def _apply_configuration_locked(
         _core.atomic_write_text(_core.AGENTS_FILE, agents_after)
         _core._runtime_overlay_record_applied(paths=[_core.AGENTS_FILE])
     synced = []
-    for env_key, secret in dict(secrets_to_sync).items():
-        _core._validate_provider_env_key(
-            env_key,
-            allow_internal=env_key.upper() == _core.AGGREGATE_ENV_KEY,
-        )
-        if _core._read_user_environment(env_key) != secret:
-            environment_changed = True
-            _core._sync_user_environment(env_key, secret)
-        _core._runtime_overlay_record_applied(environment=[env_key])
-        synced.append(env_key)
+    with _core._environment_change_batch():
+        for env_key, secret in dict(secrets_to_sync).items():
+            _core._validate_provider_env_key(
+                env_key,
+                allow_internal=env_key.upper() == _core.AGGREGATE_ENV_KEY,
+            )
+            if _core._read_user_environment(env_key) != secret:
+                environment_changed = True
+                _core._sync_user_environment(env_key, secret)
+            _core._runtime_overlay_record_applied(environment=[env_key])
+            synced.append(env_key)
     cleared_environment = _core._clear_inactive_provider_environment_overrides(settings, synced)
     if cleared_environment:
         environment_changed = True
@@ -245,6 +246,23 @@ def _configuration_status_locked(settings: dict | None = None) -> dict:
             if isinstance(current_max, bool) or not isinstance(current_max, int) or current_max < ceiling:
                 context_active = False
                 break
+    drift = []
+    if not main_active:
+        drift.append("main_model")
+    if not strategy_active:
+        drift.append("agents_policy")
+    if not context_active:
+        drift.append("model_catalog_capacity")
+    fingerprint_source = _core.json.dumps(
+        {
+            "config": config,
+            "agents": agents_text,
+            "expected": expected,
+            "drift": drift,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
     return {
         "mainActive": main_active,
         "strategyActive": strategy_active,
@@ -254,6 +272,8 @@ def _configuration_status_locked(settings: dict | None = None) -> dict:
         "activeSourceId": str(next((item["sourceId"] for item in selected_records), workspace.get("activeSourceId") or "")),
         "modelCount": len(selected_records),
         "modelCountScope": "all_sources" if workspace.get("mode") == "aggregate" else "current_account",
+        "drift": drift,
+        "fingerprint": _core.hashlib.sha256(fingerprint_source).hexdigest(),
     }
 
 

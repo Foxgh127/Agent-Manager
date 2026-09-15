@@ -1182,7 +1182,13 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                     target_name=str(account.get("label") or account.get("email") or account_id),
                     target_kind="account",
                 )
-                try:
+                if not self.server.begin_background_mutation():
+                    raise _app.core.ManagerError("Agent Manager 正在退出，已拒绝新的切换请求。")
+                self.server.runtime.update_switch_operation(
+                    operation_id,
+                    {"message": "切换任务已进入后台，正在处理", "phase": "queued", "progress": 2},
+                )
+                def run_switch():
                     if account.get("sourceType") == "web_session":
                         self.server.runtime.update_switch_operation(
                             operation_id,
@@ -1192,23 +1198,29 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                                 "message": "正在准备单账号本地转换与 Codex 配置",
                             },
                         )
-                        result = _app.activate_web2api_for_codex(self.server.runtime, account_id)
-                    else:
-                        result = _app.core.switch_codex_account_and_launch(
-                            account_id,
-                            progress_callback=lambda update: self.server.runtime.update_switch_operation(
-                                operation_id,
-                                update,
-                            ),
-                            close_processes_callback=_app._close_codex_processes_safely,
-                            ensure_gateway=lambda: _app._ensure_runtime_gateway(self.server.runtime),
-                            force_reapply=payload.get("forceReapply") is True,
-                        )
-                except Exception as exc:
-                    self.server.runtime.finish_switch_operation(operation_id, error=exc)
+                        return _app.activate_web2api_for_codex(self.server.runtime, account_id)
+                    return _app.core.switch_codex_account_and_launch(
+                        account_id,
+                        progress_callback=lambda update: self.server.runtime.update_switch_operation(
+                            operation_id,
+                            update,
+                        ),
+                        close_processes_callback=_app._close_codex_processes_safely,
+                        ensure_gateway=lambda: _app._ensure_runtime_gateway(self.server.runtime),
+                        force_reapply=payload.get("forceReapply") is True,
+                    )
+                try:
+                    self.server.runtime.start_switch_operation(
+                        operation_id,
+                        run_switch,
+                        on_complete=self.server.finish_background_mutation,
+                    )
+                except Exception:
+                    self.server.finish_background_mutation()
                     raise
-                self.server.runtime.finish_switch_operation(operation_id, result=result)
-                self._json({"ok": True, "result": result})
+                self.server.finish_mutating_request()
+                self._mutation_registered = False
+                self._json({"ok": True, "accepted": True, "operation": self.server.runtime.switch_operation_status(operation_id)})
                 return
             account_metadata = _app.re.fullmatch(r"/api/accounts/([^/]+)/metadata", path)
             if account_metadata:
@@ -1230,8 +1242,14 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                     target_name=str(provider.get("name") or provider_id),
                     target_kind="provider",
                 )
-                try:
-                    result = _app.core.switch_api_provider_and_launch(
+                if not self.server.begin_background_mutation():
+                    raise _app.core.ManagerError("Agent Manager 正在退出，已拒绝新的切换请求。")
+                self.server.runtime.update_switch_operation(
+                    operation_id,
+                    {"message": "切换任务已进入后台，正在处理", "phase": "queued", "progress": 2},
+                )
+                def run_switch():
+                    return _app.core.switch_api_provider_and_launch(
                         provider_id,
                         progress_callback=lambda update: self.server.runtime.update_switch_operation(
                             operation_id,
@@ -1241,11 +1259,18 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                         ensure_gateway=lambda: _app._ensure_runtime_gateway(self.server.runtime),
                         force_reapply=payload.get("forceReapply") is True,
                     )
-                except Exception as exc:
-                    self.server.runtime.finish_switch_operation(operation_id, error=exc)
+                try:
+                    self.server.runtime.start_switch_operation(
+                        operation_id,
+                        run_switch,
+                        on_complete=self.server.finish_background_mutation,
+                    )
+                except Exception:
+                    self.server.finish_background_mutation()
                     raise
-                self.server.runtime.finish_switch_operation(operation_id, result=result)
-                self._json({"ok": True, "result": result})
+                self.server.finish_mutating_request()
+                self._mutation_registered = False
+                self._json({"ok": True, "accepted": True, "operation": self.server.runtime.switch_operation_status(operation_id)})
                 return
             if path == "/api/api-accounts/probe":
                 self._json({"ok": True, "probe": _app.core.probe_api_account(self._read_json())})

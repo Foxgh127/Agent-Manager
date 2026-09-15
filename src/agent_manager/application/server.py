@@ -150,6 +150,17 @@ class ManagerServer(_app.ThreadingHTTPServer):
             if self.inflight_mutations == 0:
                 self.mutation_condition.notify_all()
 
+    def begin_background_mutation(self) -> bool:
+        """Hold the shutdown drain lease for work detached from an HTTP request."""
+        with self.mutation_condition:
+            if self.shutdown_started.is_set():
+                return False
+            self.inflight_mutations += 1
+            return True
+
+    def finish_background_mutation(self) -> None:
+        self.finish_mutating_request()
+
     def stop_accepting_mutations(self) -> None:
         with self.mutation_condition:
             self.mutations_open = False

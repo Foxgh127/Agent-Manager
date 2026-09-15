@@ -54,12 +54,12 @@ def _write_probe_cache(kind: str, identity: list | None, value) -> None:
         pass
 
 
-def codex_version() -> str:
+def codex_version(*, allow_probe: bool = True) -> str:
     with _PROBE_LOCK:
-        return _codex_version_locked()
+        return _codex_version_locked(allow_probe=allow_probe)
 
 
-def _codex_version_locked() -> str:
+def _codex_version_locked(*, allow_probe: bool = True) -> str:
     with _core.MODEL_CACHE_LOCK:
         cached = _core.CODEX_VERSION_CACHE.get("value")
         if isinstance(cached, str) and _core.time.monotonic() - float(_core.CODEX_VERSION_CACHE.get("at", 0)) < 3_600:
@@ -70,6 +70,8 @@ def _codex_version_locked() -> str:
         with _core.MODEL_CACHE_LOCK:
             _core.CODEX_VERSION_CACHE.update({"at": _core.time.monotonic(), "value": value})
         return value
+    if not allow_probe:
+        return "Codex unavailable"
     try:
         result = _core.run_codex_capture(["--version"], timeout=10)
         value = result.stdout.strip() if result.returncode == 0 else "Codex unavailable"
@@ -105,14 +107,14 @@ def _codex_supports_mcp_optional_startup_grace() -> bool:
 
 
 
-def _raw_local_model_catalog(force: bool = False) -> dict:
+def _raw_local_model_catalog(force: bool = False, *, allow_probe: bool = True) -> dict:
     # Single-flight across dashboard, activation and health readers. Failed
     # probes are throttled too, so an unavailable CLI cannot cost 30 s per read.
     with _PROBE_LOCK:
-        return _raw_local_model_catalog_locked(force)
+        return _raw_local_model_catalog_locked(force, allow_probe=allow_probe)
 
 
-def _raw_local_model_catalog_locked(force: bool = False) -> dict:
+def _raw_local_model_catalog_locked(force: bool = False, *, allow_probe: bool = True) -> dict:
     # Never use `debug models` without --bundled: it honors our own generated
     # model_catalog_json and can indefinitely recycle old selections as truth.
     try:
@@ -139,13 +141,20 @@ def _raw_local_model_catalog_locked(force: bool = False) -> dict:
             candidate = _core.json.loads(raw.decode("utf-8-sig"))
             if (payload is None and not force and isinstance(candidate, dict) and isinstance(candidate.get("models"), list)
                     and candidate["models"]
-                    and not _core._timestamp_is_stale(candidate.get("fetched_at"), _core.MODEL_CACHE_TTL_SECONDS)
-                    and candidate.get("client_version") == _core._codex_client_version()):
+                    and (not allow_probe or (
+                        not _core._timestamp_is_stale(candidate.get("fetched_at"), _core.MODEL_CACHE_TTL_SECONDS)
+                        and candidate.get("client_version") == _core._codex_client_version()
+                    ))):
                 payload = {"models": candidate["models"]}
     except (OSError, ValueError):
         pass
     if payload is None and isinstance(persisted, dict) and isinstance(persisted.get("models"), list):
         payload = persisted
+    if payload is None and not allow_probe:
+        # /api/state must be usable with no network and without a working
+        # Codex executable. An empty catalog is a valid degraded state; the
+        # explicit Connections refresh can probe the runtime later.
+        payload = {"models": []}
     if payload is None:
         failure_key = (str(_core.STATE_DIR), str(identity))
         if (not force and _MODEL_PROBE_FAILURE.get("key") == failure_key
@@ -166,6 +175,10 @@ def _raw_local_model_catalog_locked(force: bool = False) -> dict:
         _write_probe_cache("models", identity, payload)
     if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
         raise _core.ManagerError("Codex 返回的模型目录格式无效。")
+    if not allow_probe and not payload.get("models"):
+        # Do not poison the probe cache with a degraded offline response; a
+        # later explicit refresh must still be allowed to query Codex.
+        return {"models": []}
     with _core.MODEL_CACHE_LOCK:
         _core.MODEL_CACHE["at"] = _core.time.monotonic()
         _core.MODEL_CACHE["raw"] = _core.json.loads(_core.json.dumps(payload))
@@ -175,9 +188,9 @@ def _raw_local_model_catalog_locked(force: bool = False) -> dict:
 
 
 
-def local_model_catalog(force: bool = False) -> list[dict]:
+def local_model_catalog(force: bool = False, *, allow_probe: bool = True) -> list[dict]:
     # The raw cache checks the native file fingerprint even within its TTL.
-    payload = _core._raw_local_model_catalog(force=force)
+    payload = _core._raw_local_model_catalog(force=force, allow_probe=allow_probe)
     models = []
     for item in payload.get("models", []):
         if not isinstance(item, dict) or not item.get("slug") or not _core._model_is_picker_visible(item):

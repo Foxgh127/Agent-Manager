@@ -830,14 +830,15 @@ def _restore_switch_transaction_snapshot(
                 _core.atomic_write_bytes(path, content)
         except OSError as exc:
             errors.append(f"恢复 {path.name}：{str(exc)[:180]}")
-    for name, value in snapshot.get("environment", {}).items():
-        try:
-            if value is None:
-                _core._remove_user_environment(name)
-            else:
-                _core._sync_user_environment(name, value)
-        except Exception as exc:
-            errors.append(f"恢复环境变量 {name}：{str(exc)[:180]}")
+    with _core._environment_change_batch():
+        for name, value in snapshot.get("environment", {}).items():
+            try:
+                if value is None:
+                    _core._remove_user_environment(name)
+                else:
+                    _core._sync_user_environment(name, value)
+            except Exception as exc:
+                errors.append(f"恢复环境变量 {name}：{str(exc)[:180]}")
     try:
         if overlay_content is None:
             _core.RUNTIME_OVERLAY_FILE.unlink(missing_ok=True)

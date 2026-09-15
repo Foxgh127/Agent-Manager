@@ -1,9 +1,35 @@
 """Overlay services."""
 from __future__ import annotations
+from contextlib import contextmanager
+import threading
 from agent_manager import core as _core
 
 
+_ENV_BROADCAST_STATE = threading.local()
+
+
+@contextmanager
+def _environment_change_batch():
+    previous = bool(getattr(_ENV_BROADCAST_STATE, "batch", False))
+    if previous:
+        yield
+        return
+    _ENV_BROADCAST_STATE.batch = True
+    _ENV_BROADCAST_STATE.changed = False
+    try:
+        yield
+    finally:
+        changed = bool(getattr(_ENV_BROADCAST_STATE, "changed", False))
+        _ENV_BROADCAST_STATE.batch = previous
+        _ENV_BROADCAST_STATE.changed = False
+        if changed:
+            _broadcast_user_environment_change()
+
+
 def _broadcast_user_environment_change() -> None:
+    if getattr(_ENV_BROADCAST_STATE, "batch", False):
+        _ENV_BROADCAST_STATE.changed = True
+        return
     if _core.os.name != "nt":
         return
     try:
@@ -695,28 +721,29 @@ def _clear_inactive_provider_environment_overrides(
     with _core.RUNTIME_OVERLAY_LOCK:
         overlay = _core._runtime_overlay_read()
         overlay_changed = False
-        for name, managed_value in _core._managed_environment_values(settings).items():
-            if name in active:
-                continue
-            record = overlay.get("environment", {}).get(name) if overlay else None
-            current = _core._read_user_environment(name)
-            if record is None and (managed_value is None or current != managed_value):
-                continue
-            replacement = _core._overlay_decrypt_text(record.get("baseline")) if record else None
-            if managed_value is not None and replacement == managed_value:
-                replacement = None
-                record["baseline"] = _core._overlay_encrypt_text(None)
-                record["baselineHash"] = _core._overlay_value_hash(None)
-                overlay_changed = True
-            if current != replacement:
-                if replacement is None:
-                    _core._remove_user_environment(name)
-                else:
-                    _core._sync_user_environment(name, replacement)
-                changed.append(name)
-            if record is not None:
-                record["appliedHash"] = _core._overlay_value_hash(replacement)
-                overlay_changed = True
+        with _environment_change_batch():
+            for name, managed_value in _core._managed_environment_values(settings).items():
+                if name in active:
+                    continue
+                record = overlay.get("environment", {}).get(name) if overlay else None
+                current = _core._read_user_environment(name)
+                if record is None and (managed_value is None or current != managed_value):
+                    continue
+                replacement = _core._overlay_decrypt_text(record.get("baseline")) if record else None
+                if managed_value is not None and replacement == managed_value:
+                    replacement = None
+                    record["baseline"] = _core._overlay_encrypt_text(None)
+                    record["baselineHash"] = _core._overlay_value_hash(None)
+                    overlay_changed = True
+                if current != replacement:
+                    if replacement is None:
+                        _core._remove_user_environment(name)
+                    else:
+                        _core._sync_user_environment(name, replacement)
+                    changed.append(name)
+                if record is not None:
+                    record["appliedHash"] = _core._overlay_value_hash(replacement)
+                    overlay_changed = True
         if overlay and overlay_changed:
             overlay["updatedAt"] = _core.now_iso()
             _core.atomic_write_json(_core.RUNTIME_OVERLAY_FILE, overlay)

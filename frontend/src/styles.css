@@ -1616,8 +1616,9 @@ main { min-width: 0; }
 .toast.warning { border-color: rgb(var(--warning-rgb) / 0.42); background: rgb(var(--panel-rgb) / 1); }
 .toast.warning > svg { color: rgb(var(--warning-rgb) / 1); }
 .toast button { width: 26px; height: 26px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
-.app-loading { min-height: 100vh; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--muted); font-size: 12px; }
+.app-loading { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; color: var(--muted); font-size: 12px; text-align: center; }
 .app-loading img { width: 38px; height: 38px; border-radius: 10px; margin-right: 5px; }
+.app-loading-error { max-width: min(560px, 90vw); margin: 0; color: var(--danger, #f29191); line-height: 1.6; }
 
 .tone-green { background-color: #48d497 !important; }
 .tone-amber { background-color: #e9b85e !important; }

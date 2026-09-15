@@ -5157,7 +5157,6 @@ function AccountsView({
     const operationId = globalThis.crypto?.randomUUID?.() ||
       `switch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
     const startedAt = Date.now();
-    let pollInFlight = false;
     setSwitchProgress({
       operationId,
       targetId: item.recordId,
@@ -5170,39 +5169,46 @@ function AccountsView({
       elapsedMs: 0,
       timings: {},
     });
-    const poll = async () => {
+    const readOperation = async () => {
+      const payload = await api(
+        `/api/switch-operation?operationId=${encodeURIComponent(operationId)}`,
+        { timeoutMs: 3_000 },
+      );
+      const operation = payload.operation;
       setSwitchProgress((current) =>
-        current?.operationId === operationId && current.status === "running"
-          ? { ...current, elapsedMs: Date.now() - startedAt }
+        current?.operationId === operationId
+          ? { ...current, ...operation, operationId }
           : current,
       );
-      if (pollInFlight) return;
-      pollInFlight = true;
-      try {
-        const payload = await api(
-          `/api/switch-operation?operationId=${encodeURIComponent(operationId)}`,
-          { timeoutMs: 3_000 },
-        );
-        setSwitchProgress((current) =>
-          current?.operationId === operationId
-            ? { ...current, ...payload.operation, operationId }
-            : current,
-        );
-      } catch {
-        // The POST can reach the handler a fraction after the first poll. The
-        // authoritative operation response or the next poll will fill this in.
-      } finally {
-        pollInFlight = false;
-      }
+      return operation;
     };
-    const pollTimer = window.setInterval(poll, 350);
+    const waitForTerminal = async () => {
+      const deadline = Date.now() + 10 * 60 * 1000;
+      let lastError = null;
+      while (Date.now() < deadline) {
+        try {
+          const operation = await readOperation();
+          if (["completed", "error"].includes(operation?.status)) return operation;
+          lastError = null;
+        } catch (error) {
+          lastError = error;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+      }
+      throw lastError || new Error("切换任务超过 10 分钟仍未完成，请刷新状态后再操作。");
+    };
     try {
       const response = await api(path, {
         method: "POST",
         body: JSON.stringify({ operationId, forceReapply: Boolean(item.active) }),
+        timeoutMs: 15_000,
       });
-      await poll();
-      const visibilityResult = response.result?.sessionSync?.visibility;
+      const operation = await waitForTerminal();
+      if (operation?.status === "error") {
+        throw new Error(operation.error || operation.message || "切换未完成");
+      }
+      const result = operation?.result || {};
+      const visibilityResult = result?.sessionSync?.visibility;
       const sessionVisibility = visibilityResult ? {...visibilityResult, ...visibilityResult.completion} : null;
       setSwitchProgress((current) =>
         current?.operationId === operationId
@@ -5211,11 +5217,11 @@ function AccountsView({
               status: "completed",
               phase: "completed",
               progress: 100,
-              message: response.result?.launch?.readiness?.message || "已核对当前账号与新会话配置",
-              verificationScope: response.result?.launch?.readiness?.verificationScope,
+              message: result?.launch?.readiness?.message || "已核对当前账号与新会话配置",
+              verificationScope: result?.launch?.readiness?.verificationScope,
               sessionVisibility,
-              elapsedMs: response.result?.performance?.totalMs ?? current.elapsedMs,
-              timings: response.result?.performance?.stages ?? current.timings,
+              elapsedMs: result?.performance?.totalMs ?? current.elapsedMs,
+              timings: result?.performance?.stages ?? current.timings,
             }
           : current,
       );
@@ -5225,9 +5231,9 @@ function AccountsView({
           2_500,
         );
       }
-      return response;
+      return { ...response, result };
     } catch (error) {
-      await poll();
+      try { await readOperation(); } catch { /* retain the request error */ }
       setSwitchProgress((current) =>
         current?.operationId === operationId
           ? {
@@ -5242,8 +5248,6 @@ function AccountsView({
           : current,
       );
       throw error;
-    } finally {
-      window.clearInterval(pollTimer);
     }
   };
   const select = (item) =>
@@ -11138,6 +11142,7 @@ function ProductHome({ onOpenCodex, onOpenClaude }) {
 
 export default function App() {
   const [data, setData] = useState(null);
+  const [startupError, setStartupError] = useState("");
   useSavedAppearance(data?.settings?.appBehavior?.appearance);
   const [view, setView] = useState("accounts");
   const [workspace, setWorkspace] = useState("home");
@@ -11164,6 +11169,7 @@ export default function App() {
     const generation = ++reloadGenerationRef.current;
     ++snapshotGenerationRef.current;
     const result = await api("/api/state");
+    setStartupError("");
     if (generation !== reloadGenerationRef.current) return result;
     ++snapshotGenerationRef.current;
     setData((current) => {
@@ -11218,19 +11224,36 @@ export default function App() {
     if (generation !== snapshotGenerationRef.current) return result;
     updateData((current) => {
       if (!current) return current;
+      const sameRevision = result.revision != null &&
+        result.revision === current.accountSnapshotRevision;
+      const nextAccounts = sameRevision
+        ? current.settings.accounts
+        : (Array.isArray(result.accounts) ? result.accounts : current.settings.accounts);
+      const nextAuth = result.auth && JSON.stringify(result.auth) === JSON.stringify(current.auth)
+        ? current.auth
+        : (result.auth || current.auth);
+      const incomingRefreshStatus = result.accountRefreshStatus || current.accountRefreshStatus;
+      const incomingAutoRefreshStatus = result.accountAutoRefreshStatus || current.accountAutoRefreshStatus;
+      const nextRefreshStatus = JSON.stringify(incomingRefreshStatus) === JSON.stringify(current.accountRefreshStatus)
+        ? current.accountRefreshStatus : incomingRefreshStatus;
+      const nextAutoRefreshStatus = JSON.stringify(incomingAutoRefreshStatus) === JSON.stringify(current.accountAutoRefreshStatus)
+        ? current.accountAutoRefreshStatus : incomingAutoRefreshStatus;
+      if (
+        nextAccounts === current.settings.accounts &&
+        nextAuth === current.auth &&
+        nextRefreshStatus === current.accountRefreshStatus &&
+        nextAutoRefreshStatus === current.accountAutoRefreshStatus &&
+        result.revision === current.accountSnapshotRevision
+      ) return current;
       return {
         ...current,
         settings: {
           ...current.settings,
-          accounts: Array.isArray(result.accounts)
-            ? result.accounts
-            : current.settings.accounts,
+          accounts: nextAccounts,
         },
-        auth: result.auth || current.auth,
-        accountRefreshStatus:
-          result.accountRefreshStatus || current.accountRefreshStatus,
-        accountAutoRefreshStatus:
-          result.accountAutoRefreshStatus || current.accountAutoRefreshStatus,
+        auth: nextAuth,
+        accountRefreshStatus: nextRefreshStatus,
+        accountAutoRefreshStatus: nextAutoRefreshStatus,
         accountSnapshotRevision:
           result.revision ?? current.accountSnapshotRevision,
       };
@@ -11246,7 +11269,10 @@ export default function App() {
   }, []);
   useEffect(() => () => confirmationQueueRef.current.cancelAll(), []);
   useEffect(() => {
-    reload().catch((error) => notify(error.message, "error"));
+    reload().catch((error) => {
+      setStartupError(error.message || "无法读取本地管理服务。");
+      notify(error.message, "error");
+    });
   }, [reload, notify]);
   // The native window becomes visible before the temporary configuration is
   // adopted. The first full state response can therefore legitimately say
@@ -11394,8 +11420,14 @@ export default function App() {
     return (
       <div className="app-loading">
         <img src={appIconUrl} alt="" />
-        <Loader2 className="spin" size={22} />
-        <span>正在读取账号与模型…</span>
+        {startupError ? <AlertTriangle size={25} /> : <Loader2 className="spin" size={22} />}
+        <span>{startupError ? "Agent Manager 暂时无法读取本地状态" : "正在读取账号与模型…"}</span>
+        {startupError && <p className="app-loading-error">{startupError}</p>}
+        {startupError && <button className="button primary" type="button" onClick={() => {
+          setStartupError("");
+          reload().catch((error) => setStartupError(error.message || "无法读取本地管理服务。"));
+        }}>重试</button>}
+        {startupError && <small>断网时仍可打开界面；网络恢复后再刷新账号和模型即可。</small>}
       </div>
     );
   if (workspace === "home")
