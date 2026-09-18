@@ -223,3 +223,9 @@ def _ensure_runtime_gateway(runtime: _app.ManagerRuntime):
 def save_orchestration_for_runtime(runtime: _app.ManagerRuntime, payload: dict) -> dict:
     return _app.core.save_orchestration_and_apply(payload, ensure_gateway=lambda: _app._ensure_runtime_gateway(runtime))
 
+
+def restore_orchestration_for_runtime(runtime: _app.ManagerRuntime) -> dict:
+    return _app.core.restore_orchestration_and_apply(
+        ensure_gateway=lambda: _app._ensure_runtime_gateway(runtime)
+    )
+

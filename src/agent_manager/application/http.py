@@ -815,7 +815,27 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                 was_running = self.server.runtime.web2api.status()["running"]
                 previous = _app.json.loads(_app.json.dumps(_app.core.load_settings().get("web2api", _app.core._default_web2api_settings())))
                 config = _app.core.save_web2api_settings(payload)
-                restart_required = was_running and int(previous.get("port", 17860)) != int(config.get("port", 17860))
+                try:
+                    previous_max_per_source = int(previous.get("maxConcurrentPerSource", 0) or 0)
+                except (TypeError, ValueError):
+                    previous_max_per_source = 0
+                try:
+                    current_max_per_source = int(config.get("maxConcurrentPerSource", 0) or 0)
+                except (TypeError, ValueError):
+                    current_max_per_source = 0
+                try:
+                    previous_queue_timeout = float(previous.get("queueTimeoutSeconds", 2.0) or 2.0)
+                except (TypeError, ValueError):
+                    previous_queue_timeout = 2.0
+                try:
+                    current_queue_timeout = float(config.get("queueTimeoutSeconds", 2.0) or 2.0)
+                except (TypeError, ValueError):
+                    current_queue_timeout = 2.0
+                restart_required = was_running and (
+                    int(previous.get("port", 17860)) != int(config.get("port", 17860))
+                    or previous_max_per_source != current_max_per_source
+                    or previous_queue_timeout != current_queue_timeout
+                )
                 if restart_required:
                     self.server.runtime.web2api.stop(disable=False)
                     try:
@@ -1295,6 +1315,9 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
             if path == "/api/orchestration/save":
                 self._json({"ok": True, **_app.save_orchestration_for_runtime(self.server.runtime, self._read_json())})
                 return
+            if path == "/api/orchestration/preview":
+                self._json({"ok": True, **_app.core.preview_orchestration(self._read_json())})
+                return
             if path == "/api/runtime-tuning":
                 tuning = _app.core.save_runtime_tuning(self._read_json())
                 self._json({"ok": True, "runtimeTuning": tuning})
@@ -1345,11 +1368,11 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                 self._json({"ok": True, "routing": routing})
                 return
             if path == "/api/orchestration/restore-defaults":
-                restored = _app.core.restore_orchestration_defaults()
-                applied = _app.core.apply_configuration(False)
-                if applied.get("gatewayRequired") and not self.server.runtime.web2api.status()["running"]:
-                    self.server.runtime.web2api.start()
-                self._json({"ok": True, "restored": restored, "applied": applied})
+                result = _app.restore_orchestration_for_runtime(self.server.runtime)
+                self._json({"ok": True, **result, "restored": {
+                    "modelWorkspace": result.get("modelWorkspace"),
+                    "subagentRouting": result.get("subagentRouting"),
+                }, "applied": result.get("result")})
                 return
             if path == "/api/app-behavior":
                 payload = self._read_json()

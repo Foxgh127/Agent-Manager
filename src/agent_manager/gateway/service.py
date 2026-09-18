@@ -3675,7 +3675,9 @@ class GatewayServer(ThreadingHTTPServer):
         super().__init__(address, GatewayHandler)
         self.manager = manager
         self._thread_slots = threading.BoundedSemaphore(MAX_GATEWAY_THREADS)
-        self._upstream_slots = threading.BoundedSemaphore(MAX_UPSTREAM_CONCURRENCY)
+        self.upstream_limit = manager.upstream_concurrency_limit()
+        self.upstream_queue_timeout = manager.upstream_queue_timeout()
+        self._upstream_slots = threading.BoundedSemaphore(self.upstream_limit)
 
     def server_bind(self) -> None:
         if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -3721,13 +3723,13 @@ class GatewayServer(ThreadingHTTPServer):
 
     @contextmanager
     def upstream_slot(self):
-        if not self._upstream_slots.acquire(timeout=UPSTREAM_QUEUE_TIMEOUT_SECONDS):
+        if not self._upstream_slots.acquire(timeout=self.upstream_queue_timeout):
             with self.manager.lock:
                 self.manager.rejected_request_count += 1
             raise GatewayError(
                 "Web2API 当前请求较多，请稍后重试。",
                 429,
-                headers={"Retry-After": str(max(1, int(UPSTREAM_QUEUE_TIMEOUT_SECONDS)))},
+                headers={"Retry-After": str(max(1, int(math.ceil(self.upstream_queue_timeout))) )},
             )
         try:
             yield
@@ -4094,6 +4096,54 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 class Web2APIManager:
+    @staticmethod
+    def _runtime_web2api_config() -> dict:
+        try:
+            settings = core.load_settings()
+        except Exception:
+            settings = {}
+        config = settings.get("web2api") if isinstance(settings, dict) else None
+        return config if isinstance(config, dict) else {}
+
+    def upstream_concurrency_limit(self) -> int:
+        config = self._runtime_web2api_config()
+        try:
+            value = int(config.get("maxConcurrentRequests", MAX_UPSTREAM_CONCURRENCY))
+        except (TypeError, ValueError):
+            value = MAX_UPSTREAM_CONCURRENCY
+        return max(1, min(MAX_UPSTREAM_CONCURRENCY, value))
+
+    def upstream_queue_timeout(self) -> float:
+        config = self._runtime_web2api_config()
+        try:
+            value = float(config.get("queueTimeoutSeconds", UPSTREAM_QUEUE_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            value = UPSTREAM_QUEUE_TIMEOUT_SECONDS
+        return max(0.1, min(30.0, value))
+
+    def source_concurrency_limit(self) -> int:
+        config = self._runtime_web2api_config()
+        try:
+            value = int(config.get("maxConcurrentPerSource", 0))
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(MAX_UPSTREAM_CONCURRENCY, value))
+
+    def acquire_identity_slot(self, kind: str, identity: str):
+        try:
+            return self.scheduler.acquire(
+                kind,
+                identity,
+                max_concurrency=self.source_concurrency_limit(),
+                timeout=self.upstream_queue_timeout(),
+            )
+        except TimeoutError as exc:
+            raise GatewayError(
+                "当前来源正在处理较多请求，请稍后重试。",
+                429,
+                headers={"Retry-After": str(max(1, int(math.ceil(self.upstream_queue_timeout()))))},
+            ) from exc
+
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.server: GatewayServer | None = None
@@ -4883,7 +4933,11 @@ class Web2APIManager:
                 if next_cooldown is not None
                 else None
             ),
-            "maxConcurrentRequests": MAX_UPSTREAM_CONCURRENCY,
+            "maxConcurrentRequests": (
+                self.server.upstream_limit if self.server else self.upstream_concurrency_limit()
+            ),
+            "maxConcurrentPerSource": self.source_concurrency_limit(),
+            "queueTimeoutSeconds": self.server.upstream_queue_timeout if self.server else self.upstream_queue_timeout(),
             "lastAccount": reported_account,
             "lastQuota": reported_quota,
             "protocolCapabilities": protocol_capabilities(),
@@ -5152,7 +5206,7 @@ class Web2APIManager:
                 account_id = str(account["id"])
                 if not self._bind_session(session_key_value, "account", account_id):
                     raise GatewayError("会话身份绑定发生冲突。", 409)
-                release = self.scheduler.acquire("account", account_id)
+                release = self.acquire_identity_slot("account", account_id)
             tried.add(account_id)
             cleanup = ExitStack()
             cleanup.callback(release)
@@ -5496,7 +5550,7 @@ class Web2APIManager:
                 identity = str(chosen["sourceRecordId"])
                 if not self._bind_session(key, "provider", identity):
                     raise GatewayError("会话身份绑定发生冲突。", 409)
-                release = self.scheduler.acquire("provider", identity)
+                release = self.acquire_identity_slot("provider", identity)
             tried.add(identity)
             cleanup = ExitStack()
             cleanup.callback(release)

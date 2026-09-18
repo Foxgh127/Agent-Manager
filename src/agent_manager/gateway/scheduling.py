@@ -29,6 +29,7 @@ class SessionStateError(RuntimeError):
 class Scheduler:
     def __init__(self, lock, session_path=None):
         self.lock = lock
+        self.condition = threading.Condition(lock)
         self.inflight = {}
         self.last = OrderedDict()
         self.sessions = OrderedDict()
@@ -145,15 +146,27 @@ class Scheduler:
                     self.last.popitem(last=False)
             return records
 
-    def acquire(self, kind, identity):
+    def acquire(self, kind, identity, *, max_concurrency=0, timeout=None):
         key = (kind, identity)
-        with self.lock:
+        try:
+            limit = int(max_concurrency or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit < 0:
+            limit = 0
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        with self.condition:
+            while limit and self.inflight.get(key, 0) >= limit:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("scheduler identity concurrency limit reached")
+                self.condition.wait(remaining)
             self.inflight[key] = self.inflight.get(key, 0) + 1
         released = False
 
         def release():
             nonlocal released
-            with self.lock:
+            with self.condition:
                 if released:
                     return
                 released = True
@@ -162,6 +175,7 @@ class Scheduler:
                     self.inflight[key] = count
                 else:
                     self.inflight.pop(key, None)
+                self.condition.notify_all()
         return release
 
 

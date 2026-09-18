@@ -382,6 +382,18 @@ def save_web2api_settings(payload: dict) -> dict:
     routing = str(payload.get("routing") or current.get("routing") or "ordered")
     if routing not in _core.VALID_WEB2API_ROUTING:
         raise _core.ManagerError("Web2API 调度模式无效。")
+    try:
+        max_per_source = int(payload.get("maxConcurrentPerSource", current.get("maxConcurrentPerSource", 0)))
+    except (TypeError, ValueError) as exc:
+        raise _core.ManagerError("单来源并发上限必须是数字。") from exc
+    if max_per_source < 0 or max_per_source > 32:
+        raise _core.ManagerError("单来源并发上限必须在 0 到 32 之间；0 表示跟随全局上限。")
+    try:
+        queue_timeout = float(payload.get("queueTimeoutSeconds", current.get("queueTimeoutSeconds", 2.0)))
+    except (TypeError, ValueError) as exc:
+        raise _core.ManagerError("排队等待时间必须是数字。") from exc
+    if not _core.math.isfinite(queue_timeout) or queue_timeout < 0.1 or queue_timeout > 30:
+        raise _core.ManagerError("排队等待时间必须在 0.1 到 30 秒之间。")
     account_ids = payload.get("accountIds", current.get("accountIds", []))
     if not isinstance(account_ids, list):
         raise _core.ManagerError("Web2API 账号池格式无效。")
@@ -432,6 +444,8 @@ def save_web2api_settings(payload: dict) -> dict:
             "bindHost": "127.0.0.1",
             "port": port,
             "routing": routing,
+            "maxConcurrentPerSource": max_per_source,
+            "queueTimeoutSeconds": round(queue_timeout, 3),
             "accountIds": selected,
             "providerIds": selected_providers,
             "sourceOrder": source_order,

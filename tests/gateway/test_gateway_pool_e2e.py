@@ -17,6 +17,21 @@ def sse(*events):
     return b"".join(("data: " + json.dumps(event) + "\n\n").encode() for event in events)
 
 
+def test_scheduler_enforces_optional_per_identity_limit_without_leaking_inflight():
+    lock = threading.RLock()
+    scheduler = Scheduler(lock)
+    release = scheduler.acquire("account", "one", max_concurrency=1, timeout=0.01)
+    try:
+        with pytest.raises(TimeoutError):
+            scheduler.acquire("account", "one", max_concurrency=1, timeout=0.01)
+        assert scheduler.inflight == {("account", "one"): 1}
+    finally:
+        release()
+    assert not scheduler.inflight
+    release_again = scheduler.acquire("account", "one", max_concurrency=1, timeout=0.01)
+    release_again()
+
+
 @pytest.fixture(params=["account", "provider"])
 def pool(request, tmp_path, monkeypatch):
     kind = request.param

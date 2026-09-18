@@ -206,6 +206,29 @@ class OrchestrationTransactionTests(unittest.TestCase):
         self.assertEqual(self.environment[core.AGGREGATE_ENV_KEY], internal)
         self.assertTrue(response["result"]["backups"])
 
+    def test_preview_validates_without_writing_any_surface(self):
+        before = self.state()
+        payload = self.payload(include_config=False)
+        preview = core.preview_orchestration(payload)
+        self.assertTrue(preview["valid"])
+        self.assertEqual(preview["summary"]["strategyId"], "adaptive")
+        self.assertEqual(preview["summary"]["managedAgentCount"], 4)
+        self.assert_state_equal(before)
+
+    def test_restore_apply_failure_rolls_back_every_surface(self):
+        before = self.state()
+        original_write = core.atomic_write_text
+
+        def fail_config(path, content):
+            if Path(path) == core.CONFIG_FILE:
+                raise OSError("restore config failure")
+            return original_write(path, content)
+
+        with patch.object(core, "atomic_write_text", side_effect=fail_config):
+            with self.assertRaisesRegex(core.ManagerError, "restore config failure"):
+                core.restore_orchestration_and_apply()
+        self.assert_state_equal(before)
+
     def test_explicit_toml_edit_replaces_previous_managed_search_value(self):
         core.save_runtime_tuning({"webSearch": "cached"})
         core.CONFIG_FILE.write_text('web_search = "cached"\n', encoding="utf-8")

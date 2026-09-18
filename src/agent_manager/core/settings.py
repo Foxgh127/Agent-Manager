@@ -227,6 +227,11 @@ def _default_web2api_settings() -> dict:
         # providers while keeping the legacy typed lists for compatibility.
         "sourceOrder": [],
         "routing": "ordered",
+        # Keep the historical global gateway cap by default.  A non-zero
+        # per-source cap prevents one account/provider from monopolising the
+        # pool without changing existing installations until selected.
+        "maxConcurrentPerSource": 0,
+        "queueTimeoutSeconds": 2.0,
         "lastStartedAt": None,
         "lastError": None,
         "requestCount": 0,

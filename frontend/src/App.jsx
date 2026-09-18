@@ -4252,6 +4252,8 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
   );
   const [routing, setRouting] = useState(config.routing || "ordered");
   const [port, setPort] = useState(Number(config.port || 17860));
+  const [maxConcurrentPerSource, setMaxConcurrentPerSource] = useState(Number(config.maxConcurrentPerSource || 0));
+  const [queueTimeoutSeconds, setQueueTimeoutSeconds] = useState(Number(config.queueTimeoutSeconds || 2));
   const [saving, setSaving] = useState(false);
   const [dragged, setDragged] = useState("");
   const accounts = Object.fromEntries(
@@ -4268,7 +4270,7 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
       return record ? { sourceId, kind, id, record } : null;
     })
     .filter(Boolean);
-  const patchPool = (nextOrder, nextRouting = routing, nextPort = port) =>
+  const patchPool = (nextOrder, nextRouting = routing, nextPort = port, nextMaxPerSource = maxConcurrentPerSource, nextQueueTimeout = queueTimeoutSeconds) =>
     updateData((current) => {
       const accountIds = nextOrder
         .filter((id) => id.startsWith("account:"))
@@ -4295,6 +4297,8 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
           providerIds,
           sourceOrder: nextOrder,
           routing: nextRouting,
+          maxConcurrentPerSource: Number(nextMaxPerSource),
+          queueTimeoutSeconds: Number(nextQueueTimeout),
         },
       },
       web2apiStatus: {
@@ -4309,13 +4313,17 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
     nextRouting = routing,
     successMessage = "API 号池顺序已保存",
     nextPort = port,
+    nextMaxPerSource = maxConcurrentPerSource,
+    nextQueueTimeout = queueTimeoutSeconds,
   ) => {
     if (saving) return false;
     const previousOrder = order;
     const previousRouting = routing;
+    const previousMaxPerSource = maxConcurrentPerSource;
+    const previousQueueTimeout = queueTimeoutSeconds;
     setOrder(nextOrder);
     setRouting(nextRouting);
-    patchPool(nextOrder, nextRouting, nextPort);
+    patchPool(nextOrder, nextRouting, nextPort, nextMaxPerSource, nextQueueTimeout);
     setSaving(true);
     try {
       const result = await api("/api/web2api/config", {
@@ -4330,6 +4338,8 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
             .filter((id) => id.startsWith("provider:"))
             .map((id) => id.slice(9)),
           sourceOrder: nextOrder,
+          maxConcurrentPerSource: Number(nextMaxPerSource),
+          queueTimeoutSeconds: Number(nextQueueTimeout),
         }),
       });
       updateData((current) => ({
@@ -4344,7 +4354,9 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
     } catch (error) {
       setOrder(previousOrder);
       setRouting(previousRouting);
-      patchPool(previousOrder, previousRouting, config.port || 17860);
+      setMaxConcurrentPerSource(previousMaxPerSource);
+      setQueueTimeoutSeconds(previousQueueTimeout);
+      patchPool(previousOrder, previousRouting, config.port || 17860, previousMaxPerSource, previousQueueTimeout);
       setPort(Number(config.port || 17860));
       notify(error.message, "error");
       return false;
@@ -4444,7 +4456,7 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
   return (
     <Modal
       title="本地反代 API 号池"
-      description="拖动账号或 API Provider 调整优先级；顺序即时生效，不会重启服务"
+      description="拖动账号或 API Provider 调整优先级；来源并发和排队设置保存时会安全重启本地 API"
       onClose={onClose}
       wide
     >
@@ -4499,6 +4511,39 @@ function ApiPoolModal({ data, updateData, notify, confirm, onClose }) {
           >
             保存端口
           </button>
+        </label>
+        <label className="pool-port-control">
+          <span>单来源并发</span>
+          <select
+            value={maxConcurrentPerSource}
+            onChange={(event) => setMaxConcurrentPerSource(Number(event.target.value))}
+            aria-label="单来源并发上限"
+          >
+            <option value={0}>跟随全局</option>
+            {[1, 2, 3, 4, 6, 8].map((value) => <option key={value} value={value}>{value} 路</option>)}
+          </select>
+          <button
+            type="button"
+            className="button subtle compact"
+            disabled={saving || maxConcurrentPerSource === Number(config.maxConcurrentPerSource || 0)}
+            onClick={() => saveConfig(order, routing, "单来源并发上限已保存", port, maxConcurrentPerSource, queueTimeoutSeconds)}
+          >保存</button>
+        </label>
+        <label className="pool-port-control">
+          <span>排队等待</span>
+          <select
+            value={queueTimeoutSeconds}
+            onChange={(event) => setQueueTimeoutSeconds(Number(event.target.value))}
+            aria-label="网关排队等待时间"
+          >
+            {[0.5, 1, 2, 5, 10].map((value) => <option key={value} value={value}>{value} 秒</option>)}
+          </select>
+          <button
+            type="button"
+            className="button subtle compact"
+            disabled={saving || queueTimeoutSeconds === Number(config.queueTimeoutSeconds || 2)}
+            onClick={() => saveConfig(order, routing, "排队等待时间已保存", port, maxConcurrentPerSource, queueTimeoutSeconds)}
+          >保存</button>
         </label>
       </div>
       <div className="pool-service-actions" aria-label="本地 API 服务操作">
@@ -6785,6 +6830,7 @@ function OrchestrationView({
   // collapsed so entering the page never exposes or dirties advanced routes.
   const [advanced, setAdvanced] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState(null);
+  const [previewReport, setPreviewReport] = useState(null);
   const [runtimeRepairing, setRuntimeRepairing] = useState(false);
   const [modelsRefreshing, setModelsRefreshing] = useState(false);
   const [sessionsOpen, setSessionsOpen] = useState(false);
@@ -7171,8 +7217,7 @@ function OrchestrationView({
       notify(error.message, "error");
     }
   };
-  const save = async () => {
-    const restartRequired = dirty;
+  const orchestrationPayload = () => {
     const initialRuntimeTuning = normalizeRuntimeTuning(
       JSON.parse(initialDraftRef.current).runtimeTuning,
     );
@@ -7181,24 +7226,50 @@ function OrchestrationView({
         ([key, value]) => value !== initialRuntimeTuning[key],
       ),
     );
+    return {
+      modelWorkspace: {
+        mode,
+        activeSourceId: workspace.activeSourceId,
+        selectAll:
+          visibleKeys.length > 0 && visibleKeys.every((key) => selected.has(key)),
+        selectedModels: [...selected],
+        defaultModelKey: defaultKey,
+        syncToCodex: true,
+      },
+      subagentRouting: { ...routing, routes: routing.routes },
+      runtimeTuning: runtimePatch,
+      codexConfig: codexConfigPayload(),
+    };
+  };
+  const preview = async () => {
+    setPreviewReport(null);
+    setBusy(true);
+    try {
+      const result = await api("/api/orchestration/preview", {
+        method: "POST",
+        body: JSON.stringify(orchestrationPayload()),
+      });
+      setPreviewReport(result);
+      const warningCount = (result.warnings || []).length;
+      notify(
+        warningCount
+          ? `预检完成：发现 ${warningCount} 条提示`
+          : "预检通过：没有发现阻断问题",
+        warningCount ? "warning" : "success",
+      );
+    } catch (error) {
+      notify(`预检未通过：${error.message}`, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const save = async () => {
+    const restartRequired = dirty;
     setBusy(true);
     try {
       const applied = await api("/api/orchestration/save", {
         method: "POST",
-        body: JSON.stringify({
-          modelWorkspace: {
-            mode,
-            activeSourceId: workspace.activeSourceId,
-            selectAll:
-              visibleKeys.length > 0 && visibleKeys.every((key) => selected.has(key)),
-            selectedModels: [...selected],
-            defaultModelKey: defaultKey,
-            syncToCodex: true,
-          },
-          subagentRouting: { ...routing, routes: routing.routes },
-          runtimeTuning: runtimePatch,
-          codexConfig: codexConfigPayload(),
-        }),
+        body: JSON.stringify(orchestrationPayload()),
       });
       const persistedRuntime = normalizeRuntimeTuning(applied.runtimeTuning);
       setRuntimeTuning(persistedRuntime);
@@ -7218,6 +7289,7 @@ function OrchestrationView({
         runtimeTuning: persistedRuntime,
       });
       runtimeTouchedRef.current = false;
+      setPreviewReport(null);
       loadCodexConfig(true).catch(() => {});
       await reload();
       if (restartRequired) await offerCodexRestart();
@@ -7311,6 +7383,7 @@ function OrchestrationView({
       const fresh = await reload();
       hydrateDraft(fresh);
       await loadCodexConfig(true);
+      setPreviewReport(null);
       notify("已恢复默认调度并同步到 Codex");
       await offerCodexRestart();
     } catch (error) {
@@ -7470,6 +7543,10 @@ function OrchestrationView({
           <p>左侧控制 Codex 主模型目录，右侧配置子代理的难度与三级回退。</p>
         </div>
         <div className="heading-actions routing-actions">
+          <button className="button secondary" onClick={preview} disabled={busy}>
+            <CheckSquare size={17} />
+            预检草稿
+          </button>
           <button className="button secondary" onClick={refreshWorkspace} disabled={busy}>
             <RefreshCw size={17} />
             手动刷新
@@ -7492,6 +7569,18 @@ function OrchestrationView({
           </button>
         </div>
       </div>
+      {previewReport && (
+        <div className={cx("orchestration-preview", (previewReport.warnings || []).length && "warning")} role="status">
+          <div className="orchestration-preview-heading">
+            <CheckSquare size={17} />
+            <strong>预检结果</strong>
+            <span>{previewReport.summary?.selectedModels || 0} 个模型 · {previewReport.summary?.managedAgentCount || 0} 个受管 Agent · {previewReport.summary?.gatewayRequired ? "需要本地网关" : "无需本地网关"}</span>
+          </div>
+          {(previewReport.warnings || []).length > 0 && (
+            <ul>{previewReport.warnings.map((item) => <li key={item}>{item}</li>)}</ul>
+          )}
+        </div>
+      )}
       {runtimeStatus && !subagentDisabled && runtimeStatus.available === false && (
         <div className="runtime-repair-banner" role="status">
           <AlertTriangle size={19} />

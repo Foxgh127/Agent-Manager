@@ -139,6 +139,12 @@ main { min-width: 0; }
 .runtime-repair-banner > span { min-width: 0; display: grid; gap: 3px; }
 .runtime-repair-banner strong { color: var(--text); font-size: 12px; }
 .runtime-repair-banner small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.orchestration-preview { display: grid; gap: 8px; margin: -8px 0 20px; padding: 12px 14px; border: 1px solid rgb(var(--accent-rgb) / 0.28); border-radius: 12px; background: rgb(var(--accent-rgb) / 0.07); color: var(--text); }
+.orchestration-preview.warning { border-color: rgb(var(--warning-rgb) / 0.35); background: rgb(var(--warning-rgb) / 0.08); }
+.orchestration-preview-heading { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.orchestration-preview-heading svg { color: var(--accent); }
+.orchestration-preview-heading span { color: var(--muted); }
+.orchestration-preview ul { margin: 0 0 0 24px; padding: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .button { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 0 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); font-weight: 750; font-size: 12px; cursor: pointer; transition: border-color .18s ease, background .18s ease, transform .18s ease; }
 .button:hover:not(:disabled) { border-color: rgb(var(--panel-rgb) / 1); background: var(--surface-3); }
 .button:active:not(:disabled) { transform: translateY(1px); }
@@ -363,7 +369,7 @@ main { min-width: 0; }
 .pool-overview strong { font-size: 11px; }
 .pool-overview small { color: var(--muted-2); font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pool-port-control { display: grid; grid-template-columns: auto 82px auto; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
-.pool-port-control input { width: 82px; min-height: 34px; border: 1px solid var(--border-soft); border-radius: 8px; padding: 0 8px; color: var(--text); background: rgb(var(--canvas-rgb) / 1); font: inherit; }
+.pool-port-control input, .pool-port-control select { width: 82px; min-height: 34px; border: 1px solid var(--border-soft); border-radius: 8px; padding: 0 8px; color: var(--text); background: rgb(var(--canvas-rgb) / 1); font: inherit; }
 .pool-service-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin: 0 18px 12px; }
 .codex-quota-feedback { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 9px; margin: 0 18px 12px; padding: 10px 11px; border: 1px solid rgb(var(--accent-rgb) / 0.2); border-radius: 10px; background: rgb(var(--accent-rgb) / 0.045); }
 .codex-quota-feedback > svg { color: var(--accent); }

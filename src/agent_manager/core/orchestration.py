@@ -131,6 +131,91 @@ def _preflight_orchestration_artifacts(settings: dict) -> None:
         _core.tomllib.loads(_core._render_managed_agent(spec))
 
 
+def preview_orchestration(payload: dict) -> dict:
+    """Validate an orchestration draft without touching disk or the gateway."""
+
+    if not isinstance(payload, dict):
+        raise _core.ManagerError("编排预检请求必须是对象。")
+    workspace_payload = payload.get("modelWorkspace")
+    routing_payload = payload.get("subagentRouting")
+    tuning_payload = payload.get("runtimeTuning")
+    config_payload = payload.get("codexConfig")
+    if not isinstance(workspace_payload, dict) or not isinstance(routing_payload, dict):
+        raise _core.ManagerError("编排预检缺少有效的主模型或子代理设置。")
+    if tuning_payload is not None and not isinstance(tuning_payload, dict):
+        raise _core.ManagerError("Codex 运行参数格式无效。")
+    if config_payload is not None and not isinstance(config_payload, dict):
+        raise _core.ManagerError("Codex 配置保存请求无效。")
+    with _core.CONFIG_FILE_LOCK, _core.SETTINGS_LOCK, _core._settings_file_lock():
+        raw_settings, _migrated = _core._read_and_migrate_settings_locked()
+        settings = _core.SettingsDocument(_core._json_clone(raw_settings), baseline=raw_settings)
+        workspace = _core._normalize_model_workspace_update(settings, workspace_payload)
+        tuning = _core._normalize_runtime_tuning_update(settings, tuning_payload or {})
+        routing, strategy_id = _core._normalize_subagent_routing_update(settings, routing_payload)
+        candidate = _core.SettingsDocument(_core._json_clone(settings), baseline=getattr(settings, "_baseline", settings))
+        candidate["modelWorkspace"] = workspace
+        candidate["runtimeTuning"] = tuning
+        candidate["subagentRouting"] = routing
+        candidate["activeStrategyId"] = strategy_id
+        config_changed = False
+        if config_payload is not None:
+            previous_raw, proposed_text, _encoded = _core._prepare_codex_config_document(config_payload)
+            proposed_common, edited_fields = _core._config_runtime_edits(previous_raw, proposed_text)
+            conflicts = {
+                field for field in edited_fields
+                if field in (tuning_payload or {}) and tuning.get(field) != proposed_common.get(field)
+            }
+            if conflicts:
+                raise _core.ManagerError("可视化运行参数与 TOML 草稿存在冲突，请保留一种修改后再保存。")
+            config_changed = previous_raw != proposed_text.encode("utf-8")
+        _core._preflight_orchestration_artifacts(candidate)
+        model_records = _core._configuration_model_records(candidate)
+        known_keys = {str(item.get("key") or "") for item in _core._all_model_records(settings)}
+        selected = set(workspace.get("selectedModels", []))
+        dropped = sorted(key for key in selected if key not in known_keys)
+        route_keys = {
+            key
+            for route in routing.get("routes", {}).values()
+            for key in route.get("models", [])
+        }
+        route_outside_selection = sorted(key for key in route_keys if key not in selected and not workspace.get("selectAll"))
+        gateway_required = bool(
+            workspace.get("mode") == "aggregate"
+            or candidate.get("web2api", {}).get("activeForCodex")
+            or _core._subagents_require_shared_gateway(candidate)
+        )
+        warnings = []
+        if dropped:
+            warnings.append("主模型选择中包含已不存在的模型，保存时会忽略。")
+        if route_outside_selection:
+            warnings.append("子代理路由包含未选入主模型范围的模型；保存后会按共享网关路由。")
+        if strategy_id == "verification_first":
+            warnings.append("Codex 原生模式会保留 Codex 自己的子代理决策；需要完全禁止子代理请选择单代理模式。")
+        if strategy_id == "disabled" and route_keys:
+            warnings.append("单代理模式会清理管理器生成的路由文件，陈旧路由不会继续生效。")
+        return {
+            "valid": True,
+            "warnings": warnings,
+            "summary": {
+                "mode": workspace.get("mode"),
+                "selectedModels": len(selected),
+                "catalogModels": len(model_records),
+                "defaultModelKey": workspace.get("defaultModelKey") or None,
+                "strategyId": strategy_id,
+                "managedAgentCount": len(_core._managed_subagent_specs(candidate)),
+                "gatewayRequired": gateway_required,
+                "configChanged": config_changed,
+            },
+            "routeLevels": {
+                level: {
+                    "models": list(route.get("models", [])),
+                    "efforts": list(route.get("efforts", [])),
+                }
+                for level, route in routing.get("routes", {}).items()
+            },
+        }
+
+
 
 def save_orchestration_and_apply(
     payload: dict,
@@ -247,8 +332,12 @@ def save_orchestration_and_apply(
 
 
 
-def restore_orchestration_defaults() -> dict:
-    settings = _core.load_settings()
+def _orchestration_defaults_candidate(settings: dict) -> tuple[dict, dict]:
+    """Build the reset state without writing it.
+
+    Keeping this pure is important: the HTTP reset endpoint must be able to
+    run the same preflight, apply and rollback path as an ordinary save.
+    """
     sources = _core.model_sources(settings)
     existing_active = str(settings.get("modelWorkspace", {}).get("activeSourceId") or "")
     active_source = next((item for item in sources if item.get("id") == existing_active), None)
@@ -262,14 +351,18 @@ def restore_orchestration_defaults() -> dict:
         models = active_source.get("models") if isinstance(active_source.get("models"), list) else []
         workspace["defaultModelKey"] = str(models[0].get("key") or "") if models else ""
     routing = _core._default_subagent_routing()
-    settings["modelWorkspace"] = workspace
-    settings["subagentRouting"] = routing
-    settings["activeStrategyId"] = routing["strategyId"]
+    candidate = _core.SettingsDocument(
+        _core._json_clone(settings),
+        baseline=getattr(settings, "_baseline", settings),
+    )
+    candidate["modelWorkspace"] = workspace
+    candidate["subagentRouting"] = routing
+    candidate["activeStrategyId"] = routing["strategyId"]
     # "Restore defaults" must be self-contained.  Older installations can
     # retain a legacy custom main profile (for example codex_local_access)
     # whose secret never existed on a second computer.  Falling back to that
     # profile makes a safe reset fail with a misleading API-key error.
-    profiles = [item for item in settings.get("mainProfiles", []) if isinstance(item, dict)]
+    profiles = [item for item in candidate.get("mainProfiles", []) if isinstance(item, dict)]
     profile = next((item for item in profiles if item.get("provider") == "openai"), None)
     if profile is None:
         profile = next((item for item in profiles if item.get("id") == "current"), None)
@@ -297,13 +390,81 @@ def restore_orchestration_defaults() -> dict:
             ),
         }
     )
-    settings["mainProfiles"] = profiles
-    settings["activeMainProfileId"] = str(profile["id"])
-    web2api = settings.setdefault("web2api", _core._default_web2api_settings())
+    candidate["mainProfiles"] = profiles
+    candidate["activeMainProfileId"] = str(profile["id"])
+    web2api = candidate.setdefault("web2api", _core._default_web2api_settings())
     web2api["activeForCodex"] = False
     web2api["activeAccountId"] = None
-    _core.save_settings(settings)
-    return {"modelWorkspace": workspace, "subagentRouting": routing}
+    return candidate, {
+        "modelWorkspace": workspace,
+        "subagentRouting": routing,
+        "runtimeTuning": _core._normalize_runtime_tuning(candidate.get("runtimeTuning")),
+    }
+
+
+def restore_orchestration_and_apply(
+    *,
+    ensure_gateway: _core.Any = None,
+) -> dict:
+    """Restore defaults and apply every generated artifact atomically."""
+
+    if ensure_gateway is not None and not callable(ensure_gateway):
+        raise _core.ManagerError("网关启动回调无效。")
+    with (
+        _core.SWITCH_OPERATION_LOCK,
+        _core.CONFIG_FILE_LOCK,
+        _core.RUNTIME_OVERLAY_LOCK,
+        _core.SETTINGS_LOCK,
+        _core.SECRETS_LOCK,
+        _core._settings_file_lock(),
+    ):
+        raw_settings, _migrated = _core._read_and_migrate_settings_locked()
+        settings = _core.SettingsDocument(_core._json_clone(raw_settings), baseline=raw_settings)
+        candidate, restored = _orchestration_defaults_candidate(settings)
+        _core._preflight_orchestration_artifacts(candidate)
+        snapshot = _capture_orchestration_transaction_snapshot(settings)
+        retained_backups = []
+        try:
+            for path in (_core.SETTINGS_FILE, _core.SECRETS_FILE):
+                backup = _core.backup_file(path)
+                if backup:
+                    retained_backups.append(str(backup))
+            result = _core._apply_configuration_locked(settings=candidate)
+            result["changed"] = True
+            result["restartRequired"] = True
+            result["backups"] = list(dict.fromkeys([*retained_backups, *result.get("backups", [])]))
+            response = {
+                **restored,
+                "result": result,
+                "document": _core.codex_config_document(),
+            }
+            if result.get("gatewayRequired") and ensure_gateway is not None:
+                ensure_gateway()
+            return response
+        except BaseException as exc:
+            rollback_errors = _core._restore_switch_transaction_snapshot(
+                snapshot,
+                process_state_checked=True,
+            )
+            if not isinstance(exc, Exception):
+                raise
+            detail = f"；回滚异常：{'；'.join(rollback_errors)}" if rollback_errors else ""
+            raise _core.ManagerError(f"恢复默认失败：{exc}{detail}") from exc
+
+
+def restore_orchestration_defaults() -> dict:
+    """Return the reset state and persist settings for legacy callers.
+
+    The HTTP application uses :func:`restore_orchestration_and_apply`; this
+    compatibility wrapper retains the historical settings-only API used by
+    scripts and older integrations.
+    """
+    with _core.SWITCH_OPERATION_LOCK, _core.SETTINGS_LOCK, _core._settings_file_lock():
+        raw_settings, _migrated = _core._read_and_migrate_settings_locked()
+        settings = _core.SettingsDocument(_core._json_clone(raw_settings), baseline=raw_settings)
+        _candidate, restored = _orchestration_defaults_candidate(settings)
+        _core.save_settings(_candidate)
+        return {key: value for key, value in restored.items() if key != "runtimeTuning"}
 
 
 

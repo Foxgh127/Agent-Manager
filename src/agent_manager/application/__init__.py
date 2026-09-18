@@ -134,6 +134,7 @@ from .switching import (
     rotate_web2api_key_for_runtime,
     _ensure_runtime_gateway,
     save_orchestration_for_runtime,
+    restore_orchestration_for_runtime,
 )
 from .server import (
     ManagerServer,
