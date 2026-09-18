@@ -67,7 +67,7 @@ def _node_runtime_search_directories() -> list[_core.Path]:
     if _core.os.name == "nt":
         for value in _core._windows_registry_path_values():
             directories.extend(_core._split_runtime_path(value))
-    home = _core.Path.home()
+    home = _core.app_paths.user_home()
     program_files = _core.Path(_core.os.environ.get("ProgramFiles") or "C:/Program Files")
     program_files_x86 = _core.Path(_core.os.environ.get("ProgramFiles(x86)") or "C:/Program Files (x86)")
     local_app_data = _core.Path(_core.os.environ.get("LOCALAPPDATA") or home / "AppData/Local")
@@ -172,7 +172,7 @@ def _npm_global_prefix(npm_command: list[str]) -> _core.Path | None:
 
 def _locate_npm_codex_cli(npm_command: list[str]) -> _core.Path | None:
     prefix_dir = _core._npm_global_prefix(npm_command)
-    app_data = _core.Path(_core.os.environ.get("APPDATA") or _core.Path.home() / "AppData/Roaming")
+    app_data = _core.Path(_core.os.environ.get("APPDATA") or _core.app_paths.user_home() / "AppData/Roaming")
     candidates = [
         (prefix_dir / "node_modules" / "@openai" / "codex" / "bin" / "codex.js") if prefix_dir else None,
         app_data / "npm" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js",
@@ -488,8 +488,8 @@ def _desktop_managed_codex_candidates() -> list[_core.Path]:
     """Find the versioned runtime downloaded by current Codex/ChatGPT desktop builds."""
     if _core.os.name != "nt":
         return []
-    local_app_data = _core.Path(_core.os.environ.get("LOCALAPPDATA") or _core.Path.home() / "AppData/Local")
-    roaming_app_data = _core.Path(_core.os.environ.get("APPDATA") or _core.Path.home() / "AppData/Roaming")
+    local_app_data = _core.Path(_core.os.environ.get("LOCALAPPDATA") or _core.app_paths.user_home() / "AppData/Local")
+    roaming_app_data = _core.Path(_core.os.environ.get("APPDATA") or _core.app_paths.user_home() / "AppData/Roaming")
     roots = [
         local_app_data / "OpenAI" / "Codex" / "bin",
         local_app_data / "OpenAI" / "ChatGPT" / "bin",

@@ -171,11 +171,25 @@ def _normalize(item: dict, source: str) -> dict:
             day = parsed.date().isoformat()
         except ValueError:
             day = "未知日期"
-    model = _first_text(item, ("model", "modelName", "routedModel", "requestedModel"), "未确定模型")
+    requested_model = _first_text(item, ("requestedModel",), "")
+    routed_model = _first_text(item, ("routedModel",), "")
+    model = _first_text(item, ("routedModel", "requestedModel", "model", "modelName"), "未确定模型")
+    actual_model = (
+        _first_text(item, ("actualModel",), "")
+        if _first_text(item, ("modelEvidence",), "") == "actual"
+        else ""
+    )
     normalized = {
         "sourceKey": _source_key(item, source, role),
         "date": day[:10],
         "model": model,
+        "requestedModel": requested_model,
+        "routedModel": routed_model,
+        "actualModel": actual_model,
+        "modelEvidence": "actual" if actual_model else "unknown",
+        "modelRoutingStatus": _first_text(item, ("modelRoutingStatus",), "unknown"),
+        "systemFingerprint": _first_text(item, ("systemFingerprint",), ""),
+        "fingerprintEvidence": _first_text(item, ("fingerprintEvidence",), "unknown"),
         "role": role,
         "requestClassification": _first_text(
             item, ("requestClassification", "classification"), "unclassified"

@@ -43,6 +43,8 @@ Agent Manager 使用自己编写的 Python 网关，入口在 `src/agent_manager
 
 目前查到的资料不足以证明“只要使用 Sub2API，就必然降低模型能力或官方额度”，也不足以保证 CPA 一定没有这些问题。需要区分请求实际变了、网关统计变了、与上游账户额度变了。
 
+本项目现在在用量快照中提供 `routingEvidence` 和 `routingAudit`：它们只核对响应实际模型、配置路由及可选服务指纹，不运行额外黑盒探针。字段含义和官方/中转站隔离边界见 [路由证据与安全边界](routing-evidence-and-safety.md)。
+
 Sub2API 的 [0.2.0 发布说明](https://github.com/Wei-Shaw/sub2api/releases/tag/v0.2.0) 明确提供按模型映射 reasoning effort、超限时拒绝或降级等配置。因此应核对具体站点的映射和设置。其 [0.2.4 发布说明](https://github.com/Wei-Shaw/sub2api/releases/tag/v0.2.4) 还修复了额度未耗尽的 429 被错误触发退避的问题；这种网关状态错误不等于官方把额度下调。
 
 从本项目的请求路径看，值得排查的是：实际模型和 effort 是否一致，指令、工具参数和推理上下文是否完整，长会话是否被裁剪，失败是否重复请求，以及切换账号后会话是否仍绑定正确。以上是可能的排查方向，不是已测出的故障。Sub2API 的 [README](https://github.com/Wei-Shaw/sub2api#nginx-reverse-proxy-note) 也明确指出 Nginx 默认丢弃带下划线的请求头会破坏粘性会话。

@@ -517,7 +517,7 @@ def _configured_skill_states() -> dict[str, bool]:
 
 
 def _scope_for_path(skill_md: Path, cwd: Path) -> tuple[str, bool, str]:
-    home = Path.home()
+    home = core.app_paths.user_home()
     official_user = home / ".agents" / "skills"
     legacy_user = core.CODEX_HOME / "skills"
     plugin_cache = core.CODEX_HOME / "plugins" / "cache"
@@ -628,7 +628,7 @@ def _skill_record(
 
 
 def _candidate_skill_roots(cwd: Path) -> list[Path]:
-    roots = [Path.home() / ".agents" / "skills", core.CODEX_HOME / "skills"]
+    roots = [core.app_paths.user_home() / ".agents" / "skills", core.CODEX_HOME / "skills"]
     current = _canonical(cwd)
     for parent in (current, *current.parents):
         roots.append(parent / ".agents" / "skills")
@@ -992,7 +992,7 @@ def delete_skill(skill_id: str, expected_fingerprint: str, cwd: str | Path | Non
     skill_dir = skill_md.parent
     if _is_reparse_path(skill_dir):
         raise core.ManagerError("符号链接技能不能自动删除，请手动处理链接。")
-    allowed = [Path.home() / ".agents" / "skills", core.CODEX_HOME / "skills"]
+    allowed = [core.app_paths.user_home() / ".agents" / "skills", core.CODEX_HOME / "skills"]
     current = _canonical(Path(cwd or os.getcwd()))
     allowed.extend(parent / ".agents" / "skills" for parent in (current, *current.parents))
     if not any(_within(skill_dir, root) for root in allowed):

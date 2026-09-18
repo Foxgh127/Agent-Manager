@@ -76,6 +76,7 @@ def pool(request, tmp_path, monkeypatch):
                     body = preamble + delta + (b"" if mode == "truncate" else sse(final))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                self.send_header("system-fingerprint", "fp-" + identity)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if mode == "hold":
@@ -235,6 +236,7 @@ def test_tools_survive_stream_and_complete_with_original_arguments(pool):
     stats = pool["manager"].usage_stats.snapshot()
     record = stats["recentRequests"][0]
     assert record["actualModel"] == "gpt-test" and record["modelEvidence"] == "actual"
+    assert record["systemFingerprint"].startswith("fp-") and record["fingerprintEvidence"] == "response_header"
     assert record["contextTier"] == "long" and record["serviceTier"] == "priority"
     assert record["cacheWriteEvidence"] == "known" and record["usageEvidenceVersion"] == 2
     assert (record["inputTokens"], record["cachedInputTokens"], record["cacheWriteTokens"], record["outputTokens"]) == (300000, 200000, 10000, 4)

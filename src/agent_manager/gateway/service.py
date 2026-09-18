@@ -30,7 +30,14 @@ from zoneinfo import ZoneInfo
 import agent_manager.core as core
 from agent_manager._version import VERSION as MANAGER_VERSION
 from .scheduling import Scheduler, LeasedResponse, SessionStateError, session_key
-from agent_manager.usage.request_metadata import IDENTITY_FIELDS, observe_metadata, enrich_context, safe_metadata
+from agent_manager.usage.request_metadata import (
+    IDENTITY_FIELDS,
+    enrich_context,
+    model_routing_diagnostic,
+    observe_metadata,
+    observe_response_headers,
+    safe_metadata,
+)
 
 
 UPSTREAM_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -57,7 +64,18 @@ GATEWAY_CLIENT_TIMEOUT_SECONDS = 20.0
 MAX_UPSTREAM_CONCURRENCY = 8
 RESPONSES_AUXILIARY_PATHS = {"/v1/responses/compact", "/v1/responses/input_tokens"}
 UPSTREAM_QUEUE_TIMEOUT_SECONDS = 2.0
-SAFE_FORWARD_HEADERS = {"openai-model", "x-reasoning-included", "retry-after", "x-codex-history-compatibility"}
+SAFE_FORWARD_HEADERS = {
+    "openai-model",
+    "x-reasoning-included",
+    "retry-after",
+    "x-codex-history-compatibility",
+    # Response evidence is bounded and non-secret; retaining it lets the
+    # usage ledger distinguish a body model from an infrastructure fingerprint.
+    "system-fingerprint",
+    "x-system-fingerprint",
+    "openai-system-fingerprint",
+    "x-openai-system-fingerprint",
+}
 CODEX_RESPONSES_LITE_HEADER = "X-OpenAI-Internal-Codex-Responses-Lite"
 SAFE_CLIENT_IDENTITY_HEADERS = (
     "User-Agent",
@@ -116,6 +134,47 @@ def protocol_capabilities() -> dict:
         "limitations": ["upstream_endpoint_support_required", "websocket_one_response_at_a_time",
                         "no_websocket_warmup_multiplexing_steering", "websocket_continuation_uses_http_state",
                         "no_response_retrieve_delete_cancel_api", "no_oauth_token_count_estimate"],
+    }
+
+
+def routing_safety_audit() -> dict:
+    """Describe route boundaries and observability without probing an upstream.
+
+    This is deliberately a static, credential-free contract.  It gives the
+    UI a trustworthy explanation of what can affect a request and makes it
+    explicit that relay-site adapters are not part of the official OAuth path.
+    """
+    return {
+        "schemaVersion": 1,
+        "officialRoute": {
+            "transport": "codex_responses_oauth",
+            "upstream": UPSTREAM_RESPONSES_URL,
+            "adapter": "native_account_path",
+            "relayAdapter": False,
+            "modelRewrite": "configured_route_only",
+            "postOutputReplay": False,
+        },
+        "providerRoute": {
+            "transport": "openai_compatible_http",
+            "adapter": "provider_passthrough",
+            "relaySiteBalanceAdapters": "account_and_usage_only",
+            "officialOAuthCredentials": False,
+        },
+        "identityPolicy": {
+            "clientHeaders": "bounded_allowlist",
+            "generatedFingerprint": False,
+            "activeModelProbe": False,
+            "responseEvidence": "body_then_allowlisted_header",
+            "safetyIdentifier": "caller_supplied_passthrough",
+            "syntheticUserIdentity": False,
+        },
+        "safetyBoundaries": {
+            "replayAfterOutput": False,
+            "crossIdentityContinuation": "rejected",
+            "requestBodyRetention": False,
+            "credentialRetentionInUsage": False,
+        },
+        "interpretation": "模型指纹和实际模型只用于被动一致性核对，不能单独证明降智或官方风控。",
     }
 
 
@@ -403,6 +462,10 @@ class _SSEUsageCapture:
         self.response_id: str | None = None
         self.billing_metadata: dict = {}
 
+    def observe_headers(self, headers: Any) -> None:
+        """Observe bounded response metadata without retaining the headers."""
+        self.billing_metadata = observe_response_headers(self.billing_metadata, headers)
+
     def observe_event(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
@@ -652,6 +715,9 @@ class UsageStatsStore:
             "providerId": _bounded_text(raw_route.get("providerId"), 200),
             "requestedModel": _bounded_text(raw_route.get("requestedModel"), 200, "unknown"),
             "routedModel": _bounded_text(raw_route.get("routedModel"), 200, "unknown"),
+            "modelRoutingStatus": _bounded_text(raw_route.get("modelRoutingStatus"), 24, "unknown"),
+            "modelRoutingExpected": _bounded_text(raw_route.get("modelRoutingExpected"), 200),
+            "modelMismatch": bool(raw_route.get("modelMismatch")),
             "routeKey": _bounded_text(raw_route.get("routeKey"), 240),
             "requestClassification": _bounded_text(
                 raw_route.get("requestClassification"), 80, "unclassified"
@@ -668,6 +734,8 @@ class UsageStatsStore:
             if claimed_role in {"mainAgent", "subagent", "unclassified"}
             else _agent_role_from_classification(route["requestClassification"])
         )
+        diagnostic = model_routing_diagnostic(route, route)
+        route.update(diagnostic)
         for field in USAGE_COUNTER_FIELDS:
             route[field] = _nonnegative_token_count(raw_route.get(field)) or 0
         if _nonnegative_token_count(raw_route.get("inputTokens")) is not None:
@@ -969,6 +1037,71 @@ class UsageStatsStore:
         return sorted(buckets.values(), key=lambda item: (-item["totalTokens"], item[dimension]))
 
     @staticmethod
+    def _routing_evidence(records: list[dict]) -> dict:
+        """Summarize passive model-route evidence without judging model quality."""
+        totals = {
+            "observedRequests": 0,
+            "consistentRequests": 0,
+            "mismatchRequests": 0,
+            "unknownRequests": 0,
+            "fingerprintedRequests": 0,
+        }
+        fingerprint_groups: dict[tuple[str, str, str], set[str]] = {}
+        for raw in records:
+            if not isinstance(raw, dict):
+                continue
+            route = UsageStatsStore._safe_route(raw)
+            count = max(0, int(route.get("requestCount", 0) or 0))
+            if not count:
+                continue
+            totals["observedRequests"] += count
+            status = route.get("modelRoutingStatus")
+            if status == "consistent":
+                totals["consistentRequests"] += count
+            elif status == "mismatch":
+                totals["mismatchRequests"] += count
+            else:
+                totals["unknownRequests"] += count
+            fingerprint = str(route.get("systemFingerprint") or "")
+            if fingerprint:
+                totals["fingerprintedRequests"] += count
+                group_key = (
+                    str(route.get("source") or "unknown"),
+                    str(route.get("sourceRecordId") or ""),
+                    str(route.get("modelRoutingExpected") or route.get("routedModel") or "unknown"),
+                )
+                fingerprint_groups.setdefault(group_key, set()).add(fingerprint)
+        variants = [
+            {
+                "source": source,
+                "expectedModel": expected,
+                "fingerprintCount": len(values),
+            }
+            for (source, _record_id, expected), values in fingerprint_groups.items()
+            if len(values) > 1
+        ]
+        variants.sort(key=lambda item: (-item["fingerprintCount"], item["source"], item["expectedModel"]))
+        return {
+            **totals,
+            "fingerprintChanges": sum(max(0, item["fingerprintCount"] - 1) for item in variants),
+            "fingerprintVariants": variants[:20],
+            "method": "passive_response_metadata",
+            "interpretation": "仅核对响应元数据与配置路由；不能单独证明模型能力下降或账号被降级。",
+            "activeProbes": False,
+        }
+
+    @staticmethod
+    def _routing_evidence_from_document(document: dict) -> dict:
+        routes = []
+        for day in (document or {}).get("days", {}).values():
+            if isinstance(day, dict):
+                routes.extend(
+                    route for route in (day.get("routes") or {}).values()
+                    if isinstance(route, dict)
+                )
+        return UsageStatsStore._routing_evidence(routes)
+
+    @staticmethod
     def _daily_totals(document: dict) -> list[dict]:
         result = []
         for day, day_bucket in sorted(document.get("days", {}).items()):
@@ -1039,9 +1172,11 @@ class UsageStatsStore:
             "byAccount": self._aggregate(document, "accountId"),
             "byProvider": self._aggregate(document, "providerId"),
             "byModel": self._aggregate(document, "routedModel"),
+            "byActualModel": self._aggregate(document, "actualModel"),
             "bySource": self._aggregate(document, "requestClassification"),
             "byAgentRole": self._aggregate(document, "agentRole"),
             "dailyTotals": self._daily_totals(document),
+            "routingEvidence": self._routing_evidence_from_document(document),
             "classificationEvidence": {
                 "mainAgent": "explicit gateway metadata only",
                 "subagent": "explicit gateway metadata only",
@@ -2332,6 +2467,7 @@ def account_attribution_snapshot(gateway: dict, sessions: dict | None) -> dict:
         "totals": totals,
         "records": records,
         "recentRequests": recent[:USAGE_STATS_MAX_RECENT_REQUESTS],
+        "routingEvidence": UsageStatsStore._routing_evidence(records),
         "coverage": {
             "usageReportedRequests": reported_requests,
             "totalRequests": total_requests,
@@ -4593,6 +4729,7 @@ class Web2APIManager:
     def usage_snapshot(self) -> dict:
         snapshot = self.usage_stats.snapshot()
         snapshot["lastError"] = self.last_usage_error
+        snapshot["routingAudit"] = routing_safety_audit()
         try:
             snapshot["codexSessions"] = codex_session_usage_snapshot()
             snapshot["codexSessionsError"] = None
@@ -4750,6 +4887,7 @@ class Web2APIManager:
             "lastAccount": reported_account,
             "lastQuota": reported_quota,
             "protocolCapabilities": protocol_capabilities(),
+            "routingAudit": routing_safety_audit(),
         }
 
     def models(self, access_scope: str = "public") -> dict:
@@ -5213,6 +5351,7 @@ class Web2APIManager:
         headers: dict[str, str],
     ) -> tuple[Any | None, GatewayError | None]:
         capture = _SSEUsageCapture()
+        capture.observe_headers(headers)
         staged = bytearray()
         started_at = time.monotonic()
         try:
@@ -5974,6 +6113,7 @@ class Web2APIManager:
         require_response_terminal: bool = True,
     ) -> Any:
         observer = event_observer or _SSEUsageCapture()
+        observer.observe_headers(getattr(response, "headers", None))
         content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).casefold()
         if require_response_terminal and "application/json" in content_type:
             with response:
@@ -6063,6 +6203,7 @@ class Web2APIManager:
             if path == "/v1/responses" and "application/json" in content_type.casefold():
                 content_type = "text/event-stream; charset=utf-8"
             capture = _SSEUsageCapture()
+            capture.observe_headers(response.headers)
             chunks = self._tracked_chunks(
                 self._response_stream_chunks(
                     response,
@@ -6140,6 +6281,7 @@ class Web2APIManager:
         routed_model = str(upstream_payload.get("model") or "")
         if path == "/v1/responses":
             capture = _SSEUsageCapture()
+            capture.observe_headers(headers)
             chunks = self._tracked_chunks(
                 self._response_stream_chunks(response, capture),
                 context,
@@ -6170,6 +6312,7 @@ class Web2APIManager:
                 "_abort": lambda: _abort_upstream_response(response),
             }
         capture = _SSEUsageCapture()
+        capture.observe_headers(headers)
         chunks = self._tracked_chunks(
             self._chat_stream_chunks(response, requested_model, capture,
                                      include_usage=isinstance(payload.get("stream_options"), dict) and payload["stream_options"].get("include_usage") is True),
@@ -6232,6 +6375,7 @@ class Web2APIManager:
                     result = {"body": result, "headers": {}}
                 context = self._usage_route_context(payload, model, route=route, account=result.get("account"))
                 capture = _SSEUsageCapture()
+                capture.observe_headers(result.get("headers"))
                 usage, _failed = _inspect_usage_body(result["body"], capture)
                 context = enrich_context(context, capture)
                 response = _completed_response(result["body"])
@@ -6273,7 +6417,9 @@ class Web2APIManager:
             if not isinstance(output, list) or not any(isinstance(item, dict) and item.get("type") == "compaction" for item in output):
                 raise GatewayError("上游未返回有效的压缩上下文。", 502)
             context = self._usage_route_context(payload, model, route=route, provider_id=str(route["sourceRecordId"]))
-            self._record_usage(enrich_context(context, decoded), _payload_usage(decoded), failed=status >= 400)
+            metadata = observe_metadata(None, decoded)
+            metadata = observe_response_headers(metadata, headers)
+            self._record_usage(enrich_context(context, metadata), _payload_usage(decoded), failed=status >= 400)
         self.request_count += 1
         return {"status": status, "contentType": "application/json; charset=utf-8", "body": body, "headers": headers}
 
@@ -6339,6 +6485,7 @@ class Web2APIManager:
                 response.close()
             self.request_count += 1
             capture = _SSEUsageCapture()
+            capture.observe_headers(headers)
             usage, body_failed = _inspect_usage_body(body, capture)
             context = enrich_context(context, capture)
             if capture.rate_limited or capture.quota_exhausted:
@@ -6429,6 +6576,7 @@ class Web2APIManager:
         account = upstream.get("account") if isinstance(upstream.get("account"), dict) else None
         context = self._usage_route_context(payload, requested_model, route=route, account=account)
         capture = _SSEUsageCapture()
+        capture.observe_headers(headers)
         usage, body_failed = _inspect_usage_body(body, capture)
         context = enrich_context(context, capture)
         if account is not None and capture.rate_limited:

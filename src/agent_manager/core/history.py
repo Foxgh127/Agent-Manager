@@ -84,8 +84,8 @@ def recommended_history_targets() -> list[dict]:
             candidates.append((label, _core.Path(value) / "Codex History"))
     candidates.extend(
         [
-            ("OneDrive", _core.Path.home() / "OneDrive" / "Codex History"),
-            ("本地文档", _core.Path.home() / "Documents" / "Codex History"),
+            ("OneDrive", _core.app_paths.user_home() / "OneDrive" / "Codex History"),
+            ("本地文档", _core.app_paths.user_home() / "Documents" / "Codex History"),
         ]
     )
     seen = set()

@@ -94,6 +94,18 @@ def test_official_config_removes_orphan_endpoint_absent_from_cards(official):
     assert config.get("model_provider", "openai") == "openai"
 
 
+def test_gateway_audit_keeps_official_oauth_separate_from_relay_adapters():
+    from agent_manager.gateway.service import routing_safety_audit
+
+    audit = routing_safety_audit()
+    assert audit["officialRoute"]["relayAdapter"] is False
+    assert audit["providerRoute"]["officialOAuthCredentials"] is False
+    assert audit["identityPolicy"]["activeModelProbe"] is False
+    assert audit["identityPolicy"]["syntheticUserIdentity"] is False
+    assert audit["identityPolicy"]["safetyIdentifier"] == "caller_supplied_passthrough"
+    assert audit["safetyBoundaries"]["replayAfterOutput"] is False
+
+
 def test_direct_official_route_check_rejects_custom_endpoint(official):
     _root, settings, _account, source = official
     assert not core._switch_runtime_model_matches(settings, tomllib.loads(orphan_config()), source, "openai")

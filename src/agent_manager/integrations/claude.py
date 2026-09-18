@@ -38,7 +38,7 @@ def _now_iso() -> str:
 
 
 def _local_app_data() -> Path:
-    return Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    return Path(os.environ.get("LOCALAPPDATA") or (core.app_paths.user_home() / "AppData" / "Local"))
 
 
 def _pick_claude_dir(threep: bool) -> Path:
@@ -636,7 +636,7 @@ def delete_profile(profile_id: str) -> dict:
 
 
 def preview_claude_code_import() -> dict:
-    path = Path.home() / ".claude" / "settings.json"
+    path = core.app_paths.user_home() / ".claude" / "settings.json"
     value = _json_object(path)
     env = value.get("env") if isinstance(value.get("env"), dict) else {}
     base_url = str(env.get("ANTHROPIC_BASE_URL") or "").strip()

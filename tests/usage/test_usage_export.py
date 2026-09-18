@@ -74,6 +74,23 @@ class UsageExportV8Tests(unittest.TestCase):
         self.assertNotIn("prompt", document["records"][0])
         self.assertNotIn("token", document["records"][0])
 
+    def test_export_keeps_bounded_route_evidence_without_raw_payload(self):
+        snapshot = {"accountAttribution": {"records": [{
+            "date": "2026-09-06", "accountId": "a", "requestedModel": "alias",
+            "routedModel": "gpt-6-astra", "actualModel": "gpt-5.6-luna",
+            "modelEvidence": "actual", "modelRoutingStatus": "mismatch",
+            "systemFingerprint": "fp_demo", "fingerprintEvidence": "response_body",
+            "requestCount": 1, "tokens": 3, "response": "must-not-export",
+        }]}}
+        _result, saved, _runtime = self.export(snapshot, {
+            "source": "accounts", "sourceFilter": "all", "model": "gpt-6-astra", "date": "all"
+        })
+        row = saved["document"]["records"][0]
+        self.assertEqual(row["actualModel"], "gpt-5.6-luna")
+        self.assertEqual(row["modelRoutingStatus"], "mismatch")
+        self.assertEqual(row["systemFingerprint"], "fp_demo")
+        self.assertNotIn("response", row)
+
     def test_account_and_provider_ids_do_not_collide(self):
         records = [
             {"date": "2026-09-06", "accountId": "same", "tokens": 1},

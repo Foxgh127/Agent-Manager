@@ -38,3 +38,39 @@ def test_legacy_aggregate_migrates_once_and_new_context_tiers_stay_separate(tmp_
     finally:
         if store.flush_timer:
             store.flush_timer.cancel()
+
+
+def test_usage_snapshot_exposes_actual_model_and_route_evidence(tmp_path):
+    store = gateway.UsageStatsStore(tmp_path / "usage.json")
+    store.record(
+        enrich_context(
+            {
+                "source": "account_pool",
+                "sourceKind": "account",
+                "accountId": "account-1",
+                "requestedModel": "alias",
+                "routedModel": "gpt-6-astra",
+            },
+            {"model": "gpt-6-astra", "system_fingerprint": "fp_a", "usage": {"input_tokens": 2, "output_tokens": 1}},
+        ),
+        {"inputTokens": 2, "outputTokens": 1, "totalTokens": 3},
+    )
+    store.record(
+        enrich_context(
+            {
+                "source": "account_pool",
+                "sourceKind": "account",
+                "accountId": "account-1",
+                "requestedModel": "alias",
+                "routedModel": "gpt-6-astra",
+            },
+            {"model": "gpt-5.6-luna", "system_fingerprint": "fp_b", "usage": {"input_tokens": 2, "output_tokens": 1}},
+        ),
+        {"inputTokens": 2, "outputTokens": 1, "totalTokens": 3},
+    )
+    snapshot = store.snapshot()
+    assert snapshot["byActualModel"]
+    assert snapshot["routingEvidence"]["consistentRequests"] == 1
+    assert snapshot["routingEvidence"]["mismatchRequests"] == 1
+    assert snapshot["routingEvidence"]["fingerprintedRequests"] == 2
+    assert snapshot["routingEvidence"]["fingerprintChanges"] == 1

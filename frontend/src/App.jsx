@@ -25,6 +25,7 @@ import { quotaIsCurrent } from "./quotaFreshness.js";
 import { contextBudget } from "./contextBudget.js";
 import { createConfirmationQueue } from "./confirmationQueue.js";
 import { usageSourceKey, usageSourceLabels, usageBackfillState } from "./usageViewModel.js";
+import { usageModelRouting, usageRoutingSummary } from "./usageRouting.js";
 import { applyDashboardMoveResult } from "./dashboardMove.js";
 import { normalizeUsageRange, resolveUsageRange, filterUsageRecordsByRange, usageRecordDateKey } from "./usageRange.js";
 import DiscreteSlider from "./components/DiscreteSlider.jsx";
@@ -10255,11 +10256,18 @@ function UsageView({ data, notify, confirm, embedded = false }) {
         classification === "explicit_main_agent" ? "mainAgent" : "unclassified");
     const timestamp = String(item.timestamp || item.lastSeenAt || item.createdAt || item.date || item.day || "");
     const timestampMs = Date.parse(timestamp);
+    const modelRouting = usageModelRouting(item);
     return {
       ...item,
       rowId: item.id || `${prefix}-${timestamp || "row"}-${index}`,
       account: sourceName(item),
-      model: item.model || item.modelName || item.routedModel || item.requestedModel || "未确定模型",
+      model: modelRouting.displayModel,
+      actualModel: modelRouting.actualModel,
+      modelRoutingStatus: modelRouting.status,
+      modelRoutingExpected: modelRouting.expectedModel,
+      modelMismatch: modelRouting.mismatch,
+      systemFingerprint: modelRouting.fingerprint,
+      fingerprintEvidence: modelRouting.fingerprintEvidence,
       timestamp,
       timestampMs: Number.isFinite(timestampMs) ? timestampMs : 0,
       date: usageRecordDateKey(item) || "未知日期",
@@ -10274,6 +10282,7 @@ function UsageView({ data, notify, confirm, embedded = false }) {
   const detailed = (recentRecords.length ? recentRecords : records)
     .map((item, index) => normalizeRecord(item, index, "detail"))
     .sort((left, right) => right.timestampMs - left.timestampMs);
+  const routingSummary = usageRoutingSummary(records);
   const accountDimension = effectiveUsageSource === "codex" ? "role" : "account";
   const dimensionLabel = (item) => accountDimension === "role"
     ? item.role === "mainAgent" ? "主代理" : item.role === "subagent" ? "子代理" : "未标记角色"
@@ -10419,6 +10428,8 @@ function UsageView({ data, notify, confirm, embedded = false }) {
           <span>角色可识别 <b>{totals.requests ? `${(((totals.requests - visible.filter((item) => item.role === "unclassified").reduce((sum, item) => sum + item.requests, 0)) / totals.requests) * 100).toFixed(1)}%` : "—"}</b></span>
           <span>缓存写入 <b>{usagePayload?.coverage?.cacheWriteAvailable === false ? "当前 Codex 日志未提供" : formatTokenCount(totals.cacheWrite)}</b></span>
         </div>
+        {routingSummary.mismatchRequests > 0 && <p className="usage-routing-warning" role="status"><AlertTriangle size={14} /><span>发现 {formatTokenCount(routingSummary.mismatchRequests)} 个请求的响应模型与配置路由不一致；实际模型仅依据响应元数据记录，不能单独证明“降智”。</span></p>}
+        {!routingSummary.mismatchRequests && routingSummary.fingerprintChanges > 0 && <p className="usage-routing-warning" role="status"><AlertTriangle size={14} /><span>响应系统指纹出现 {formatTokenCount(routingSummary.fingerprintChanges)} 次变体；这只是基础设施元数据变化，不能单独证明“降智”。</span></p>}
         <div className="usage-filters" aria-label="用量筛选">
           <label><span>{effectiveUsageSource === "codex" ? "代理角色" : "账号 / API 来源"}</span><select value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}><option value="all">全部{effectiveUsageSource === "codex" ? "角色" : "账号"}</option>{accounts.map((item) => <option key={item} value={item}>{accountLabels.get(item)}</option>)}</select></label>
           <label><span>模型</span><select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}><option value="all">全部模型</option>{models.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
@@ -10445,8 +10456,8 @@ function UsageView({ data, notify, confirm, embedded = false }) {
         <div className="usage-table-wrap">
           <table className="usage-table">
             <thead><tr><th>时间（最新在上）</th><th>{effectiveUsageSource === "codex" ? "日志来源" : "实际消耗账号"}</th><th>模型</th><th>角色</th><th>请求</th><th>输入</th><th>缓存读取</th><th>输出</th><th>推理</th><th>合计</th></tr></thead>
-            <tbody>{pagedDetails.map((item) => <tr key={item.rowId} className={cx(item.uncertain && "uncertain", item.role === "mainAgent" && "main-agent-row", item.role === "subagent" && "subagent-row")}>
-              <td>{item.timestamp.length > 10 ? formatDateTime(item.timestamp) : item.date}</td><td><strong>{item.account}</strong></td><td><code>{item.model}</code></td><td>{item.role === "mainAgent" ? <span className="agent-role-badge main"><Bot size={12} />主代理</span> : item.role === "subagent" ? <span className="agent-role-badge sub"><Route size={12} />子代理</span> : <span className="uncertain-tag">未标记</span>}</td><td>{formatTokenCount(item.requests)}</td><td>{formatTokenCount(item.inputTokens ?? item.input_tokens)}</td><td>{formatTokenCount(item.cachedInputTokens ?? item.cached_input_tokens ?? item.cachedTokens ?? item.cached_tokens)}</td><td>{formatTokenCount(item.outputTokens ?? item.output_tokens)}</td><td>{formatTokenCount(item.reasoningOutputTokens ?? item.reasoning_output_tokens ?? item.reasoningTokens)}</td><td><b>{formatTokenCount(item.tokens)}</b></td>
+            <tbody>{pagedDetails.map((item) => <tr key={item.rowId} className={cx(item.uncertain && "uncertain", item.modelMismatch && "model-routing-mismatch", item.role === "mainAgent" && "main-agent-row", item.role === "subagent" && "subagent-row")}>
+              <td>{item.timestamp.length > 10 ? formatDateTime(item.timestamp) : item.date}</td><td><strong>{item.account}</strong></td><td><div className="usage-model-cell"><code>{item.model}</code>{item.modelMismatch && <span className="model-routing-issue" title={item.systemFingerprint ? `服务指纹：${item.systemFingerprint}` : "响应元数据与配置路由不一致"}><AlertTriangle size={12} />实际：{item.actualModel || "未知"}</span>}</div></td><td>{item.role === "mainAgent" ? <span className="agent-role-badge main"><Bot size={12} />主代理</span> : item.role === "subagent" ? <span className="agent-role-badge sub"><Route size={12} />子代理</span> : <span className="uncertain-tag">未标记</span>}</td><td>{formatTokenCount(item.requests)}</td><td>{formatTokenCount(item.inputTokens ?? item.input_tokens)}</td><td>{formatTokenCount(item.cachedInputTokens ?? item.cached_input_tokens ?? item.cachedTokens ?? item.cached_tokens)}</td><td>{formatTokenCount(item.outputTokens ?? item.output_tokens)}</td><td>{formatTokenCount(item.reasoningOutputTokens ?? item.reasoning_output_tokens ?? item.reasoningTokens)}</td><td><b>{formatTokenCount(item.tokens)}</b></td>
             </tr>)}</tbody>
           </table>
           {!visibleDetails.length && <div className="table-empty">当前筛选条件没有可显示记录。</div>}
@@ -10609,6 +10620,16 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
     : configurationPending || data.status?.fullyApplied !== false;
   const healthy = !configurationPending && Boolean(checkItems.length) && !issues.length && configurationHealthy;
   const checked = Boolean(checkItems.length) || !configurationHealthy;
+  const storageDiagnostics = data.storageDiagnostics || {};
+  const codexStorage = storageDiagnostics.codexHome || {};
+  const stateStorage = storageDiagnostics.stateDirectory || {};
+  const storageIssue = Boolean(
+    codexStorage.protectedLocation || stateStorage.protectedLocation ||
+    (codexStorage.exists && !codexStorage.writable) ||
+    (stateStorage.exists && !stateStorage.writable) ||
+    (!codexStorage.exists && codexStorage.parentWritable === false) ||
+    (!stateStorage.exists && stateStorage.parentWritable === false),
+  );
   const modelCount = data.settings.modelWorkspace.mode === "aggregate"
     ? data.selectedModelKeys.length
     : data.modelSources
@@ -10701,6 +10722,7 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
         <button className="button secondary compact" onClick={() => load(true)} disabled={actionsDisabled}><RefreshCw className={loading ? "spin" : ""} size={14} />{loading ? "刷新中" : "刷新状态"}</button>
       </header>
       {error && <div className="inline-notice warning"><AlertTriangle size={16} /><span>{error}</span></div>}
+      {storageIssue && <div className="inline-notice warning"><AlertTriangle size={16} /><span>本地数据路径可能无法写入或位于受保护目录。请优先使用当前用户的 CODEX_HOME；管理员启动不会自动修复用户配置切换。</span></div>}
       {configurationPending && <div className="inline-notice"><Loader2 className="spin" size={16} /><span>正在激活临时配置，完成后自动核对同步状态。</span></div>}
       {checks?.stale && <div className="inline-notice"><Clock3 size={16} /><span>完整诊断缓存已过期；生成配置已重新核对，可点击“刷新状态”更新其他检查。</span></div>}
       <div className="update-grid">

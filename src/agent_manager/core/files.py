@@ -372,7 +372,7 @@ def _windows_downloads_directory() -> _core.Path | None:
 
 
 def user_downloads_directory() -> _core.Path:
-    directory = _core._windows_downloads_directory() or (_core.Path.home() / "Downloads")
+    directory = _core._windows_downloads_directory() or (_core.app_paths.user_home() / "Downloads")
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:

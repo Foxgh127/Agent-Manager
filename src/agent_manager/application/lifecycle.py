@@ -416,7 +416,7 @@ def _manager_restart_command(token: str) -> tuple[list[str], _app.Path]:
         # Use the ``--option=value`` form so a URL-safe token that happens to
         # begin with '-' can never be parsed as another command-line option.
         return [str(target), f"--quick-restart-token={token}"], target.parent
-    return [_app.sys.executable, "-m", "agent_manager", f"--quick-restart-token={token}"], _app.app_paths.development_root() or _app.Path.home()
+    return [_app.sys.executable, "-m", "agent_manager", f"--quick-restart-token={token}"], _app.app_paths.development_root() or _app.app_paths.user_home()
 
 
 

@@ -10,6 +10,45 @@ def test_custom_codex_home_does_not_depend_on_working_directory(tmp_path,monkeyp
     monkeypatch.chdir(b);second=paths.codex_home({'CODEX_HOME':'custom codex'},home)
     assert first==second==(home/'custom codex').resolve()
     assert paths.codex_home({},home)==(home/'.codex').resolve()
+    assert paths.codex_home({'CODEX_HOME': '~\\portable'}, home) == (home / 'portable').resolve()
+
+
+def test_elevated_launch_prefers_inherited_user_profile_and_expands_override(tmp_path):
+    profile = tmp_path / "用户 profile"
+    profile.mkdir()
+    values = {
+        "USERPROFILE": str(profile),
+        "HOME": str(tmp_path / "admin-profile"),
+        "CODEX_HOME": "%USERPROFILE%\\Codex Data",
+    }
+    # expandvars follows the process environment, so provide the same value
+    # through a temporary environment-independent form as well.
+    with patch.dict(paths.os.environ, {"USERPROFILE": str(profile)}, clear=False):
+        result = paths.codex_home(values)
+    assert result == (profile / "Codex Data").resolve()
+
+
+def test_profile_environment_keys_are_case_insensitive(tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    assert paths.user_home({"userprofile": str(profile)}) == profile.resolve()
+    assert paths.codex_home({"codex_home": "portable", "userprofile": str(profile)}) == (profile / "portable").resolve()
+
+
+def test_data_path_diagnostics_are_non_destructive_and_flag_protected_locations(tmp_path):
+    codex = tmp_path / "codex"
+    state = codex / "agent-manager"
+    codex.mkdir()
+    state.mkdir()
+    result = paths.data_path_diagnostics(codex, state, {"USERPROFILE": str(tmp_path)})
+    assert result["writeProbePerformed"] is False
+    assert result["codexHome"]["writable"] is True
+    assert result["stateDirectory"]["writable"] is True
+    missing = paths.data_path_diagnostics(codex, codex / "new-state", {"USERPROFILE": str(tmp_path)})
+    assert missing["stateDirectory"]["exists"] is False
+    assert missing["stateDirectory"]["parentWritable"] is True
+    protected = paths.data_path_diagnostics(tmp_path / "Program Files" / "Codex", state, {})
+    assert protected["codexHome"]["protectedLocation"] is True
 
 
 def test_frozen_resources_use_bundle_not_executable_or_cwd(tmp_path,monkeypatch):

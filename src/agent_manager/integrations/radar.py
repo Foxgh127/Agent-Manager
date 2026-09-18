@@ -36,6 +36,7 @@ from urllib.parse import urlencode, urlparse
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from zoneinfo import ZoneInfo
+from agent_manager import paths as app_paths
 from . import radar_monitor as monitor_engine
 
 
@@ -272,7 +273,7 @@ def _decode_json(raw: bytes | str, *, label: str, max_bytes: int = MAX_PUBLIC_BY
 
 
 def _default_cache_path() -> Path:
-    root = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    root = app_paths.codex_home()
     return root / "agent-manager" / "radar-cache.json"
 
 

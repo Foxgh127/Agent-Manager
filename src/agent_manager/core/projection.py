@@ -197,6 +197,10 @@ def public_state() -> dict:
         "codexVersion": _core.codex_version(allow_probe=False),
         "codexHome": str(_core.CODEX_HOME),
         "configPath": str(_core.CONFIG_FILE),
+        "storageDiagnostics": _core.app_paths.data_path_diagnostics(
+            _core.CODEX_HOME,
+            _core.STATE_DIR,
+        ),
         "status": _core.configuration_status(settings),
         "auth": connections["auth"],
         # History has its own on-demand endpoint; no dashboard consumes this
