@@ -7,6 +7,7 @@ The failing assertions describe required behavior, not guessed desktop state.
 from __future__ import annotations
 
 import json
+import base64
 import sqlite3
 import subprocess
 import tomllib
@@ -140,17 +141,51 @@ def test_official_readiness_cannot_accept_identity_and_model_on_orphan_route(off
         core.wait_for_codex_runtime_ready(account["email"], MODEL, timeout_seconds=1)
 
 
-def test_windows_app_activation_forwards_the_same_codex_home_as_probe(official, monkeypatch):
+def test_windows_app_activation_uses_package_identity_for_custom_home(official, monkeypatch):
     root, _settings, _account, _source = official
+    executable = root / "app" / "ChatGPT.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic executable")
     launch = Mock(return_value=subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(core.subprocess, "run", launch)
     monkeypatch.setattr(core, "_codex_launch_process_observation", lambda: ([{"pid": 123}], None))
     monkeypatch.setattr(core.shutil, "which", lambda _name: "explorer.exe")
     monkeypatch.setenv("CODEX_HOME", str(root / "different-inherited-home"))
-    core.launch_codex_app(launch_plan={"strategy": "windows_app", "appUserModelId": "OpenAI.Codex_test!App"})
-    assert launch.call_args.kwargs.get("env", {}).get("CODEX_HOME") == str(root), (
-        "Primary AppUserModelId activation drops the constructed environment; its home is not bound to the probe"
+    package_launch = Mock(return_value=(True, "package_identity"))
+    monkeypatch.setattr(core, "_launch_codex_via_package_identity", package_launch)
+    result = core.launch_codex_app(launch_plan={
+        "strategy": "windows_app",
+        "appUserModelId": "OpenAI.Codex_test!App",
+        "executable": str(executable),
+        "officialAccountId": "official-a",
+    })
+    package_launch.assert_called_once()
+    assert result["launchMethod"] == "package_identity"
+    assert launch.call_count == 0
+
+
+def test_package_identity_launch_preserves_custom_home_inside_store_package(official, monkeypatch):
+    root, _settings, _account, _source = official
+    executable = root / "app" / "ChatGPT.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic executable")
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(core.subprocess, "run", run)
+    ok, method = core._launch_codex_via_package_identity(
+        {
+            "appUserModelId": "OpenAI.Codex_test!App",
+            "executable": str(executable),
+            "officialAccountId": "official-a",
+        },
+        {"CODEX_HOME": str(root)},
     )
+    assert ok
+    assert method == "package_identity"
+    command = run.call_args.args[0][-1]
+    assert "Invoke-CommandInDesktopPackage" in command
+    encoded = command.split("-EncodedCommand ", 1)[1].split("'", 1)[0]
+    inner = base64.b64decode(encoded).decode("utf-16le")
+    assert f"$env:CODEX_HOME='{root}'" in inner
 
 
 def test_live_selection_does_recognize_orphan_root_endpoint_as_external(official):
@@ -229,23 +264,88 @@ def test_official_runtime_environment_is_child_only_and_cannot_be_re_overridden(
     assert core._codex_runtime_environment(official=False)["CODEX_ACCESS_TOKEN"] == "synthetic-old-credential"
 
 
-def test_official_windows_launch_uses_executable_with_clean_environment(official, monkeypatch):
+def test_official_windows_launch_uses_package_identity_with_clean_environment(official, monkeypatch):
     root, _settings, account, _source = official
     executable = root / "ChatGPT.exe"
     executable.write_bytes(b"synthetic executable, never run")
     monkeypatch.setenv("CODEX_ACCESS_TOKEN", "fixture-old-token")
-    child = Mock(pid=123)
-    popen = Mock(return_value=child)
-    monkeypatch.setattr(core.subprocess, "Popen", popen)
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    monkeypatch.setattr(core.subprocess, "run", run)
     monkeypatch.setattr(core, "_codex_launch_process_observation", lambda: ([{"pid": 123}], None))
+    package_launch = Mock(return_value=(True, "package_identity"))
+    monkeypatch.setattr(core, "_launch_codex_via_package_identity", package_launch)
     result = core.launch_codex_app(launch_plan={
         "strategy": "windows_app", "appUserModelId": "OpenAI.Codex_test!App",
         "executable": str(executable), "officialAccountId": account["id"],
     })
-    assert result["strategy"] == "desktop_executable"
-    assert popen.call_args.args[0] == [str(executable)]
-    assert popen.call_args.kwargs["env"]["CODEX_HOME"] == str(root)
-    assert "CODEX_ACCESS_TOKEN" not in popen.call_args.kwargs["env"]
+    package_launch.assert_called_once()
+    assert result["strategy"] == "windows_app"
+    assert result["launchMethod"] == "package_identity"
+    child_env = package_launch.call_args.args[1]
+    assert child_env["CODEX_HOME"] == str(root)
+    assert "CODEX_ACCESS_TOKEN" not in child_env
+    run.assert_not_called()
+
+
+def test_store_launch_does_not_persist_official_auth_overrides(official, monkeypatch):
+    root, _settings, account, _source = official
+    executable = root / "ChatGPT.exe"
+    executable.write_bytes(b"synthetic executable, never run")
+    package_launch = Mock(return_value=(True, "package_identity"))
+    sync_environment = Mock()
+    monkeypatch.setattr(core, "_launch_codex_via_package_identity", package_launch)
+    monkeypatch.setattr(core, "_sync_user_environment", sync_environment)
+    monkeypatch.setattr(core, "_codex_launch_process_observation", lambda: ([{"pid": 123}], None))
+
+    core.launch_codex_app(
+        env_overrides={
+            "CODEX_ACCESS_TOKEN": "must-not-persist",
+            "SAFE_PROVIDER_TOKEN": "allowed-provider-value",
+            "CODEX_HOME": "must-not-persist-home",
+        },
+        launch_plan={
+            "strategy": "windows_app",
+            "appUserModelId": "OpenAI.Codex_test!App",
+            "executable": str(executable),
+            "officialAccountId": account["id"],
+        },
+    )
+
+    assert [call.args for call in sync_environment.call_args_list] == [
+        ("SAFE_PROVIDER_TOKEN", "allowed-provider-value"),
+    ]
+
+
+def test_store_path_reported_as_desktop_is_re_resolved_before_any_direct_spawn(official, monkeypatch):
+    root, _settings, account, _source = official
+    old_path = root / "WindowsApps" / "OpenAI.Codex_old" / "ChatGPT.exe"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(b"protected store executable")
+    refreshed = root / "WindowsApps" / "OpenAI.Codex_current" / "ChatGPT.exe"
+    refreshed.parent.mkdir(parents=True)
+    refreshed.write_bytes(b"protected store executable")
+    monkeypatch.setattr(core.os, "name", "nt")
+    monkeypatch.setattr(core, "_detect_codex_windows_app", lambda force=False: {
+        "appUserModelId": "OpenAI.Codex_test!App",
+        "executable": str(refreshed),
+        "package": "OpenAI.Codex_test_1.0.0.0_x64__test",
+    })
+    package_launch = Mock(return_value=(True, "package_identity"))
+    monkeypatch.setattr(core, "_launch_codex_via_package_identity", package_launch)
+    monkeypatch.setattr(core, "_codex_launch_process_observation", lambda: ([{"pid": 42}], None))
+    popen = Mock()
+    monkeypatch.setattr(core.subprocess, "Popen", popen)
+
+    result = core.launch_codex_app(launch_plan={
+        "strategy": "desktop_executable",
+        "executable": str(old_path),
+        "officialAccountId": account["id"],
+    })
+
+    assert result["strategy"] == "windows_app"
+    assert result["launchMethod"] == "package_identity"
+    assert package_launch.call_args.args[0]["executable"] == str(refreshed)
+    popen.assert_not_called()
 
 
 def test_probe_prefers_selected_desktop_runtime_over_path(official, monkeypatch):
@@ -256,7 +356,35 @@ def test_probe_prefers_selected_desktop_runtime_over_path(official, monkeypatch)
     runtime.parent.mkdir()
     runtime.write_bytes(b"synthetic")
     monkeypatch.setattr(core, "codex_prefix", lambda: pytest.fail("Unrelated PATH CLI must not win"))
-    assert core._codex_launch_probe_prefix({"executable": str(desktop)}) == [str(runtime)]
+    assert core._codex_launch_probe_prefix({
+        "executable": str(desktop),
+        "appServerExecutable": str(desktop.parent / "resources" / "codex.exe"),
+    }) == [str(runtime)]
+
+
+def test_probe_avoids_store_sibling_when_native_runtime_is_available(official, monkeypatch):
+    root, _settings, _account, _source = official
+    desktop = root / "WindowsApps" / "ChatGPT.exe"
+    desktop.parent.mkdir(parents=True)
+    desktop.write_bytes(b"synthetic")
+    runtime = root / "runtime" / "codex.exe"
+    runtime.parent.mkdir()
+    runtime.write_bytes(b"synthetic")
+    monkeypatch.setattr(core, "codex_prefix", lambda: [str(runtime)])
+    assert core._codex_launch_probe_prefix({
+        "executable": str(desktop),
+        "appServerExecutable": str(desktop.parent / "resources" / "codex.exe"),
+    }) == [str(runtime)]
+
+
+def test_probe_never_returns_a_protected_cli_without_desktop_plan(official, monkeypatch):
+    root, _settings, _account, _source = official
+    protected = root / "WindowsApps" / "OpenAI.Codex" / "resources" / "codex.exe"
+    protected.parent.mkdir(parents=True)
+    protected.write_bytes(b"protected")
+    monkeypatch.setattr(core, "codex_prefix", lambda: [str(protected)])
+    with pytest.raises(core.ManagerError, match="受保护的 WindowsApps"):
+        core._codex_launch_probe_prefix(None)
 
 
 @pytest.mark.parametrize("override", [{"model_provider": "orphan-relay"},
@@ -319,6 +447,104 @@ def test_app_server_transport_uses_bound_runtime_and_clean_official_environment(
     with pytest.raises(core.ManagerError, match="synthetic spawn checkpoint"):
         APP_SERVER_REQUESTS([("account/read", {})],
             launch_plan={"officialAccountId": account["id"], "appServerExecutable": str(runtime)})
+
+
+def test_app_server_probe_falls_back_after_windows_access_denied(official, monkeypatch):
+    root, _settings, account, _source = official
+    primary = root / "WindowsApps" / "resources" / "codex.exe"
+    fallback = root / "runtime" / "codex.exe"
+    primary.parent.mkdir(parents=True)
+    fallback.parent.mkdir(parents=True)
+    primary.write_bytes(b"primary")
+    fallback.write_bytes(b"fallback")
+
+    class _Stream:
+        def __init__(self, lines=()):
+            self.lines = list(lines)
+            self.writes = []
+
+        def write(self, value):
+            self.writes.append(value)
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+        def __iter__(self):
+            return iter(self.lines)
+
+    class _Process:
+        def __init__(self):
+            self.stdin = _Stream()
+            self.stdout = _Stream([
+                '{"id":1,"result":{}}\n',
+                '{"id":2,"result":{"account":{"email":"official-a@example.invalid"}}}\n',
+            ])
+            self.stderr = _Stream()
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+    calls = []
+
+    def spawn(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            error = PermissionError(13, "access denied")
+            error.winerror = 5
+            raise error
+        return _Process()
+
+    monkeypatch.setattr(core, "_codex_launch_probe_prefix", lambda _plan: [str(primary)])
+    monkeypatch.setattr(core, "codex_prefix", lambda: [str(fallback)])
+    monkeypatch.setattr(core.subprocess, "Popen", spawn)
+    result = APP_SERVER_REQUESTS(
+        [("account/read", {"refreshToken": False})],
+        launch_plan={"officialAccountId": account["id"], "appServerExecutable": str(primary)},
+    )
+    assert result[0]["account"]["email"] == account["email"]
+    assert calls == [
+        [str(primary), "app-server", "--listen", "stdio://"],
+        [str(fallback), "app-server", "--listen", "stdio://"],
+    ]
+
+
+def test_store_gui_fallback_never_spawns_a_protected_cli_workspace_path(official, monkeypatch):
+    root, _settings, _account, _source = official
+    executable = root / "WindowsApps" / "OpenAI.Codex" / "app" / "ChatGPT.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"protected gui")
+    protected_cli = root / "WindowsApps" / "OpenAI.Codex" / "app" / "resources" / "codex.exe"
+    protected_cli.parent.mkdir(parents=True)
+    protected_cli.write_bytes(b"protected cli")
+    monkeypatch.setattr(core, "CODEX_WINDOWS_APP_START_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(core, "CODEX_WINDOWS_APP_PRIMARY_WAIT_SECONDS", 0)
+    monkeypatch.setattr(core, "_recent_codex_workspace", lambda: root)
+    monkeypatch.setattr(core, "_codex_launch_process_observation", lambda: ([], None))
+    monkeypatch.setattr(core, "codex_prefix", lambda: [str(protected_cli)])
+    run = Mock(return_value=subprocess.CompletedProcess([], 1, "", ""))
+    popen = Mock()
+    monkeypatch.setattr(core.subprocess, "run", run)
+    monkeypatch.setattr(core.subprocess, "Popen", popen)
+
+    with pytest.raises(core.ManagerError, match="受保护的 WindowsApps"):
+        core.launch_codex_app(
+            command_prefix=[str(protected_cli)],
+            launch_plan={
+                "strategy": "windows_app",
+                "appUserModelId": "OpenAI.Codex_test!App",
+                "executable": str(executable),
+            },
+        )
+    popen.assert_not_called()
 
 
 @pytest.mark.parametrize("method", ["quota", "models"])

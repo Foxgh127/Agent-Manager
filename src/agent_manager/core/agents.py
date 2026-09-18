@@ -347,11 +347,26 @@ def _uses_codex_native_subagent_policy(settings: dict) -> bool:
     return strategy_id == "verification_first"
 
 
+def _uses_codex_disabled_subagent_policy(settings: dict) -> bool:
+    """Return true when the user explicitly disabled Codex multi-agent tools."""
+
+    routing = settings.get("subagentRouting", {})
+    strategy_id = str(
+        routing.get("strategyId") or settings.get("activeStrategyId") or ""
+        if isinstance(routing, dict)
+        else settings.get("activeStrategyId") or ""
+    )
+    return strategy_id == "disabled"
+
+
 
 def _managed_subagent_mode_hint(settings: dict) -> str | None:
     """Return the Manager policy that replaces Codex's effort-derived V2 hint."""
 
-    if _core._uses_codex_native_subagent_policy(settings):
+    if (
+        _core._uses_codex_native_subagent_policy(settings)
+        or _core._uses_codex_disabled_subagent_policy(settings)
+    ):
         return None
     match = _core.re.search(r"(\d+)\.(\d+)\.(\d+)", _core.codex_version())
     if not match or tuple(int(part) for part in match.groups()) < (0, 153, 0):

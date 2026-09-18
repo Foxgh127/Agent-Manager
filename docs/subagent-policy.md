@@ -16,7 +16,7 @@ Codex catalog 的 `display_name` 使用原生模型 ID，例如 `gpt-6-astra`。
 
 Codex 在运行开始时加载说明。已开始的任务不应被假定会立即采用刚编辑的内容；必要时在保存同步后开启新任务验证。不要用完整生成说明替换应用中的策略正文，否则会重复嵌套规则。
 
-调度策略由三部分生成：调用协议、所选策略正文、生命周期及有序路由。`OPTIMAL_ADAPTIVE_INSTRUCTIONS` 是自动模式的应用内置正文；`SUBAGENT_LIFECYCLE_SAFETY` 负责统一生命周期；`_render_managed_agent()` 给 worker 输出契约。Codex V2 mode hint 接收策略正文，完整的调用协议、生命周期和实际路由同时写入管理块。
+调度策略由三部分生成：调用协议、所选策略正文、生命周期及有序路由。`OPTIMAL_ADAPTIVE_INSTRUCTIONS` 是自动模式的应用内置正文；`SUBAGENT_LIFECYCLE_SAFETY` 负责统一生命周期；`_render_managed_agent()` 给 worker 输出契约。Codex V2 mode hint 接收策略正文，完整的调用协议、生命周期和实际路由同时写入管理块。`verification_first`（界面名称“Codex 原生模式”）只释放管理器接管权；需要禁止 Codex 自己创建子代理时使用 `disabled`（界面名称“单代理模式”），它同步 `[agents].enabled = false` 并保留可恢复的基线。
 
 | 阶段 | 执行要求 | 验收依据 |
 | --- | --- | --- |

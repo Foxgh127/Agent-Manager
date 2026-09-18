@@ -342,7 +342,10 @@ def wait_for_codex_runtime_ready(
             # A freshly launched App Server can report no account for a short
             # window while it loads the credential store.  That transient is
             # retryable; only an explicit, different identity is conclusive.
-            if expected and "并非刚切换" in last_error:
+            if (
+                (expected and "并非刚切换" in last_error)
+                or "无法启动 Codex App Server 探针" in last_error
+            ):
                 break
         except Exception as exc:
             last_error = _core._redact_sensitive_text(exc, limit=500)
@@ -602,7 +605,16 @@ def _rollback_failed_switch(
     try:
         _core._restore_switch_session_visibility(session_visibility)
     except Exception as exc:
-        rollback_errors.append(f"恢复历史对话标记：{_core._redact_sensitive_text(exc, limit=240)}")
+        visibility_error = _core._redact_sensitive_text(exc, limit=240)
+        if "恢复冲突" in visibility_error:
+            # The catalog/session repair deliberately refuses to overwrite a
+            # newer Codex update. Report that as preserved newer state rather
+            # than implying that conversation history was lost.
+            rollback_errors.append(
+                f"恢复历史对话标记：已保留后续更新（{visibility_error}）"
+            )
+        else:
+            rollback_errors.append(f"恢复历史对话标记：{visibility_error}")
     # A readiness timeout can mean either a still-running misconfigured
     # process or a process that crashed during startup.  Recover only in the
     # latter case, after restoring the transaction snapshot, and never retry a
@@ -618,6 +630,8 @@ def _rollback_failed_switch(
     if recovery_launch_error:
         rollback_errors.append(f"恢复后单次启动原 Codex：{recovery_launch_error}")
     if rollback_errors:
+        if all("已保留后续更新" in item for item in rollback_errors):
+            return f"；历史对话标记已保留后续更新：{'；'.join(rollback_errors)}"
         return f"；回滚回验异常：{'；'.join(rollback_errors)}"
     if not state_mutated:
         if launch_attempted:

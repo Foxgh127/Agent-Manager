@@ -135,6 +135,9 @@ def _initial_settings() -> dict:
         # It lets native mode restore a pre-existing user hint without claiming
         # ownership of the rest of [features.multi_agent_v2].
         "managedSubagentPolicy": None,
+        # Tracks only the [agents].enabled=false value written by the explicit
+        # single-agent mode, so another mode can restore a user's prior value.
+        "managedSubagentEnabledPolicy": None,
         "runtimeTuning": _core._default_runtime_tuning(),
         "appBehavior": _core._default_app_behavior(),
         "accounts": [],
@@ -498,9 +501,14 @@ def _migrate_settings(settings: dict) -> tuple[dict, bool]:
         normalized["subagentRouting"] = subagent_routing
     for key, value in _core._default_subagent_routing().items():
         subagent_routing.setdefault(key, _core.json.loads(_core.json.dumps(value)))
+    normalized.setdefault("managedSubagentPolicy", None)
     managed_subagent_policy = normalized.get("managedSubagentPolicy")
     if managed_subagent_policy is not None and not isinstance(managed_subagent_policy, dict):
         normalized["managedSubagentPolicy"] = None
+    normalized.setdefault("managedSubagentEnabledPolicy", None)
+    managed_subagent_enabled_policy = normalized.get("managedSubagentEnabledPolicy")
+    if managed_subagent_enabled_policy is not None and not isinstance(managed_subagent_enabled_policy, dict):
+        normalized["managedSubagentEnabledPolicy"] = None
     if str(subagent_routing.get("prompt") or "").strip() in {"", _core.PRE_V10_DEFAULT_CALL_STRATEGY_PROMPT}:
         subagent_routing["prompt"] = _core.DEFAULT_CALL_STRATEGY_PROMPT
     sub_routes = subagent_routing.setdefault("routes", {})

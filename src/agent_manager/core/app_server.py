@@ -11,17 +11,60 @@ def codex_app_server_requests(requests: list[tuple[str, dict]], timeout: int | f
             raise _core.ManagerError("Codex App Server 请求格式无效。")
     env = _core._codex_source_environment(launch_plan)
     flags = getattr(_core.subprocess, "CREATE_NO_WINDOW", 0) if _core.os.name == "nt" else 0
-    process = _core.subprocess.Popen(
-        _core._codex_launch_probe_prefix(launch_plan) + ["app-server", "--listen", "stdio://"],
-        stdin=_core.subprocess.PIPE,
-        stdout=_core.subprocess.PIPE,
-        stderr=_core.subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        creationflags=flags,
-    )
+    primary_prefix = _core._codex_launch_probe_prefix(launch_plan)
+    prefixes = [primary_prefix]
+    # Microsoft Store packages can launch their GUI through Explorer while
+    # denying a separately spawned copy of the bundled helper under
+    # WindowsApps (WinError 5).  Runtime selection filters that path up front;
+    # this remains a compatibility backstop for a stale plan or a runtime that
+    # disappears between discovery and process creation.  The native CLI uses
+    # the same isolated CODEX_HOME for its stdio App Server.
+    spawn_errors: list[tuple[list[str], OSError]] = []
+    process = None
+    for prefix in prefixes:
+        try:
+            process = _core.subprocess.Popen(
+                prefix + ["app-server", "--listen", "stdio://"],
+                stdin=_core.subprocess.PIPE,
+                stdout=_core.subprocess.PIPE,
+                stderr=_core.subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                creationflags=flags,
+            )
+            break
+        except OSError as exc:
+            spawn_errors.append((prefix, exc))
+            if not launch_plan or not isinstance(launch_plan, dict):
+                break
+            # Do not silently switch runtimes for ordinary failures.  Only
+            # Windows access/path errors get the compatibility fallback.
+            winerror = getattr(exc, "winerror", None)
+            if winerror not in {5, 2, 3} and getattr(exc, "errno", None) not in {2, 13}:
+                break
+            try:
+                fallback = _core.codex_prefix()
+            except Exception:
+                fallback = []
+            fallback_executable = _core.Path(str(fallback[0])) if fallback else None
+            if (
+                fallback
+                and fallback_executable is not None
+                and not _core._is_windows_store_path(fallback_executable)
+                and fallback != prefix
+                and fallback not in prefixes
+            ):
+                prefixes.append(fallback)
+    if process is None:
+        details = []
+        for prefix, exc in spawn_errors[-2:]:
+            executable = str(prefix[0]) if prefix else "<empty>"
+            details.append(f"{executable}: {exc}")
+        raise _core.ManagerError(
+            "无法启动 Codex App Server 探针：" + "；".join(details or ["未知启动错误"])
+        ) from (spawn_errors[-1][1] if spawn_errors else None)
     if process.stdin is None or process.stdout is None or process.stderr is None:
         process.kill()
         raise _core.ManagerError("无法连接 Codex App Server 标准输入输出。")

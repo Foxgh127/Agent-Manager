@@ -4108,12 +4108,11 @@ class AgentManagerTests(unittest.TestCase):
                 launch_plan={"strategy": "windows_app", "appUserModelId": "com.openai.codex"}
             )
 
-    def test_windows_direct_gui_fallback_never_uses_create_no_window(self):
+    def test_windows_store_success_never_direct_spawns_protected_executable(self):
         executable = self.root / "ChatGPT.exe"
         executable.write_bytes(b"gui")
         process = {"name": "ChatGPT.exe", "pid": "200", "parentPid": "9"}
         completed = subprocess.CompletedProcess([], 0, "", "")
-        fake_child = type("Child", (), {"pid": 200})()
         plan = {
             "strategy": "windows_app",
             "appUserModelId": "OpenAI.Codex_2p2nqsd0c76g0!App",
@@ -4123,14 +4122,13 @@ class AgentManagerTests(unittest.TestCase):
         with (
             patch.object(core, "CODEX_WINDOWS_APP_START_TIMEOUT_SECONDS", 0),
             patch.object(core.subprocess, "run", return_value=completed),
-            patch.object(core.subprocess, "Popen", return_value=fake_child) as popen,
+            patch.object(core.subprocess, "Popen") as popen,
             patch.object(core, "_detect_codex_windows_app", return_value=None),
             patch.object(core, "running_codex_processes", side_effect=[[], [process], [process]]),
         ):
-            result = core.launch_codex_app(launch_plan=plan)
-        flags = popen.call_args.kwargs["creationflags"]
-        self.assertEqual(flags & getattr(subprocess, "CREATE_NO_WINDOW", 0), 0)
-        self.assertEqual(result["launchMethod"], "current_appx_executable")
+            with self.assertRaisesRegex(core.ManagerError, "Windows App 启动失败"):
+                core.launch_codex_app(launch_plan=plan)
+        popen.assert_not_called()
 
     def test_windows_app_fallbacks_share_one_start_deadline(self):
         executable = self.root / "ChatGPT.exe"
@@ -4167,7 +4165,7 @@ class AgentManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(core.ManagerError, "Windows App 启动失败"):
                 core.launch_codex_app(command_prefix=["codex.exe"], launch_plan=plan)
         self.assertLessEqual(clock[0], 15.01)
-        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(popen.call_count, 0)
 
     def test_runtime_readiness_rejects_a_different_chatgpt_account(self):
         with patch.object(

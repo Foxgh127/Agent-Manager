@@ -124,6 +124,36 @@ class NativeSubagentPolicyTests(unittest.TestCase):
         self.assertNotIn("cam_simple_1", doc["agents"])
         self.assertNotIn("features", doc)
 
+    def test_single_agent_mode_disables_codex_tools_and_restores_user_value(self):
+        self.settings["subagentRouting"]["strategyId"] = "disabled"
+        original = (
+            "[agents]\n"
+            "enabled = true\n"
+            "max_depth = 9\n"
+            "\n"
+            "[agents.scout]\n"
+            "config_file = \"user-agent.toml\"\n"
+        )
+        journal = core._next_managed_subagent_enabled_policy(self.settings, original)
+        doc = tomlkit.parse(original)
+        core._apply_managed_subagent_enabled_policy(doc, self.settings)
+        self.assertFalse(doc["agents"]["enabled"])
+        self.assertEqual(doc["agents"]["max_depth"], 9)
+        self.assertIn("scout", doc["agents"])
+
+        self.settings["managedSubagentEnabledPolicy"] = journal
+        self.settings["subagentRouting"]["strategyId"] = "verification_first"
+        core._apply_managed_subagent_enabled_policy(doc, self.settings)
+        self.assertEqual(doc.unwrap(), tomlkit.parse(original).unwrap())
+
+    def test_single_agent_mode_does_not_emit_manager_routes_or_hint(self):
+        self.settings["subagentRouting"]["strategyId"] = "disabled"
+        self.assertEqual(core._managed_subagent_specs(self.settings), [])
+        self.assertEqual(core.build_routing_block(self.settings), "")
+        doc = tomlkit.parse(core.build_codex_config(self.settings))
+        self.assertFalse(doc["agents"]["enabled"])
+        self.assertFalse(doc["features"]["multi_agent"])
+
     def test_native_release_restores_feature_boolean_and_custom_user_hint(self):
         for original in (
             "[features]\nmulti_agent_v2=false\nother=true\n",

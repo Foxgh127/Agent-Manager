@@ -68,6 +68,10 @@ def _apply_configuration_locked(
     config_before = _core.read_toml_text(_core.CONFIG_FILE)
     agents_before = _core.AGENTS_FILE.read_text(encoding="utf-8") if _core.AGENTS_FILE.exists() else ""
     next_subagent_policy = _core._next_managed_subagent_policy(settings, config_before)
+    next_subagent_enabled_policy = _core._next_managed_subagent_enabled_policy(
+        settings,
+        config_before,
+    )
     backups = []
     written_agents = []
     removed_agents = []
@@ -144,6 +148,7 @@ def _apply_configuration_locked(
     )
     settings["managedAgentNames"] = [spec["name"] for spec in specs]
     settings["managedSubagentPolicy"] = next_subagent_policy
+    settings["managedSubagentEnabledPolicy"] = next_subagent_enabled_policy
     active_source_id = str(workspace.get("activeSourceId") or "")
     if active_source_id.startswith("provider:"):
         active_provider_id = active_source_id.split(":", 1)[1]

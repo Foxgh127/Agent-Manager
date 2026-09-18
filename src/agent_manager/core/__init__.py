@@ -459,10 +459,19 @@ DEFAULT_STRATEGIES = [
         # Keep the compatibility ID because it is persisted by released builds.
         # The policy now means "no Agent Manager override", not "disable Codex".
         "name": "Codex 原生模式",
-        "description": "不注册 Agent Manager 子代理，也不改写 Codex 自带的委派策略。",
+        "description": "不注册 Agent Manager 子代理；Codex 仍可按自身策略委派。",
         "instructions": (
             "Leave subagent availability and delegation behavior to Codex. Do not add an "
             "Agent Manager delegation policy, prohibition, role, or runtime override."
+        ),
+    },
+    {
+        "id": "disabled",
+        "name": "单代理模式",
+        "description": "关闭 Codex 多代理工具，只保留当前主代理。",
+        "instructions": (
+            "Do not create, call, or retry any subagent or child thread for this task. "
+            "Keep all planning, implementation, verification, and final integration in the primary agent."
         ),
     },
 ]
@@ -1053,7 +1062,10 @@ from .runtime import (
     _recent_codex_workspace,
     resolve_codex_launch_plan,
     _codex_runtime_environment,
+    _launch_codex_via_package_identity,
     _codex_launch_probe_prefix,
+    _is_windows_store_path,
+    _safe_cli_workspace_prefix,
     _codex_source_environment,
     launch_codex_app,
     run_codex_capture,
@@ -1152,6 +1164,7 @@ from .agents import (
     _active_main,
     _active_strategy,
     _uses_codex_native_subagent_policy,
+    _uses_codex_disabled_subagent_policy,
     _managed_subagent_mode_hint,
     _default_model_reasoning_effort,
     _effective_subagent_routing,
@@ -1175,6 +1188,11 @@ from .rendering import (
     _normalized_managed_subagent_policy,
     _apply_managed_subagent_mode_hint,
     _next_managed_subagent_policy,
+    _normalized_managed_subagent_enabled_policy,
+    _agents_enabled_state,
+    _feature_multi_agent_state,
+    _apply_managed_subagent_enabled_policy,
+    _next_managed_subagent_enabled_policy,
     build_codex_config,
     build_routing_block,
     build_agents_file,

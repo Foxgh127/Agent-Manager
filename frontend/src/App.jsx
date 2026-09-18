@@ -6919,6 +6919,8 @@ function OrchestrationView({
     selected.has(key),
   ).length;
   const parentSourceId = data.modelSources.find(source => source.active)?.id || workspace.activeSourceId;
+  const subagentDisabled = routing.strategyId === "disabled";
+  const codexNativeSubagents = routing.strategyId === "verification_first";
   const crossSourceSubagents = Object.values(routing.routes || {}).some(route =>
     (route.models || []).some(key => String(key).split("::", 1)[0] !== parentSourceId));
   const sharedSubagentGateway = mode === "aggregate" || data.settings.web2api?.activeForCodex || crossSourceSubagents;
@@ -7046,7 +7048,7 @@ function OrchestrationView({
       };
     });
   const chooseStrategy = (strategy) => {
-    if (strategy.id === "verification_first") setAdvanced(false);
+    if (strategy.id === "verification_first" || strategy.id === "disabled") setAdvanced(false);
     setRouting((current) => ({
       ...current,
       strategyId: strategy.id,
@@ -7066,7 +7068,7 @@ function OrchestrationView({
       tone: "info",
       eyebrow: "配置已经安全写入",
       title: "是否立即重启 Codex？",
-      message: "config.toml、主模型目录和子代理路由在重新启动 Codex 后会完整生效。",
+      message: "config.toml、主模型目录和子代理路由在重新启动 Codex 后会完整生效；已打开的任务不会重新读取提示词，需要新建任务。",
       detail: "选择“稍后自行重启”不会撤销保存；下次手动打开 Codex 时会自动应用新配置。",
       confirmLabel: "立即重启 Codex",
       cancelLabel: "稍后自行重启",
@@ -7200,7 +7202,11 @@ function OrchestrationView({
       const persistedRuntime = normalizeRuntimeTuning(applied.runtimeTuning);
       setRuntimeTuning(persistedRuntime);
       if (applied.document) hydrateCodexConfigDocument(applied.document, true);
-      notify(`已同步 ${selected.size} 个主模型和四级子代理路由到 Codex`);
+      notify(
+        subagentDisabled
+          ? `已同步 ${selected.size} 个主模型；Codex 多代理工具已关闭`
+          : `已同步 ${selected.size} 个主模型和四级子代理路由到 Codex`,
+      );
       if (applied.result.gatewayRequired && !data.web2apiStatus.running)
         notify("聚合服务已在后台启动");
       initialDraftRef.current = JSON.stringify({
@@ -7485,7 +7491,7 @@ function OrchestrationView({
           </button>
         </div>
       </div>
-      {runtimeStatus && runtimeStatus.available === false && (
+      {runtimeStatus && !subagentDisabled && runtimeStatus.available === false && (
         <div className="runtime-repair-banner" role="status">
           <AlertTriangle size={19} />
           <span>
@@ -7570,14 +7576,15 @@ function OrchestrationView({
             </span>
             <div>
               <h2>子代理设置</h2>
-              <p>策略决定何时调用；同级模型按顺序自动回退</p>
+              <p>收起高级设置只隐藏编辑项；要完全禁用请选择“单代理模式”</p>
             </div>
           </header>
-          {routing.strategyId !== "verification_first" && <div className={cx("subagent-runtime-note", sharedSubagentGateway && "gateway")}>
+          {!codexNativeSubagents && !subagentDisabled && <div className={cx("subagent-runtime-note", sharedSubagentGateway && "gateway")}>
             {sharedSubagentGateway ? <Route size={17} /> : <ShieldCheck size={17} />}
             <span><strong>{sharedSubagentGateway ? "共享本地路由" : "使用已配置的子代理路由"}</strong><small>{sharedSubagentGateway ? "主模型和子代理都通过本机统一入口请求，并各自绑定所选账号。配置变更后需重新载入 Codex。" : "各档主模型思考强度均加载此处的难度路由和策略提示词。"}</small></span>
           </div>}
-          {routing.strategyId === "verification_first" && <div className="subagent-runtime-note"><ShieldCheck size={17} /><span><strong>跟随 Codex 原生行为</strong><small>不接管子代理设置；是否调用、使用哪些原生子代理由 Codex 与当前模型决定。</small></span></div>}
+          {codexNativeSubagents && <div className="subagent-runtime-note"><ShieldCheck size={17} /><span><strong>跟随 Codex 原生行为</strong><small>不接管子代理设置；是否调用、使用哪些原生子代理由 Codex 与当前模型决定。</small></span></div>}
+          {subagentDisabled && <div className="subagent-runtime-note"><ShieldCheck size={17} /><span><strong>已关闭多代理工具</strong><small>会同步 Codex 官方的 agents.enabled=false；当前任务只保留主代理，不会创建或调用子智能体。</small></span></div>}
           <div className="strategy-picks">
             {data.settings.strategies.map((strategy) => (
               <button
@@ -7600,14 +7607,14 @@ function OrchestrationView({
             className={cx("advanced-toggle", advanced && "active")}
             onClick={() => setAdvanced(!advanced)}
             aria-expanded={advanced}
-            disabled={routing.strategyId === "verification_first"}
+            disabled={codexNativeSubagents || subagentDisabled}
           >
             <span>
               <Sparkles size={17} />
               <strong>高级设置</strong>
                   <small>
-                    {routing.strategyId === "verification_first"
-                      ? "原生模式不接管难度路由和调用提示词"
+                    {codexNativeSubagents || subagentDisabled
+                      ? subagentDisabled ? "单代理模式不接管难度路由和调用提示词" : "原生模式不接管难度路由和调用提示词"
                       : "难度路由、三级模型回退和调用提示词"}
                   </small>
             </span>
@@ -7682,6 +7689,8 @@ function OrchestrationView({
                 <ShieldCheck size={15} />
                 {routing.strategyId === "parallel_first"
                   ? "自定义提示词负责判断何时、调用哪个等级；Agent 注册与失败回退由软件生成。"
+                  : subagentDisabled
+                  ? "单代理模式会清理管理器生成的路由提示词，并关闭 Codex 多代理工具。"
                   : "当前模式使用经过优化的固定策略，避免无意义委派和重复消耗 Token；选择“自定义模式”后才可编辑。"}
                 Codex“说明”展示同步后的完整内容，因此篇幅不同，策略正文应保持一致。
               </p>

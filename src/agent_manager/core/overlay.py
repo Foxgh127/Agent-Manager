@@ -202,6 +202,10 @@ def _release_owned_subagent_hint(doc: object) -> None:
         _core._apply_managed_subagent_mode_hint(doc, {
             **saved, "subagentRouting": {"strategyId": "verification_first"},
         })
+    if isinstance(saved, dict) and saved.get("managedSubagentEnabledPolicy"):
+        _core._apply_managed_subagent_enabled_policy(doc, {
+            **saved, "subagentRouting": {"strategyId": "verification_first"},
+        })
 
 
 

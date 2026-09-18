@@ -4,7 +4,10 @@ from agent_manager import core as _core
 
 
 def _managed_subagent_specs(settings: dict) -> list[dict]:
-    if _core._uses_codex_native_subagent_policy(settings):
+    if (
+        _core._uses_codex_native_subagent_policy(settings)
+        or _core._uses_codex_disabled_subagent_policy(settings)
+    ):
         return []
     records = _core.gateway_model_records(settings)
     by_key = {item["key"]: item for item in records}
@@ -107,14 +110,17 @@ def subagent_runtime_summary(settings: dict) -> dict:
     specs = _core._managed_subagent_specs(settings)
     gateway = any(spec.get("routingMode") == "gateway" for spec in specs)
     codex_native = _core._uses_codex_native_subagent_policy(settings)
-    mode = "gateway" if gateway else "native" if specs or codex_native else "unconfigured"
+    disabled = _core._uses_codex_disabled_subagent_policy(settings)
+    mode = "disabled" if disabled else "gateway" if gateway else "native" if specs or codex_native else "unconfigured"
     return {
         "mode": mode, "roleCount": len(specs), "requiresSharedGateway": gateway,
         "providerInherited": True,
-        "policySource": "codex" if codex_native else "agent_manager",
+        "policySource": "disabled" if disabled else "codex" if codex_native else "agent_manager",
         "managed": bool(specs),
         "message": (
-            "跨账号子代理与主会话共享本地网关，配置变更后需要重新载入 Codex。"
+            "Codex 多代理工具已关闭；当前配置只允许主代理运行。"
+            if disabled
+            else "跨账号子代理与主会话共享本地网关，配置变更后需要重新载入 Codex。"
             if gateway
             else "子代理继承主会话 Provider，直接使用同一账号的原生模型。"
             if specs
@@ -502,6 +508,129 @@ def _next_managed_subagent_policy(settings: dict, original_config: str) -> dict 
     }
 
 
+def _normalized_managed_subagent_enabled_policy(value: object) -> dict | None:
+    if not isinstance(value, dict) or value.get("appliedEnabled") is not False:
+        return None
+    agents_present = bool(value.get("baselineAgentsPresent", value.get("baselinePresent")))
+    agents_enabled = value.get("baselineAgentsEnabled", value.get("baselineEnabled"))
+    feature_present = bool(value.get("baselineFeaturePresent", False))
+    feature_enabled = value.get("baselineFeatureEnabled")
+    if agents_present and not isinstance(agents_enabled, bool):
+        return None
+    if feature_present and not isinstance(feature_enabled, bool):
+        return None
+    return {
+        "appliedEnabled": False,
+        "baselineAgentsPresent": agents_present,
+        "baselineAgentsEnabled": agents_enabled if agents_present else None,
+        "baselineFeaturePresent": feature_present,
+        "baselineFeatureEnabled": feature_enabled if feature_present else None,
+    }
+
+
+def _agents_enabled_state(doc: object) -> tuple[bool, bool | None]:
+    agents = doc.get("agents") if hasattr(doc, "get") else None
+    if not hasattr(agents, "get") or "enabled" not in agents:
+        return False, None
+    value = agents.get("enabled")
+    return (True, value) if isinstance(value, bool) else (False, None)
+
+
+def _feature_multi_agent_state(doc: object) -> tuple[bool, bool | None]:
+    features = doc.get("features") if hasattr(doc, "get") else None
+    if not hasattr(features, "get") or "multi_agent" not in features:
+        return False, None
+    value = features.get("multi_agent")
+    return (True, value) if isinstance(value, bool) else (False, None)
+
+
+def _apply_managed_subagent_enabled_policy(doc: object, settings: dict) -> None:
+    """Disable all Codex subagent tools, or release only our owned flag."""
+
+    disabled = _core._uses_codex_disabled_subagent_policy(settings)
+    ownership = _core._normalized_managed_subagent_enabled_policy(
+        settings.get("managedSubagentEnabledPolicy")
+    )
+    if disabled:
+        agents = doc.get("agents") if hasattr(doc, "get") else None
+        if agents is None:
+            agents = _core.tomlkit.table()
+            doc["agents"] = agents
+        elif not hasattr(agents, "get"):
+            raise _core.ManagerError("Codex 配置中的 [agents] 不是有效表格。")
+        agents["enabled"] = False
+        features = doc.get("features") if hasattr(doc, "get") else None
+        if features is None:
+            features = _core.tomlkit.table()
+            doc["features"] = features
+        elif not hasattr(features, "get"):
+            raise _core.ManagerError("Codex 配置中的 [features] 不是有效表格。")
+        features["multi_agent"] = False
+        return
+    if not ownership:
+        return
+    agents_present, agents_enabled = _core._agents_enabled_state(doc)
+    if agents_present and agents_enabled is ownership["appliedEnabled"]:
+        agents = doc.get("agents")
+        if ownership["baselineAgentsPresent"]:
+            agents["enabled"] = ownership["baselineAgentsEnabled"]
+        else:
+            agents.pop("enabled", None)
+        if not agents:
+            doc.pop("agents", None)
+    feature_present, feature_enabled = _core._feature_multi_agent_state(doc)
+    if feature_present and feature_enabled is ownership["appliedEnabled"]:
+        features = doc.get("features")
+        if ownership["baselineFeaturePresent"]:
+            features["multi_agent"] = ownership["baselineFeatureEnabled"]
+        else:
+            features.pop("multi_agent", None)
+        if not features:
+            doc.pop("features", None)
+
+
+def _next_managed_subagent_enabled_policy(
+    settings: dict,
+    original_config: str,
+) -> dict | None:
+    """Remember the pre-disable value so leaving single-agent mode is lossless."""
+
+    if not _core._uses_codex_disabled_subagent_policy(settings):
+        return None
+    try:
+        original_doc = (
+            _core.tomlkit.parse(original_config)
+            if original_config.strip()
+            else _core.tomlkit.document()
+        )
+    except Exception:
+        return None
+    current_present, current_enabled = _core._agents_enabled_state(original_doc)
+    feature_present, feature_enabled = _core._feature_multi_agent_state(original_doc)
+    previous = _core._normalized_managed_subagent_enabled_policy(
+        settings.get("managedSubagentEnabledPolicy")
+    )
+    if previous and current_present and current_enabled is previous["appliedEnabled"]:
+        baseline_agents_present = previous["baselineAgentsPresent"]
+        baseline_agents_enabled = previous["baselineAgentsEnabled"]
+    else:
+        baseline_agents_present = current_present
+        baseline_agents_enabled = current_enabled if current_present else None
+    if previous and feature_present and feature_enabled is previous["appliedEnabled"]:
+        baseline_feature_present = previous["baselineFeaturePresent"]
+        baseline_feature_enabled = previous["baselineFeatureEnabled"]
+    else:
+        baseline_feature_present = feature_present
+        baseline_feature_enabled = feature_enabled if feature_present else None
+    return {
+        "appliedEnabled": False,
+        "baselineAgentsPresent": baseline_agents_present,
+        "baselineAgentsEnabled": baseline_agents_enabled,
+        "baselineFeaturePresent": baseline_feature_present,
+        "baselineFeatureEnabled": baseline_feature_enabled,
+    }
+
+
 
 def build_codex_config(settings: dict) -> str:
     original = _core.read_toml_text(_core.CONFIG_FILE)
@@ -576,6 +705,7 @@ def build_codex_config(settings: dict) -> str:
     # strategies supply their selected policy as a custom hint so automatic and
     # manual routing stay stable across efforts. Native mode releases that hint.
     _core._apply_managed_subagent_mode_hint(doc, settings)
+    _core._apply_managed_subagent_enabled_policy(doc, settings)
     if not provider_bridge_url and str(doc.get("openai_base_url") or "") in _core._managed_provider_base_urls(settings):
         doc.pop("openai_base_url", None)
     _core._apply_root_runtime_tuning(doc, runtime_tuning)
@@ -713,9 +843,12 @@ def build_routing_block(settings: dict) -> str:
     )
     specs = _core._managed_subagent_specs(settings)
     tuning = _core._normalize_runtime_tuning(settings.get("runtimeTuning"))
-    if _core._uses_codex_native_subagent_policy(settings):
-        # Absence is intentional: Codex can apply its own effort-derived
-        # policy, including native proactive behavior at Ultra.
+    if (
+        _core._uses_codex_native_subagent_policy(settings)
+        or _core._uses_codex_disabled_subagent_policy(settings)
+    ):
+        # Absence is intentional: native mode leaves Codex's effort-derived
+        # policy alone, while single-agent mode enforces the config switch.
         return ""
     lines = [
         _core.MANAGED_BLOCK_START,
@@ -803,7 +936,11 @@ def build_agents_file(settings: dict) -> str:
         _core.re.escape(_core.MANAGED_BLOCK_START) + r".*?" + _core.re.escape(_core.MANAGED_BLOCK_END) + r"\s*",
         _core.re.DOTALL,
     )
-    if _core._uses_codex_native_subagent_policy(settings) and not pattern.search(original) and _core.LEGACY_AGENTS_TEXT not in original:
+    unmanaged = (
+        _core._uses_codex_native_subagent_policy(settings)
+        or _core._uses_codex_disabled_subagent_policy(settings)
+    )
+    if unmanaged and not pattern.search(original) and _core.LEGACY_AGENTS_TEXT not in original:
         return original
     base = pattern.sub("", original).strip()
     if _core.LEGACY_AGENTS_TEXT in base:
