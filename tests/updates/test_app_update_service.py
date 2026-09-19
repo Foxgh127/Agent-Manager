@@ -355,6 +355,15 @@ def test_oversized_metadata_stops_before_parsing(service):
     assert instance.check()["errorCode"] == "metadata_too_large"
 
 
+def test_manifest_release_notes_must_be_plain_text(service):
+    instance, fetcher = service
+    fetcher.metadata["releaseNotes"] = {"value": "provider metadata must not be accepted"}
+    instance.configure(SOURCE)
+    status = instance.check()
+    assert status["state"] == "check_failed"
+    assert status["errorCode"] == "invalid_manifest"
+
+
 @pytest.mark.parametrize("proxy,code", [("http://user:secret@127.0.0.1:7890", "proxy_auth_unsupported"),
     ("socks5://127.0.0.1:7890", "proxy_scheme_unsupported"), ("https://127.0.0.1:7890", "proxy_scheme_unsupported")])
 def test_proxy_auth_and_unsupported_schemes_are_explicitly_rejected(monkeypatch, proxy, code):

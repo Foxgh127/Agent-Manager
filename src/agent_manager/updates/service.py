@@ -632,6 +632,10 @@ class AppUpdateService:
         else:
             hosts = {_url(source["url"])[1], *source["allowedAssetHosts"]}
             _url(raw.get("url"), hosts)
+        if notes is not None and not isinstance(notes, str):
+            raise UpdateError("更新说明字段无效。", "invalid_manifest")
+        if published is not None and not isinstance(published, str):
+            raise UpdateError("发布时间字段无效。", "invalid_manifest")
         return {"version": version, "name": name, "size": size, "sha256": digest.lower(),
                 "url": raw["url"], "allowedHosts": sorted(hosts), "publishedAt": str(published or "")[:80],
                 "releaseNotes": str(notes or "")[:12000]}

@@ -68,18 +68,22 @@ $bodyPath = Join-Path $publishStage "release-notes.md"
 if ($NotesFile) {
     & python (Join-Path $publishProject 'scripts/release_notes.py') --version $publishVersion --input $NotesFile --output $bodyPath
     if ($LASTEXITCODE -ne 0) { throw 'Release notes do not match the requested version.' }
-    $notes = Get-Content -LiteralPath $bodyPath -Raw -Encoding UTF8
-} else { $notes = "Agent Manager $publishVersion" }
+} else {
+    [IO.File]::WriteAllText($bodyPath, "Agent Manager $publishVersion", $utf8)
+}
 $assetSize = (Get-Item -LiteralPath $assetPath).Length
-$releaseManifest = @{schemaVersion=1; appId="openai-agent-manager"; version=$publishVersion; channel="stable"; releaseEpoch=$releaseEpoch;
-    publishedAt=[DateTime]::UtcNow.ToString("o"); releaseNotes=$notes;
-    assets=@(@{platform="windows-x64"; name=$assetName; url="https://github.com/$Repository/releases/download/$publishTag/$assetName"; size=$assetSize; sha256=$expectedHash})}
 $jsonPath = Join-Path $publishStage "app-update-manifest.json"
 $shaPath = Join-Path $publishStage "SHA256.txt"
 $bodyPath = Join-Path $publishStage "release-notes.md"
-[IO.File]::WriteAllText($jsonPath, ($releaseManifest | ConvertTo-Json -Depth 5) + "`n", $utf8)
+[string]$manifestNotesPath = $bodyPath
+& python (Join-Path $publishProject "scripts/prepare_update_manifest.py") `
+    --version $publishVersion --release-epoch ([string]$releaseEpoch) --repository $Repository `
+    --asset-name $assetName --asset-path $assetPath --notes-file $manifestNotesPath --output $jsonPath
+if ($LASTEXITCODE -ne 0) { throw "Update manifest generation failed." }
+[string]$manifestJson = [IO.File]::ReadAllText($jsonPath, [Text.Encoding]::UTF8)
+$manifestDocument = $manifestJson | ConvertFrom-Json
+if ($manifestDocument.releaseNotes -isnot [string] -or $manifestDocument.assets.Count -ne 1) { throw "Update manifest schema validation failed." }
 [IO.File]::WriteAllText($shaPath, "$expectedHash  $assetName`n", $utf8)
-[IO.File]::WriteAllText($bodyPath, $notes, $utf8)
 Write-Host "Prepared local release: $publishStage"
 if (-not $Publish) { Write-Host "Nothing uploaded. Review these files, then add -Publish."; exit 0 }
 
@@ -115,6 +119,12 @@ $remote = $remoteText | ConvertFrom-Json
 $uploaded = @($remote.assets | Where-Object { $_.name -eq $assetName })
 if ($uploaded.Count -ne 1 -or $uploaded[0].size -ne $assetSize -or $uploaded[0].digest -ne "sha256:$expectedHash") {
     throw "Uploaded binary checksum/size did not verify; release remains a draft."
+}
+$uploadedManifest = @($remote.assets | Where-Object { $_.name -eq "app-update-manifest.json" })
+$manifestSize = (Get-Item -LiteralPath $jsonPath).Length
+$manifestHash = (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($uploadedManifest.Count -ne 1 -or $uploadedManifest[0].size -ne $manifestSize -or $uploadedManifest[0].digest -ne "sha256:$manifestHash" -or $manifestSize -gt 2MB) {
+    throw "Uploaded update manifest checksum/size did not verify; release remains a draft."
 }
 & gh release edit $publishTag --repo $Repository --draft=false --latest
 if ($LASTEXITCODE -ne 0) { throw "Publish failed; inspect the draft release." }
