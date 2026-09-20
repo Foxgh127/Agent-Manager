@@ -658,7 +658,18 @@ class AppUpdateService:
                 raise UpdateError("该版本缺少唯一的当前平台更新文件。", "asset_selection")
             return self._asset(selected[0], source, version, notes=raw.get("releaseNotes"), published=raw.get("publishedAt"))
         endpoint = f"https://api.github.com/repos/{source['repository']}/releases"
-        raw = self._json_remote(endpoint + ("/latest" if source["channel"] == "stable" else "?per_page=20"), {"api.github.com"})
+        try:
+            raw = self._json_remote(endpoint + ("/latest" if source["channel"] == "stable" else "?per_page=20"), {"api.github.com"})
+        except UpdateError as exc:
+            # GitHub's unauthenticated API is rate-limited independently from
+            # release assets.  The stable channel has a signed, versioned
+            # manifest attached to the same public release, so use that
+            # endpoint when the API itself is temporarily unavailable.
+            if source["channel"] == "stable" and exc.code in {
+                "network_error", "timeout", "dns_error", "http_error", "redirect_limit",
+            }:
+                return self._discover_github_latest_manifest(source)
+            raise
         releases = raw if isinstance(raw, list) else [raw]
         candidates = []
         for release in releases[:20]:
@@ -683,6 +694,53 @@ class AppUpdateService:
                     continue
                 raise
         raise last_epoch_error or UpdateError("未找到当前版本系列的发布。", "release_not_found")
+
+    def _discover_github_latest_manifest(self, source):
+        """Discover the stable release without consuming the GitHub API quota."""
+
+        manifest_url = (
+            f"https://github.com/{source['repository']}"
+            "/releases/latest/download/app-update-manifest.json"
+        )
+        raw = self._json_remote(manifest_url, set(GITHUB_ASSET_HOSTS))
+        if not isinstance(raw, dict) or raw.get("schemaVersion") != 1 or raw.get("appId") != APP_ID:
+            raise UpdateError("更新 manifest 版本或应用标识不匹配。", "invalid_manifest")
+        version = raw.get("version")
+        parsed = Version.parse(version)
+        if parsed.prerelease or raw.get("channel", "stable") != "stable":
+            raise UpdateError("稳定渠道返回了预发布版本。", "channel_mismatch")
+        self._require_release_epoch(raw, version)
+        assets = raw.get("assets")
+        if not isinstance(assets, list) or len(assets) > 100:
+            raise UpdateError("更新资产列表无效。", "invalid_manifest")
+        selected = [
+            asset for asset in assets
+            if isinstance(asset, dict) and asset.get("platform") == self.platform
+        ]
+        if len(selected) != 1:
+            raise UpdateError("该版本缺少唯一的当前平台更新文件。", "asset_selection")
+        asset = selected[0]
+        template = source.get("assetName")
+        if template:
+            wanted_name = template.replace("{version}", str(version)).replace("{tag}", "v" + str(version))
+            if asset.get("name") != wanted_name:
+                raise UpdateError("发布 manifest 没有配置的当前平台资产。", "asset_selection")
+        asset_url = asset.get("url")
+        parsed_asset, _host = _url(asset_url, {"github.com"})
+        prefix = f"/{source['repository']}/releases/download/"
+        if parsed_asset.path[:len(prefix)].casefold() != prefix.casefold():
+            raise UpdateError("GitHub 资产不属于所配置仓库。", "asset_origin_mismatch")
+        tail = unquote(parsed_asset.path[len(prefix):]).split("/", 1)
+        if len(tail) != 2 or tail[1] != str(asset.get("name") or ""):
+            raise UpdateError("GitHub 资产版本或文件名无效。", "asset_origin_mismatch")
+        return self._asset(
+            asset,
+            source,
+            version,
+            tag=tail[0],
+            notes=raw.get("releaseNotes"),
+            published=raw.get("publishedAt"),
+        )
 
     def _github_asset_release(self, release, source):
         tag = release["tag_name"]
@@ -793,6 +851,7 @@ class AppUpdateService:
     def _download_worker(self, release, on_ready=None):
         temporary = None
         stream = None
+        failure_update = None
         deadline = time.monotonic() + DOWNLOAD_TIMEOUT
         try:
             directory = _regular_path(self.download_dir)
@@ -849,10 +908,12 @@ class AppUpdateService:
                                       path=str(target), sha256=release["sha256"], verifiedAt=_now())
         except Exception as exc:
             cancelled = self._cancel.is_set() or isinstance(exc, UpdateError) and exc.code == "cancelled"
-            with self._lock:
-                self._download.update(state="cancelled" if cancelled else "failed", verified=False,
-                    error="下载已取消。" if cancelled else str(exc) if isinstance(exc, UpdateError) else "下载失败，未生成可用更新文件。",
-                    errorCode="cancelled" if cancelled else exc.code if isinstance(exc, UpdateError) else "download_failed")
+            failure_update = {
+                "state": "cancelled" if cancelled else "failed",
+                "verified": False,
+                "error": "下载已取消。" if cancelled else str(exc) if isinstance(exc, UpdateError) else "下载失败，未生成可用更新文件。",
+                "errorCode": "cancelled" if cancelled else exc.code if isinstance(exc, UpdateError) else "download_failed",
+            }
         finally:
             if stream is not None:
                 try:
@@ -866,6 +927,13 @@ class AppUpdateService:
                     pass
             with self._lock:
                 self._active_stream = None
+                # Publish a failed/cancelled state only after the temporary
+                # file has been removed.  Callers poll the state and may
+                # inspect the download directory immediately; publishing it
+                # from the exception handler created a small race where a
+                # corrupt `.part` file was still visible.
+                if failure_update:
+                    self._download.update(failure_update)
             self._operation.release()
 
         if on_ready and not self._closed and not self._cancel.is_set() and self._download.get("state") == "ready":

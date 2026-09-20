@@ -1296,7 +1296,16 @@ def resolve_codex_launch_plan(command_prefix: list[str] | None = None) -> dict:
     windows_app = _core._detect_codex_windows_app() or _core._detect_codex_windows_app(force=True)
     if windows_app:
         strategy = "windows_app" if windows_app.get("appUserModelId") else "desktop_executable"
-        return {"strategy": strategy, **windows_app, "refreshBeforeLaunch": True}
+        workspace = _core._recent_codex_workspace()
+        return {
+            "strategy": strategy,
+            **windows_app,
+            "refreshBeforeLaunch": True,
+            # The GUI launcher does not consume this field, but the App Server
+            # readiness probe does: it must load requirements from the same
+            # workspace as the desktop session.
+            **({"workspace": str(workspace)} if workspace else {}),
+        }
     workspace = _core._recent_codex_workspace()
     if not workspace:
         raise _core.ManagerError(

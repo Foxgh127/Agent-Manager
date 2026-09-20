@@ -34,6 +34,52 @@ class RelayNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(record["models"], ["gpt-relay", "vision-relay"])
 
+    def test_key_model_limits_are_read_even_when_flag_is_missing_or_disabled(self):
+        record, _secret = relay._normalize_key_record(
+            {
+                "id": "key-1",
+                "model_limits_enabled": False,
+                "model_limits": {"gpt-relay": True, "claude-relay": False},
+                "modelNames": ["gpt-mini"],
+            },
+            "new-api",
+        )
+        self.assertEqual(record["models"], ["gpt-relay", "gpt-mini"])
+
+    def test_login_model_catalog_falls_back_to_the_selected_provider_key(self):
+        preview = {
+            "baseUrl": "https://relay.example.test/v1",
+            "modelsEndpoint": "https://relay.example.test/v1/models",
+            "defaultEndpointId": "default",
+            "apiEndpoints": [{
+                "id": "default",
+                "baseUrl": "https://relay.example.test/v1",
+                "modelsEndpoint": "https://relay.example.test/v1/models",
+            }],
+            "models": [],
+            "keys": [{"id": "key-1", "groupPlatform": "openai", "models": []}],
+        }
+        with patch.object(
+            relay.core,
+            "_probe_provider_models_with_key",
+            return_value={
+                "models": ["gpt-relay"],
+                "modelsEndpoint": "https://relay.example.test/v1/models",
+            },
+        ) as probe:
+            relay._augment_relay_model_catalog(preview, {"key-1": "sk-secret"})
+
+        self.assertEqual(preview["models"], ["gpt-relay"])
+        self.assertEqual(preview["keys"][0]["models"], ["gpt-relay"])
+        self.assertEqual(preview["modelDiscovery"]["status"], "ready")
+        probe.assert_called_once_with(
+            "https://relay.example.test/v1",
+            "sk-secret",
+            models_endpoint="https://relay.example.test/v1/models",
+            timeout=8,
+        )
+        self.assertNotIn("sk-secret", json.dumps(preview))
+
     def test_isolated_webview_session_captures_same_origin_http_only_cookie(self):
         same_origin = SimpleCookie()
         same_origin.load("session=opaque-refresh-cookie; Path=/; Domain=.example.test; Secure; HttpOnly")

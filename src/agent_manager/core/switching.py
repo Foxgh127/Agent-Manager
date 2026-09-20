@@ -247,7 +247,12 @@ def wait_for_codex_runtime_ready(
     expected_config = _core.read_toml(_core.CONFIG_FILE)
     if expected and _core._official_route_has_overrides(expected_config):
         raise _core.ManagerError("官方账号配置仍包含 API 地址或认证覆盖，已停止启动回验。")
-    probe_options = {"launch_plan": launch_plan} if launch_plan is not None else {}
+    probe_plan = dict(launch_plan) if isinstance(launch_plan, dict) else launch_plan
+    if isinstance(probe_plan, dict) and not str(probe_plan.get("workspace") or "").strip():
+        workspace = _core._recent_codex_workspace()
+        if workspace:
+            probe_plan["workspace"] = str(workspace)
+    probe_options = {"launch_plan": probe_plan} if probe_plan is not None else {}
     last_error = "Codex App Server 尚未就绪"
     attempts = 0
     while _core.time.monotonic() < deadline:
@@ -261,8 +266,8 @@ def wait_for_codex_runtime_ready(
                     # whenever their default ordering changed.
                     ("model/list", {"cursor": None, "limit": 100 if expected_model_id else 1}),
                 ]
-            if launch_plan is not None:
-                requests.append(("config/read", {"includeLayers": True, "cwd": launch_plan.get("workspace")}))
+            if probe_plan is not None:
+                requests.append(("config/read", {"includeLayers": True, "cwd": probe_plan.get("workspace")}))
             results = _core.codex_app_server_requests(
                 requests,
                 timeout=max(2, min(8, int(remaining))),
@@ -277,7 +282,7 @@ def wait_for_codex_runtime_ready(
                 raise _core.ManagerError(
                     f"Codex 读取到的账号是 {actual_email}，并非刚切换的 {expected_email}。"
                 )
-            if launch_plan is not None:
+            if probe_plan is not None:
                 effective = results[2].get("config") if len(results) > 2 and isinstance(results[2], dict) else None
                 if not isinstance(effective, dict) or not _core._probe_configuration_matches(expected_config, effective):
                     raise _core.ManagerError("Codex 探针有效配置与刚写入的账号路由不一致。")
@@ -333,7 +338,7 @@ def wait_for_codex_runtime_ready(
                 "attempts": attempts,
                 "checkedAt": _core.now_iso(),
                 "verificationScope": "app_server_probe",
-                "effectiveConfigChecked": launch_plan is not None,
+                "effectiveConfigChecked": probe_plan is not None,
                 "desktopThreadsChecked": False,
                 "message": "Codex 已启动，当前账号与新会话配置检查通过。",
             }

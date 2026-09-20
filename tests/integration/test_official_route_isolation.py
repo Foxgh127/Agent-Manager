@@ -461,6 +461,28 @@ def test_app_server_transport_uses_bound_runtime_and_clean_official_environment(
             launch_plan={"officialAccountId": account["id"], "appServerExecutable": str(runtime)})
 
 
+def test_app_server_transport_uses_the_selected_workspace_as_cwd(official, monkeypatch):
+    root, _settings, account, _source = official
+    runtime = root / "codex.exe"
+    runtime.write_bytes(b"synthetic")
+
+    def spawn(command, **kwargs):
+        assert command == [str(runtime), "app-server", "--listen", "stdio://"]
+        assert kwargs["cwd"] == str(root.resolve())
+        raise core.ManagerError("synthetic workspace checkpoint")
+
+    monkeypatch.setattr(core.subprocess, "Popen", spawn)
+    with pytest.raises(core.ManagerError, match="synthetic workspace checkpoint"):
+        APP_SERVER_REQUESTS(
+            [("account/read", {})],
+            launch_plan={
+                "officialAccountId": account["id"],
+                "appServerExecutable": str(runtime),
+                "workspace": str(root),
+            },
+        )
+
+
 def test_app_server_probe_falls_back_after_windows_access_denied(official, monkeypatch):
     root, _settings, account, _source = official
     primary = root / "WindowsApps" / "resources" / "codex.exe"

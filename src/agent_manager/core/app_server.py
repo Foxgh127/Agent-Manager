@@ -12,6 +12,29 @@ def codex_app_server_requests(requests: list[tuple[str, dict]], timeout: int | f
     env = _core._codex_source_environment(launch_plan)
     flags = getattr(_core.subprocess, "CREATE_NO_WINDOW", 0) if _core.os.name == "nt" else 0
     primary_prefix = _core._codex_launch_probe_prefix(launch_plan)
+    # Codex resolves workspace requirements relative to the App Server's
+    # current directory.  Starting the probe from Agent Manager's directory
+    # makes account/read fail with ``failed to load workspace requirements``
+    # even though the selected workspace is valid.  Launch plans already carry
+    # a workspace chosen by the same guarded discovery used for ``codex app``;
+    # pass it through when it still exists and otherwise keep the historical
+    # process default rather than inventing a directory.
+    probe_cwd = None
+    if isinstance(launch_plan, dict):
+        raw_workspace = str(launch_plan.get("workspace") or "").strip()
+        if raw_workspace:
+            workspace = _core.Path(raw_workspace).expanduser()
+            if workspace.is_dir():
+                probe_cwd = str(workspace.resolve())
+        else:
+            # Older callers may pass a minimal plan (for example a Windows
+            # Store App identity) without copying the workspace field.  Reuse
+            # the same recent-workspace resolver as launch-plan construction;
+            # it is read-only and returns None when no verified directory is
+            # available.
+            workspace = _core._recent_codex_workspace()
+            if workspace:
+                probe_cwd = str(workspace)
     prefixes = [primary_prefix]
     # Microsoft Store packages can launch their GUI through Explorer while
     # denying a separately spawned copy of the bundled helper under
@@ -33,6 +56,7 @@ def codex_app_server_requests(requests: list[tuple[str, dict]], timeout: int | f
                 errors="replace",
                 env=env,
                 creationflags=flags,
+                **({"cwd": probe_cwd} if probe_cwd else {}),
             )
             break
         except OSError as exc:

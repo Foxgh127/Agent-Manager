@@ -836,6 +836,7 @@ def _probe_provider_models_with_key(
     key: str,
     *,
     models_endpoint: object = "",
+    timeout: float = 25,
 ) -> dict:
     """Read a provider model catalog without writing the API Key to disk."""
 
@@ -862,7 +863,7 @@ def _probe_provider_models_with_key(
                 endpoint,
                 key,
                 "模型接口",
-                timeout=25,
+                timeout=max(1.0, min(float(timeout), 60.0)),
             )
             catalog = _core._parse_provider_model_catalog(payload)
             models = catalog["models"]

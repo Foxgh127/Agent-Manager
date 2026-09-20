@@ -30,6 +30,58 @@ def test_new_series_accepts_matching_generation_and_case_insensitive_repo(tmp_pa
     finally:service.close()
 
 
+def test_stable_github_check_falls_back_to_latest_release_manifest(tmp_path):
+    digest = hashlib.sha256(b"MZ fixture").hexdigest()
+
+    class FallbackFetcher:
+        def __init__(self):
+            self.calls = []
+
+        def open(self, url, hosts, **kwargs):
+            self.calls.append(url)
+            if url.startswith("https://api.github.com/"):
+                raise updates.UpdateError("GitHub API unavailable", "http_error")
+            assert url == "https://github.com/owner/app/releases/latest/download/app-update-manifest.json"
+            return Stream(json.dumps({
+                "schemaVersion": 1,
+                "appId": updates.APP_ID,
+                "version": "1.0.1",
+                "channel": "stable",
+                "releaseEpoch": 1,
+                "assets": [{
+                    "name": "AgentManager-1.0.1.exe",
+                    "platform": "windows-x64",
+                    "size": 10,
+                    "sha256": digest,
+                    "url": "https://github.com/owner/app/releases/download/v1.0.1/AgentManager-1.0.1.exe",
+                }],
+            }).encode())
+
+    fetch = FallbackFetcher()
+    service = updates.AppUpdateService(
+        "1.0.0",
+        tmp_path / "config.json",
+        tmp_path / "downloads",
+        fetcher=fetch,
+        release_epoch=1,
+    )
+    service.configure({
+        "kind": "github",
+        "repository": "owner/app",
+        "assetName": "AgentManager-{version}.exe",
+    })
+    try:
+        state = service.check()
+        assert state["state"] == "update_available", state.get("error")
+        assert state["latestRelease"]["version"] == "1.0.1"
+        assert fetch.calls == [
+            "https://api.github.com/repos/owner/app/releases/latest",
+            "https://github.com/owner/app/releases/latest/download/app-update-manifest.json",
+        ]
+    finally:
+        service.close()
+
+
 def test_retired_nine_x_release_is_not_a_new_update(tmp_path):
     fetch=Fetcher();fetch.epoch=0;fetch.version='9.13.0'
     service=updates.AppUpdateService('1.0.0',tmp_path/'config.json',tmp_path/'downloads',fetcher=fetch,release_epoch=1)

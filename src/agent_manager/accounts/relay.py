@@ -311,11 +311,18 @@ def _normalize_key_record(item: dict, adapter: str) -> tuple[dict, str]:
     )
     quota = _number(item.get("quota") if "quota" in item else item.get("remain_quota"))
     used = _number(item.get("quota_used") if "quota_used" in item else item.get("used_quota"))
-    models_value = item.get("model_limits") if item.get("model_limits_enabled") else item.get("models")
-    # Key catalogs from Cockpit/New API often return model objects rather than
-    # strings.  Use the same alias-aware collector as the dashboard snapshot
-    # so those rows do not turn into ``0 models`` during import.
-    models = _collect_models(models_value)
+    # New API can return model limits even when ``model_limits_enabled`` is
+    # false (and several Cockpit-compatible deployments omit that flag).  A
+    # login probe must preserve every model-bearing field and let the later
+    # Codex compatibility filter remove non-text lanes.
+    models = _collect_models(
+        *(item.get(field) for field in (
+            "models", "model_limits", "modelLimits", "model_limit", "modelLimit",
+            "model_ids", "modelIds", "model_names", "modelNames", "model_list",
+            "modelList", "allowed_models", "allowedModels", "available_models",
+            "availableModels", "model_catalog", "modelCatalog",
+        ) if field in item)
+    )
     group_value = item.get("group")
     group_id = item.get("group_id")
     group_platform = ""
@@ -356,25 +363,42 @@ def _collect_models(*values: object) -> list[str]:
     output: list[str] = []
 
     def add(value: object) -> None:
+        if isinstance(value, str):
+            for part in value.split(","):
+                text = _text(part, 180)
+                if text and text not in output:
+                    output.append(text)
+            return
         normalized = _response_data(value)
         if normalized is not value:
             add(normalized)
             return
-        if isinstance(value, str):
-            value = [part.strip() for part in value.split(",")]
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple, set)):
             for item in value:
                 add(item)
         elif isinstance(value, dict):
             nested = False
             for key in (
                 "items", "models", "data", "list", "available_models", "availableModels",
-                "model_ids", "modelIds", "model_list", "modelList", "model_catalog",
-                "modelCatalog", "model_limits", "modelLimits", "result",
+                "available_model_ids", "availableModelIds", "model_ids", "modelIds",
+                "model_names", "modelNames", "model_list", "modelList", "model_catalog",
+                "modelCatalog", "model_limits", "modelLimits", "model_limit", "modelLimit",
+                "allowed_models", "allowedModels", "result",
             ):
                 if key in value:
                     nested = True
-                    add(value[key])
+                    nested_value = value[key]
+                    # A few New API/Cockpit versions encode limits as a map
+                    # (`{"gpt-…": true}`) rather than an array of objects.
+                    # Keep enabled/unknown entries by their map key, while
+                    # still recursively handling normal array/object catalogs.
+                    if key.casefold().replace("_", "") in {
+                        "modellimits", "modellimit", "allowedmodels", "modelnames",
+                    } and isinstance(nested_value, dict):
+                        for model_id, allowed in nested_value.items():
+                            if allowed is not False and allowed is not None:
+                                add(model_id)
+                    add(nested_value)
             if not nested:
                 candidate = next(
                     (
@@ -390,6 +414,22 @@ def _collect_models(*values: object) -> list[str]:
                 text = _text(candidate, 180)
                 if text and text not in output:
                     output.append(text)
+                elif value and all(
+                    isinstance(allowed, bool) for allowed in value.values()
+                ):
+                    # A bare boolean map is another common representation of
+                    # model limits.  Do not treat ordinary response metadata
+                    # as a model when it happens to contain ``success`` or
+                    # ``status`` flags.
+                    metadata_keys = {
+                        "success", "status", "ok", "error", "message", "code",
+                        "data", "total", "page", "enabled",
+                    }
+                    for model_id, allowed in value.items():
+                        if allowed is not False and str(model_id).casefold() not in metadata_keys:
+                            model_text = _text(model_id, 180)
+                            if model_text and model_text not in output:
+                                output.append(model_text)
 
     for value in values:
         add(value)
@@ -810,6 +850,140 @@ def normalize_probe_result(raw: dict, *, portal_url: str) -> tuple[dict, dict[st
         "detectedAt": core.now_iso(),
     }
     return preview, secrets_by_id
+
+
+def _augment_relay_model_catalog(
+    preview: dict,
+    secrets_by_id: dict[str, str],
+    *,
+    max_keys: int = 2,
+    endpoint_id: object = None,
+) -> dict:
+    """Fill a dashboard's incomplete model list from authenticated API Keys.
+
+    Relay dashboards are not consistent about exposing their model catalogue:
+    some return it only from an admin endpoint, while the API Key itself can
+    still answer the OpenAI-compatible ``/models`` request.  API import already
+    uses that provider probe; using the same bounded fallback during a browser
+    login keeps the two import paths equivalent.  No key material is returned
+    in the preview or diagnostic metadata.
+    """
+
+    if not isinstance(preview, dict) or not isinstance(secrets_by_id, dict):
+        return preview
+    existing = _collect_models(preview.get("models"))
+    compatible_existing = [
+        model
+        for model in existing
+        if core._relay_is_codex_compatible("", "", [model])
+    ]
+    if compatible_existing:
+        preview["models"] = existing
+        preview.setdefault(
+            "modelDiscovery",
+            {"source": "dashboard", "status": "ready", "probedKeys": 0, "errors": []},
+        )
+        return preview
+
+    endpoints = preview.get("apiEndpoints") if isinstance(preview.get("apiEndpoints"), list) else []
+    requested_id = _text(endpoint_id, 80)
+    default_id = requested_id or str(preview.get("defaultEndpointId") or "")
+    selected_endpoint = next(
+        (
+            item for item in endpoints
+            if isinstance(item, dict) and str(item.get("id") or "") == default_id
+        ),
+        next((item for item in endpoints if isinstance(item, dict)), None),
+    )
+    target_base = str(
+        (selected_endpoint or {}).get("baseUrl")
+        or preview.get("baseUrl")
+        or ""
+    ).strip()
+    target_models_endpoint = str(
+        (selected_endpoint or {}).get("modelsEndpoint")
+        or preview.get("modelsEndpoint")
+        or ""
+    ).strip()
+    if not target_base:
+        preview["modelDiscovery"] = {
+            "source": "provider_key",
+            "status": "unavailable",
+            "probedKeys": 0,
+            "errors": ["缺少可用 API 端点"],
+        }
+        return preview
+
+    records = preview.get("keys") if isinstance(preview.get("keys"), list) else []
+    candidates: list[tuple[str, str, dict | None]] = []
+    seen: set[str] = set()
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        key_id = _text(item.get("id"), 80)
+        secret = _text(secrets_by_id.get(key_id), 600) if key_id else ""
+        if not key_id or not secret or key_id in seen or not _codex_key_record(item):
+            continue
+        seen.add(key_id)
+        candidates.append((key_id, secret, item))
+        if len(candidates) >= max(1, min(int(max_keys), 8)):
+            break
+    if not candidates:
+        # New API often returns a full key directly while a few Sub2API
+        # responses use a generated row id.  Preserve insertion order without
+        # making a secret visible in the public preview.
+        for raw_id, raw_secret in secrets_by_id.items():
+            key_id = _text(raw_id, 80)
+            secret = _text(raw_secret, 600)
+            if key_id and secret and key_id not in seen:
+                candidates.append((key_id, secret, None))
+                if len(candidates) >= max(1, min(int(max_keys), 8)):
+                    break
+
+    errors: list[str] = []
+    probed = 0
+    discovered: list[str] = []
+    for key_id, secret, record in candidates:
+        probed += 1
+        try:
+            result = core._probe_provider_models_with_key(
+                target_base,
+                secret,
+                models_endpoint=target_models_endpoint,
+                timeout=8,
+            )
+            models = _collect_models(result.get("models")) if isinstance(result, dict) else []
+            if not models:
+                errors.append(f"{key_id}: 未返回模型")
+                continue
+            discovered.extend(models)
+            if isinstance(record, dict):
+                previous_models = record.get("models") if isinstance(record.get("models"), list) else []
+                record["models"] = list(dict.fromkeys([*previous_models, *models]))[:MAX_MODELS]
+            resolved_endpoint = _text(result.get("modelsEndpoint"), 500) if isinstance(result, dict) else ""
+            if resolved_endpoint:
+                preview["modelsEndpoint"] = resolved_endpoint
+                if isinstance(selected_endpoint, dict):
+                    selected_endpoint["modelsEndpoint"] = resolved_endpoint
+            resolved_base = _text(result.get("resolvedBaseUrl"), 500) if isinstance(result, dict) else ""
+            if resolved_base:
+                preview["baseUrl"] = f"{resolved_base.rstrip('/')}/v1"
+                if isinstance(selected_endpoint, dict):
+                    selected_endpoint["baseUrl"] = preview["baseUrl"]
+            if any(core._relay_is_codex_compatible("", "", [model]) for model in models):
+                break
+        except Exception as exc:
+            errors.append(f"{key_id}: {core._redact_sensitive_text(exc, limit=180)}")
+
+    merged = list(dict.fromkeys([*existing, *discovered]))[:MAX_MODELS]
+    preview["models"] = merged
+    preview["modelDiscovery"] = {
+        "source": "dashboard_and_provider_key" if existing else "provider_key",
+        "status": "ready" if any(core._relay_is_codex_compatible("", "", [model]) for model in merged) else "unavailable",
+        "probedKeys": probed,
+        "errors": errors[:6],
+    }
+    return preview
 
 
 def _codex_key_record(record: object) -> bool:
@@ -1245,12 +1419,14 @@ def _probe_script(expected_origin: str) -> str:
     }}
   }}
   if (isUserData(dataOf(subUser))) {{
-    const [keys, stats, groups, groupRates, models] = await Promise.all([
+    const [keys, stats, groups, groupRates, models, apiModels, availableModels] = await Promise.all([
       request('/api/v1/keys?page=1&page_size=200&sort_by=created_at&sort_order=desc', {{ headers: subHeaders() }}),
       request('/api/v1/usage/dashboard/stats', {{ headers: subHeaders() }}),
       request('/api/v1/groups/available', {{ headers: subHeaders() }}),
       request('/api/v1/groups/rates', {{ headers: subHeaders() }}),
       request('/api/v1/usage/dashboard/models', {{ headers: subHeaders() }}),
+      request('/api/v1/models', {{ headers: subHeaders() }}),
+      request('/api/v1/available_models', {{ headers: subHeaders() }}),
     ]);
     const keyData = dataOf(keys);
     const keyRows = Array.isArray(keyData)
@@ -1275,7 +1451,7 @@ def _probe_script(expected_origin: str) -> str:
       user: subUser,
       keys: [keys],
       stats,
-      models: [models],
+      models: [models, apiModels, availableModels],
       groups,
       groupRates,
       keyUsage,
@@ -1322,6 +1498,8 @@ def _probe_script(expected_origin: str) -> str:
       request('/api/user/models', {{ headers: managementHeaders }}),
       request('/api/user/available_models', {{ headers: managementHeaders }}),
       request('/api/models', {{ headers: managementHeaders }}),
+      request('/api/available_models', {{ headers: managementHeaders }}),
+      request('/api/model', {{ headers: managementHeaders }}),
     ]);
     return {{
       adapter: 'new-api', status, user, keys, models,
@@ -2188,6 +2366,24 @@ def _probe_saved_dashboard(session: dict) -> tuple[dict, dict]:
         groups = dashboard["groups"]
         group_rates = dashboard["groupRates"]
         models = dashboard["models"]
+        model_responses = [models]
+        if not _collect_models(models):
+            # Saved sessions cannot reveal a new API Key, but the dashboard
+            # bearer can still expose one of the provider-compatible catalog
+            # routes used by Cockpit/Sub2API deployments.
+            for path in (
+                "/api/v1/models",
+                "/api/v1/available_models",
+                "/api/v1/user/models",
+                "/api/v1/usage/models",
+            ):
+                try:
+                    fallback = _saved_json_request(current, path, headers=sub_headers)
+                except Exception:
+                    continue
+                model_responses.append(fallback)
+                if _collect_models(fallback):
+                    break
         key_rows = _items(keys)
         numeric_ids = [
             int(item.get("id"))
@@ -2214,7 +2410,7 @@ def _probe_saved_dashboard(session: dict) -> tuple[dict, dict]:
                 "user": user,
                 "keys": [keys],
                 "stats": stats,
-                "models": [models],
+                "models": model_responses,
                 "groups": groups,
                 "groupRates": group_rates,
                 "keyUsage": key_usage,
@@ -2295,6 +2491,19 @@ def _probe_saved_dashboard(session: dict) -> tuple[dict, dict]:
     )
     keys = [dashboard["keysPage1"], dashboard["keysPage0"]]
     models = [dashboard["userModels"], dashboard["availableModels"], dashboard["models"]]
+    if not _collect_models(*models):
+        for path in ("/api/available_models", "/api/model", "/api/user/model"):
+            try:
+                fallback = _saved_json_request(
+                    current,
+                    path,
+                    headers=management_headers,
+                )
+            except Exception:
+                continue
+            models.append(fallback)
+            if _collect_models(fallback):
+                break
     keys_complete, keys_total = _key_catalog_status(keys, page_size=100)
     current["updatedAt"] = core.now_iso()
     return (
@@ -2882,6 +3091,7 @@ class RelayPortalService:
             phase = "scan"
             full_raw = self._evaluate(window, _probe_script(expected_origin))
             preview, secrets_by_id = normalize_probe_result(full_raw, portal_url=portal_url)
+            _augment_relay_model_catalog(preview, secrets_by_id)
             dashboard_session = _dashboard_session_from_probe(
                 full_raw,
                 portal_url=portal_url,
@@ -3061,6 +3271,7 @@ class RelayPortalService:
         try:
             raw = self._evaluate(window, _probe_script(expected_origin))
             preview, secrets_by_id = normalize_probe_result(raw, portal_url=portal_url)
+            _augment_relay_model_catalog(preview, secrets_by_id)
             dashboard_session = _dashboard_session_from_probe(
                 raw,
                 portal_url=portal_url,
@@ -3251,6 +3462,18 @@ class RelayPortalService:
                 failed.append({"keyId": key_id, "error": core._redact_sensitive_text(exc, limit=400)})
         if not secrets_by_id:
             raise core.ManagerError("所选 Codex API Key 均无法读取，未写入任何账号数据。")
+        # A portal can report an empty dashboard catalogue while its selected
+        # key is perfectly able to answer the provider model endpoint.  Probe
+        # after revealing the selected key so login import and API import share
+        # the same model discovery path.
+        _augment_relay_model_catalog(
+            preview,
+            secrets_by_id,
+            endpoint_id=payload.get("endpointId"),
+        )
+        with self.lock:
+            self._require_current_session_locked(session_id)
+            self._preview = json.loads(json.dumps(preview))
         selected_key_id = next(
             (key_id for key_id in preferred_ids if key_id in secrets_by_id),
             next(iter(secrets_by_id), ""),
