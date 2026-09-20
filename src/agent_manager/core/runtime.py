@@ -483,6 +483,72 @@ def _download_official_codex_runtime() -> dict:
     return {"path": str(installed_cli.resolve()), "version": verified, "downloaded": True}
 
 
+def install_codex_cli_latest() -> dict:
+    """Install the standalone official CLI, even when Desktop has a runtime."""
+    if not _core.CODEX_RUNTIME_DEPLOY_LOCK.acquire(blocking=False):
+        raise _core.ManagerError("Codex CLI 正在安装，请等待当前操作完成。")
+    try:
+        if _core.os.name != "nt":
+            raise _core.ManagerError("官方独立 Codex CLI 自动安装目前仅支持 Windows。")
+        flags = getattr(_core.subprocess, "CREATE_NO_WINDOW", 0)
+        errors: list[str] = []
+        runtime = _core._discover_node_npm_runtime(refresh_registry=True, update_process_path=True)
+        if runtime:
+            npm_command = list(runtime.get("npmCommand") or [])
+            if npm_command:
+                node_value = str(runtime.get("node") or "").strip()
+                if node_value:
+                    _core._configure_windows_runtime_path([_core.Path(node_value).parent])
+                try:
+                    completed = _core.subprocess.run(
+                        [*npm_command, "install", "--global", "@openai/codex@latest",
+                         "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=900, creationflags=flags,
+                    )
+                except (OSError, _core.subprocess.TimeoutExpired) as exc:
+                    errors.append(f"npm 安装：{str(exc)[:300]}")
+                else:
+                    if completed.returncode == 0:
+                        cli_path = _core._locate_npm_codex_cli(npm_command)
+                        if cli_path is not None:
+                            try:
+                                version = _core._verify_codex_cli(cli_path)
+                            except _core.ManagerError as exc:
+                                errors.append(f"npm CLI 复检：{str(exc)[:300]}")
+                            else:
+                                _core.invalidate_codex_version_cache()
+                                return {
+                                    "installed": True,
+                                    "method": "npm",
+                                    "version": version,
+                                    "path": str(cli_path.resolve()),
+                                    "message": "已通过官方 npm 安装最新版 Codex CLI。",
+                                }
+                        else:
+                            errors.append("npm 安装完成，但没有找到 Codex CLI。")
+                    else:
+                        detail = (completed.stderr or completed.stdout or "未知错误").strip()[-500:]
+                        errors.append(f"npm 安装：{detail}")
+        try:
+            direct = _core._download_official_codex_runtime()
+            _core.invalidate_codex_version_cache()
+            return {
+                "installed": bool(direct.get("downloaded")),
+                "method": "official_native_package",
+                "version": str(direct.get("version") or ""),
+                "path": str(direct.get("path") or ""),
+                "message": "已下载并校验官方最新版 Codex CLI，无需预装 Node.js 或 npm。",
+            }
+        except _core.ManagerError as exc:
+            errors.append(f"官方平台包：{str(exc)[:400]}")
+        raise _core.ManagerError(
+            "自动安装 Codex CLI 失败：" + ("；".join(errors)[:700] or "没有找到可用的安装方式。")
+        )
+    finally:
+        _core.CODEX_RUNTIME_DEPLOY_LOCK.release()
+
+
 
 def _desktop_managed_codex_candidates() -> list[_core.Path]:
     """Find the versioned runtime downloaded by current Codex/ChatGPT desktop builds."""
@@ -723,10 +789,19 @@ def codex_runtime_status(force: bool = False) -> dict:
             source = "npm_javascript"
         else:
             source = "system_path"
+    runtime_version = None
+    if source == "manager_managed" and prefix:
+        # The manager's release directory is named ``<version>-<platform>-<digest>``.
+        # Reading it avoids spawning a second process on every status refresh.
+        candidate = _core.Path(str(prefix[-1]))
+        release_name = candidate.parent.parent.name
+        match = _core.re.search(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", release_name)
+        runtime_version = match.group(0) if match else None
     return {
         "available": bool(prefix),
         "source": source,
         "command": prefix,
+        "version": runtime_version,
         "desktop": desktop,
         "error": error,
         "canAutoDeploy": _core.os.name == "nt",

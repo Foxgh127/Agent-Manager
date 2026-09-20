@@ -312,12 +312,10 @@ def _normalize_key_record(item: dict, adapter: str) -> tuple[dict, str]:
     quota = _number(item.get("quota") if "quota" in item else item.get("remain_quota"))
     used = _number(item.get("quota_used") if "quota_used" in item else item.get("used_quota"))
     models_value = item.get("model_limits") if item.get("model_limits_enabled") else item.get("models")
-    if isinstance(models_value, str):
-        models = [part.strip() for part in models_value.split(",") if part.strip()]
-    elif isinstance(models_value, list):
-        models = [_text(part, 160) for part in models_value if _text(part, 160)]
-    else:
-        models = []
+    # Key catalogs from Cockpit/New API often return model objects rather than
+    # strings.  Use the same alias-aware collector as the dashboard snapshot
+    # so those rows do not turn into ``0 models`` during import.
+    models = _collect_models(models_value)
     group_value = item.get("group")
     group_id = item.get("group_id")
     group_platform = ""
@@ -369,12 +367,26 @@ def _collect_models(*values: object) -> list[str]:
                 add(item)
         elif isinstance(value, dict):
             nested = False
-            for key in ("items", "models", "data", "list", "available_models", "model_ids"):
+            for key in (
+                "items", "models", "data", "list", "available_models", "availableModels",
+                "model_ids", "modelIds", "model_list", "modelList", "model_catalog",
+                "modelCatalog", "model_limits", "modelLimits", "result",
+            ):
                 if key in value:
                     nested = True
                     add(value[key])
             if not nested:
-                candidate = value.get("id") or value.get("model") or value.get("name")
+                candidate = next(
+                    (
+                        value.get(key)
+                        for key in (
+                            "id", "slug", "model", "name", "model_id", "modelId",
+                            "model_name", "modelName", "model_slug", "modelSlug",
+                        )
+                        if value.get(key) is not None
+                    ),
+                    None,
+                )
                 text = _text(candidate, 180)
                 if text and text not in output:
                     output.append(text)

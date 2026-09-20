@@ -218,9 +218,36 @@ def _configuration_status_locked(settings: dict | None = None) -> dict:
     settings = settings or _core.load_settings()
     config = _core.read_toml(_core.CONFIG_FILE)
     expected = _core.tomllib.loads(_core.build_codex_config(settings))
+    workspace = settings.get("modelWorkspace", _core._default_model_workspace())
+    selected_records = _core.selected_model_records(settings)
+    # Codex may persist a different reasoning slider value after a runtime
+    # restart (for example, changing High to Ultra in its own model picker).
+    # That is safe when the selected model explicitly advertises the value;
+    # treating it as generated-file drift made the health card reappear after
+    # every repair even though the active model and endpoint were unchanged.
+    expected_effort = str(expected.get("model_reasoning_effort") or "").strip()
+    actual_effort = str(config.get("model_reasoning_effort") or "").strip()
+    effort_compatible = actual_effort == expected_effort
+    if not effort_compatible and actual_effort in _core.VALID_EFFORTS:
+        configured_model = str(config.get("model") or "").strip()
+        selected = next(
+            (
+                record
+                for record in selected_records
+                if configured_model in {
+                    str(record.get("id") or "").strip(),
+                    str(record.get("slug") or "").strip(),
+                }
+            ),
+            None,
+        )
+        advertised = selected.get("efforts") if isinstance(selected, dict) else None
+        effort_compatible = isinstance(advertised, list) and actual_effort in {
+            str(item).strip().casefold() for item in advertised
+        }
     main_active = (
         config.get("model") == expected.get("model")
-        and config.get("model_reasoning_effort") == expected.get("model_reasoning_effort")
+        and effort_compatible
         and (config.get("model_provider") or "openai") == (expected.get("model_provider") or "openai")
         and config.get("openai_base_url") == expected.get("openai_base_url")
         and config.get("model_catalog_json") == expected.get("model_catalog_json")
@@ -230,8 +257,6 @@ def _configuration_status_locked(settings: dict | None = None) -> dict:
     # result instead of requiring a marker (or accepting any stale same-ID
     # block after its routes have been edited).
     strategy_active = agents_text == _core.build_agents_file(settings)
-    workspace = settings.get("modelWorkspace", _core._default_model_workspace())
-    selected_records = _core.selected_model_records(settings)
     context_active = config.get("model_context_window") == expected.get("model_context_window")
     tuning = _core._normalize_runtime_tuning(settings.get("runtimeTuning"))
     expected_ceilings = {
@@ -274,7 +299,7 @@ def _configuration_status_locked(settings: dict | None = None) -> dict:
         "contextActive": context_active,
         "fullyApplied": main_active and strategy_active and context_active,
         "mode": workspace.get("mode", "independent"),
-        "activeSourceId": str(next((item["sourceId"] for item in selected_records), workspace.get("activeSourceId") or "")),
+        "activeSourceId": str(next((item.get("sourceId") for item in selected_records if item.get("sourceId")), workspace.get("activeSourceId") or "")),
         "modelCount": len(selected_records),
         "modelCountScope": "all_sources" if workspace.get("mode") == "aggregate" else "current_account",
         "drift": drift,

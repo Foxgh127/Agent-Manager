@@ -55,23 +55,43 @@ def _model_entries(payload: _core.Any) -> list[tuple[str, _core.Any]]:
         return [("", item) for item in _core.re.split(r"[\s,;]+", payload) if item]
     if not isinstance(payload, dict):
         return []
-    for key in ("data", "models", "items", "result", "model_list", "available_models"):
+    for key in (
+        "data", "models", "items", "result", "model_list", "modelList",
+        "available_models", "availableModels", "model_catalog", "modelCatalog",
+    ):
         value = payload.get(key)
         if isinstance(value, list):
             return [("", item) for item in value]
         if isinstance(value, str):
             return [("", item) for item in _core.re.split(r"[\s,;]+", value) if item]
         if isinstance(value, dict):
-            if any(identity_key in value for identity_key in ("id", "slug", "model", "name")):
+            if any(
+                identity_key in value
+                for identity_key in (
+                    "id", "slug", "model", "name", "model_id", "modelId",
+                    "model_name", "modelName", "model_slug", "modelSlug",
+                )
+            ):
                 return [("", value)]
             if not any(
                 nested_key in value
-                for nested_key in ("data", "models", "items", "result", "model_list", "available_models")
+                for nested_key in (
+                    "data", "models", "items", "result", "model_list", "modelList",
+                    "available_models", "availableModels", "model_catalog", "modelCatalog",
+                )
             ):
                 return [(str(fallback), item) for fallback, item in value.items()]
             nested = _core._model_entries(value)
             if nested:
                 return nested
+    if any(
+        identity_key in payload
+        for identity_key in (
+            "id", "slug", "model", "name", "model_id", "modelId",
+            "model_name", "modelName", "model_slug", "modelSlug",
+        )
+    ):
+        return [("", payload)]
     return []
 
 
@@ -80,7 +100,10 @@ def _model_id_from_entry(value: _core.Any, fallback: str = "") -> str:
     if isinstance(value, str):
         return _core._bounded_model_id(value)
     if isinstance(value, dict):
-        for key in ("slug", "id", "model", "name"):
+        for key in (
+            "slug", "id", "model", "name", "model_id", "modelId",
+            "model_name", "modelName", "model_slug", "modelSlug",
+        ):
             candidate = _core._bounded_model_id(value.get(key))
             if candidate:
                 return candidate
@@ -251,6 +274,8 @@ def _provider_model_capability(entry: _core.Any) -> dict:
     for output_key, keys in (
         ("contextWindow", ("context_window", "contextWindow")),
         ("maxContextWindow", ("max_context_window", "maxContextWindow")),
+        ("maxInputTokens", ("max_input_tokens", "maxInputTokens", "input_token_limit", "inputTokenLimit")),
+        ("maxOutputTokens", ("max_output_tokens", "maxOutputTokens", "output_token_limit", "outputTokenLimit", "max_tokens", "maxTokens")),
         (
             "effectiveContextWindowPercent",
             ("effective_context_window_percent", "effectiveContextWindowPercent"),
@@ -296,6 +321,32 @@ def _provider_model_capability(entry: _core.Any) -> dict:
     if verbosity is not None:
         capability["supportsVerbosity"] = verbosity
         capability["defaultVerbosity"] = default_verbosity if verbosity else ""
+
+    vision_present, raw_vision = first(
+        ("supports_vision", "supportsVision", "vision", "vision_supported", "visionSupported")
+    )
+    vision = _core._catalog_boolean(raw_vision) if vision_present else None
+    modalities_present, raw_modalities = first(
+        ("input_modalities", "inputModalities", "modalities", "supportedModalities")
+    )
+    if vision is None and modalities_present:
+        if isinstance(raw_modalities, str):
+            modalities = _core.re.split(r"[\s,;]+", raw_modalities)
+        elif isinstance(raw_modalities, list):
+            modalities = [str(item) for item in raw_modalities]
+        else:
+            modalities = []
+        vision = any("image" in item.casefold() or "vision" in item.casefold() for item in modalities)
+    if vision is not None:
+        capability["supportsVision"] = vision
+    tools_present, raw_tools = first(
+        ("supports_tools", "supportsTools", "tool_calling", "toolCalling", "function_calling", "functionCalling")
+    )
+    tools = _core._catalog_boolean(raw_tools) if tools_present else None
+    if tools is None and isinstance(raw_tools, (list, tuple, set)):
+        tools = bool(raw_tools)
+    if tools is not None:
+        capability["supportsTools"] = tools
     return capability
 
 

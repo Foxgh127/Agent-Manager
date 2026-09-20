@@ -29,6 +29,29 @@ class StartupHealthConsistencyTests(unittest.TestCase):
                 render.return_value = "Changed routing policy\n"
                 self.assertFalse(core.configuration_status(settings)["fullyApplied"])
 
+    def test_codex_supported_runtime_effort_does_not_reappear_as_configuration_drift(self):
+        settings = {
+            "modelWorkspace": {"mode": "independent", "activeSourceId": "account:current"},
+        }
+        with (
+            patch.object(core, "read_toml", return_value={
+                "model": "gpt-a",
+                "model_reasoning_effort": "ultra",
+                "model_provider": "openai",
+            }),
+            patch.object(core, "build_codex_config", return_value=(
+                'model = "gpt-a"\nmodel_reasoning_effort = "high"\n'
+            )),
+            patch.object(core, "build_agents_file", return_value=""),
+            patch.object(core, "AGENTS_FILE", Path("__missing_agents_for_test__.md")),
+            patch.object(core, "selected_model_records", return_value=[
+                {"id": "gpt-a", "efforts": ["low", "high", "ultra"]},
+            ]),
+        ):
+            status = core.configuration_status(settings)
+        self.assertTrue(status["mainActive"])
+        self.assertTrue(status["fullyApplied"])
+
     def test_cached_configuration_warning_is_rechecked_but_other_errors_survive(self):
         cached = {"checks": [
             {"id": "generated_configuration", "status": "warning", "autoFixable": True,

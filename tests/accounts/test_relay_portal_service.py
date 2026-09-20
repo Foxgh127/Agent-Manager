@@ -16,6 +16,24 @@ def response(data, *, status=200):
 
 
 class RelayNormalizationTests(unittest.TestCase):
+    def test_collects_model_ids_from_common_relay_catalog_aliases(self):
+        self.assertEqual(
+            relay._collect_models(
+                {"data": [{"model_id": "relay-id"}, {"modelName": "relay-name"}]}
+            ),
+            ["relay-id", "relay-name"],
+        )
+
+    def test_key_model_objects_are_normalized_before_import(self):
+        record, _secret = relay._normalize_key_record(
+            {
+                "id": "key-1",
+                "models": [{"id": "gpt-relay"}, {"modelName": "vision-relay"}],
+            },
+            "new-api",
+        )
+        self.assertEqual(record["models"], ["gpt-relay", "vision-relay"])
+
     def test_isolated_webview_session_captures_same_origin_http_only_cookie(self):
         same_origin = SimpleCookie()
         same_origin.load("session=opaque-refresh-cookie; Path=/; Domain=.example.test; Secure; HttpOnly")

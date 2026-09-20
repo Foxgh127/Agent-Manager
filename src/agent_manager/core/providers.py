@@ -27,7 +27,10 @@ def _parse_provider_balance(payload: _core.Any) -> dict | None:
         str(payload.get("mode") or "") in {"quota_limited", "unrestricted"}
         and "isValid" in payload
     )
-    for nested_key in ("data", "result", "billing", "credit", "credits", "quota"):
+    for nested_key in (
+        "data", "result", "billing", "credit", "credits", "quota", "usage",
+        "account", "user", "wallet", "balance", "details",
+    ):
         nested = payload.get(nested_key)
         if isinstance(nested, dict):
             parsed = _core._parse_provider_balance(nested)
@@ -46,6 +49,12 @@ def _parse_provider_balance(payload: _core.Any) -> dict | None:
                         }
                     )
                 return parsed
+        if isinstance(nested, list):
+            for item in nested[:8]:
+                if isinstance(item, dict):
+                    parsed = _core._parse_provider_balance(item)
+                    if parsed:
+                        return parsed
     currency = str(
         payload.get("currency")
         or payload.get("currency_code")
@@ -58,24 +67,52 @@ def _parse_provider_balance(payload: _core.Any) -> dict | None:
         "total_available",
         "remaining_balance",
         "remainingBalance",
+        "remaining_quota",
+        "remainingQuota",
+        "quota_remaining",
+        "quotaRemaining",
         "available_balance",
         "availableBalance",
         "balance",
         "remaining",
         "available",
+        "amount",
+        "money",
         "credits_remaining",
         "credit_balance",
+        "creditBalance",
     ):
         amount = _core._number_value(payload.get(key))
         if amount is not None:
             source_field = key
             break
     if amount is None:
-        granted = _core._number_value(payload.get("total_granted"))
-        used = _core._number_value(payload.get("total_used"))
+        granted = next(
+            (
+                value
+                for key in (
+                    "total_granted", "totalGranted", "limit", "total_limit", "totalLimit", "total_balance", "totalBalance",
+                    "quota_limit", "quotaLimit", "credit_limit", "creditLimit", "total",
+                    "quota", "max_quota", "maxQuota",
+                )
+                if (value := _core._number_value(payload.get(key))) is not None
+            ),
+            None,
+        )
+        used = next(
+            (
+                value
+                for key in (
+                    "total_used", "totalUsed", "used", "usage", "spent", "spend",
+                    "consumed", "cost",
+                )
+                if (value := _core._number_value(payload.get(key))) is not None
+            ),
+            None,
+        )
         if granted is not None and used is not None:
             amount = granted - used
-            source_field = "total_granted-total_used"
+            source_field = "limit-used"
     if amount is None:
         return None
     result = {
@@ -84,6 +121,35 @@ def _parse_provider_balance(payload: _core.Any) -> dict | None:
         "unit": "currency" if currency else "credits",
         "sourceField": source_field,
     }
+    used_value = next(
+        (
+            value
+            for key in ("total_used", "totalUsed", "used", "usage", "spent", "spend", "consumed", "cost")
+            if (value := _core._number_value(payload.get(key))) is not None
+        ),
+        None,
+    )
+    limit_value = next(
+        (
+            value
+            for key in ("total_granted", "totalGranted", "limit", "total_limit", "totalLimit", "total_balance", "totalBalance", "quota_limit", "quotaLimit", "total")
+            if (value := _core._number_value(payload.get(key))) is not None
+        ),
+        None,
+    )
+    if used_value is not None:
+        result["used"] = round(used_value, 6)
+    if limit_value is not None:
+        result["limit"] = round(limit_value, 6)
+    for output_key, input_keys in (
+        ("expiresAt", ("expires_at", "expiresAt", "expireAt", "expiration")),
+        ("planName", ("plan_name", "planName", "plan", "tier")),
+        ("valid", ("isValid", "valid", "is_valid")),
+        ("unlimited", ("unlimited", "unlimited_quota", "unlimitedQuota")),
+    ):
+        value = next((payload[key] for key in input_keys if key in payload), None)
+        if value is not None:
+            result[output_key] = value if output_key not in {"planName"} else str(value)[:160]
     if sub2api_usage:
         result.update(
             {
@@ -113,6 +179,26 @@ def _provider_probe_url(base_url: str, endpoint: str, *, strip_v1: bool = True) 
     return f"{root}/{endpoint.lstrip('/')}"
 
 
+def _provider_endpoint_candidates(
+    base_url: str,
+    configured: str,
+    resource: str,
+) -> list[str]:
+    """Build compatible endpoint variants used by common relay dashboards."""
+    base = _core._validated_provider_url(base_url, "中转站 Base URL").rstrip("/")
+    root = _core._provider_api_root(base)
+    suffixes = (
+        resource,
+        f"v1/{resource}",
+        f"api/{resource}",
+        f"api/v1/{resource}",
+        f"openai/v1/{resource}",
+    )
+    candidates = [configured] if configured else []
+    candidates.extend(f"{prefix}/{suffix}" for prefix in (base, root) for suffix in suffixes)
+    return list(dict.fromkeys(item for item in candidates if item))
+
+
 
 def _provider_json_request(
     url: str,
@@ -121,20 +207,38 @@ def _provider_json_request(
     *,
     timeout: float = 4,
 ) -> _core.Any:
-    request = _core.urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-            "User-Agent": "Codex-Agent-Manager/6",
-        },
+    auth_headers = (
+        {"Authorization": f"Bearer {key}"},
+        {"x-api-key": key},
+        {"api-key": key},
+        {"Authorization": f"Token {key}"},
+        {"x-goog-api-key": key},
     )
-    with _core._open_same_origin_request(request, timeout=timeout) as response:
-        return _core._read_limited_json_response(
-            response,
-            _core.PROVIDER_RESPONSE_LIMIT_BYTES,
-            label,
+    for index, authentication in enumerate(auth_headers):
+        request = _core.urllib.request.Request(
+            url,
+            headers={
+                **authentication,
+                "Accept": "application/json",
+                "User-Agent": "Codex-Agent-Manager/6",
+            },
         )
+        try:
+            with _core._open_same_origin_request(request, timeout=timeout) as response:
+                return _core._read_limited_json_response(
+                    response,
+                    _core.PROVIDER_RESPONSE_LIMIT_BYTES,
+                    label,
+                )
+        except _core.urllib.error.HTTPError as exc:
+            # 401 commonly means the relay expects a different API-key header;
+            # 403 is a permission decision and must advance to the next URL
+            # instead of replaying the same request five times.
+            if exc.code == 401 and index < len(auth_headers) - 1:
+                exc.close()
+                continue
+            raise
+    raise _core.ManagerError(f"{label}认证失败。")
 
 
 
@@ -345,6 +449,17 @@ def _probe_provider_balance_with_key(
         [
             f"{root}/dashboard/billing/credit_grants",
             f"{root}/v1/dashboard/billing/credit_grants",
+            f"{root}/billing/credit_grants",
+            f"{root}/api/billing/credit_grants",
+            f"{root}/usage",
+            f"{root}/api/usage",
+            f"{root}/api/usage/token/",
+            f"{root}/user/balance",
+            f"{root}/api/user/balance",
+            f"{root}/balance",
+            f"{root}/api/balance",
+            f"{root}/credits",
+            f"{root}/api/credits",
         ]
     )
     if balance:
@@ -445,22 +560,22 @@ def fetch_provider_models(provider_id: str) -> list[str]:
     # configured root only when there is no such address, otherwise a relay
     # that happens to expose a root /models endpoint could erase /v1.
     base = resolved_base or configured_base
-    endpoints = [configured_models_endpoint] if configured_models_endpoint else []
-    endpoints.append(f"{base}/models")
-    if not base.endswith("/v1"):
-        endpoints.append(f"{base}/v1/models")
+    if resolved_base:
+        endpoints = [configured_models_endpoint] if configured_models_endpoint else []
+        endpoints.append(f"{base}/models")
+    else:
+        endpoints = _core._provider_endpoint_candidates(
+            base,
+            configured_models_endpoint,
+            "models",
+        )
     failures = []
     authentication_failure = False
     for endpoint in dict.fromkeys(endpoints):
         diagnostic_endpoint = _core._public_diagnostic_url(endpoint)
         started_at = _core.time.monotonic()
-        request = _core.urllib.request.Request(
-            endpoint,
-            headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "Codex-Agent-Manager/2"},
-        )
         try:
-            with _core._open_same_origin_request(request, timeout=25) as response:
-                payload = _core._read_limited_json_response(response, _core.PROVIDER_RESPONSE_LIMIT_BYTES, "模型接口")
+            payload = _core._provider_json_request(endpoint, key, "模型接口", timeout=25)
             catalog = _core._parse_provider_model_catalog(payload)
             models = catalog["models"]
             if models:
@@ -643,6 +758,78 @@ def _preferred_discovered_model(models: list[str]) -> str:
     return models[0]
 
 
+def _normalize_api_import_payload(payload: dict) -> dict:
+    """Accept the field aliases emitted by Cockpit and common relay exports."""
+    if not isinstance(payload, dict):
+        return payload
+    contexts = [payload]
+    for key in ("provider", "account", "connection", "config", "data"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            contexts.append(value)
+
+    def pick(keys: tuple[str, ...], default: object = None) -> object:
+        for context in contexts:
+            for key in keys:
+                value = context.get(key)
+                if value is not None and value != "":
+                    return value
+        return default
+
+    normalized = dict(payload)
+    aliases = {
+        "baseUrl": ("baseUrl", "baseURL", "base_url", "apiBaseUrl", "api_base_url", "apiUrl", "api_url", "endpoint", "url"),
+        "key": ("key", "apiKey", "api_key", "openaiApiKey", "openai_api_key", "token", "accessToken", "access_token"),
+        "name": ("name", "displayName", "display_name", "label", "title"),
+        "id": ("id", "providerId", "provider_id", "accountId", "account_id"),
+        "integrationKind": ("integrationKind", "integration_kind", "providerType", "provider_type", "adapter", "type"),
+        "modelsEndpoint": ("modelsEndpoint", "models_endpoint", "modelsUrl", "models_url", "modelEndpoint", "model_endpoint"),
+        "balanceEndpoint": ("balanceEndpoint", "balance_endpoint", "usageEndpoint", "usage_endpoint", "quotaEndpoint", "quota_endpoint"),
+        "portalUrl": ("portalUrl", "portal_url", "dashboardUrl", "dashboard_url"),
+        "envKey": ("envKey", "env_key", "apiEnvKey", "api_env_key"),
+        "profileName": ("profileName", "profile_name", "presetName", "preset_name"),
+        "groupId": ("groupId", "group_id", "group"),
+        "presetId": ("presetId", "preset_id"),
+        "originalId": ("originalId", "original_id"),
+    }
+    for target, keys in aliases.items():
+        value = pick(keys)
+        if value is not None:
+            normalized[target] = value
+
+    raw_model = pick(("model", "modelId", "model_id", "apiModel", "api_model"))
+    if isinstance(raw_model, dict):
+        raw_model = _core._model_id_from_entry(raw_model)
+    if raw_model is not None:
+        normalized["model"] = str(raw_model).strip()
+
+    raw_catalog = pick(("models", "modelCatalog", "model_catalog", "availableModels", "available_models", "apiModelCatalog", "api_model_catalog"))
+    if raw_catalog is not None:
+        parsed_catalog = _core._parse_provider_model_catalog(raw_catalog)
+        normalized["models"] = parsed_catalog["models"]
+        if parsed_catalog["modelCapabilities"] and not pick(("modelCapabilities", "model_capabilities")):
+            normalized["modelCapabilities"] = parsed_catalog["modelCapabilities"]
+
+    raw_capabilities = pick(("modelCapabilities", "model_capabilities", "capabilities"))
+    if isinstance(raw_capabilities, dict):
+        normalized["modelCapabilities"] = raw_capabilities
+
+    raw_balance = pick(("balanceSnapshot", "balance_snapshot", "balance", "quota", "usage", "credit", "credits"))
+    if raw_balance is not None:
+        normalized["balanceSnapshot"] = raw_balance
+
+    for target, keys in (
+        ("fetchModels", ("fetchModels", "fetch_models", "discoverModels", "discover_models")),
+        ("fetchBalance", ("fetchBalance", "fetch_balance", "discoverBalance", "discover_balance")),
+        ("activate", ("activate", "setActive", "set_active")),
+        ("proxyEnabled", ("proxyEnabled", "proxy_enabled")),
+    ):
+        value = pick(keys)
+        if value is not None:
+            normalized[target] = value
+    return normalized
+
+
 
 def _probe_provider_models_with_key(
     base_url: str,
@@ -660,10 +847,11 @@ def _probe_provider_models_with_key(
         allow_empty=True,
         allow_query=True,
     )
-    endpoints = [configured_models_endpoint] if configured_models_endpoint else []
-    endpoints.append(f"{configured_base}/models")
-    if not configured_base.endswith("/v1"):
-        endpoints.append(f"{configured_base}/v1/models")
+    endpoints = _core._provider_endpoint_candidates(
+        configured_base,
+        configured_models_endpoint,
+        "models",
+    )
     failures: list[str] = []
     authentication_failure = False
     for endpoint in dict.fromkeys(item for item in endpoints if item):
@@ -774,6 +962,7 @@ def probe_api_account(payload: dict) -> dict:
 
     if not isinstance(payload, dict):
         raise _core.ManagerError("API 账号检测内容无效。")
+    payload = _normalize_api_import_payload(payload)
     base_url = _core._validated_provider_url(payload.get("baseUrl"), "Base URL")
     key = str(payload.get("key") or "").strip()
     if not key:
@@ -851,6 +1040,7 @@ def import_api_account(payload: dict) -> dict:
         try:
             if not isinstance(payload, dict):
                 raise _core.ManagerError("API 账号导入内容无效。")
+            payload = _normalize_api_import_payload(payload)
             base_url = _core._validated_provider_url(payload.get("baseUrl"), "Base URL")
             key = str(payload.get("key") or "").strip()
             if not key:

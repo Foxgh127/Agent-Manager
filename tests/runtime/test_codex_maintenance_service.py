@@ -368,6 +368,45 @@ class CodexMaintenanceServiceTests(unittest.TestCase):
         self.assertTrue(result["noop"])
         run.assert_not_called()
 
+    def test_desktop_bundled_runtime_does_not_count_as_standalone_cli(self):
+        runtime = {
+            "available": True,
+            "source": "desktop_bundled",
+            "desktop": {"version": "26.901.0"},
+            "command": ["codex.exe"],
+        }
+        npm = {"installed": False, "version": None, "npmCommand": None}
+        with (
+            patch.object(core, "codex_runtime_status", return_value=runtime),
+            patch.object(maintenance, "_npm_installation", return_value=npm),
+            patch.object(core, "_registry_json", return_value={"version": "0.153.4"}),
+        ):
+            status = maintenance.update_center_status(force=True)
+        cli = status["components"]["cli"]
+        self.assertFalse(cli["installed"])
+        self.assertEqual(cli["updateState"], "not_installed")
+        self.assertTrue(cli["canAutoInstall"])
+
+    def test_missing_cli_update_uses_standalone_installer(self):
+        before = {
+            "lastError": None,
+            "stale": False,
+            "components": {"cli": {"installed": False, "updateAvailable": None}},
+        }
+        after = {
+            "lastError": None,
+            "stale": False,
+            "components": {"cli": {"installed": True, "installedVersion": "0.153.4", "updateAvailable": False}},
+        }
+        with (
+            patch.object(maintenance, "update_center_status", side_effect=[before, after]),
+            patch.object(core, "install_codex_cli_latest", return_value={"method": "official_native_package", "version": "0.153.4"}) as install,
+        ):
+            result = maintenance.update_cli()
+        install.assert_called_once_with()
+        self.assertTrue(result["installed"])
+        self.assertEqual(result["method"], "official_native_package")
+
     def test_cli_update_invalidates_version_cache_before_refreshing_status(self):
         before = {
             "components": {

@@ -118,6 +118,34 @@ class ProviderCapabilitiesV9Tests(unittest.TestCase):
         self.assertFalse(no_reasoning["supportsVerbosity"])
         self.assertNotIn("unknown-new-model", catalog["modelCapabilities"])
 
+    def test_provider_catalog_accepts_relay_capability_aliases(self):
+        catalog = core._parse_provider_model_catalog(
+            {
+                "models": [
+                    {
+                        "slug": "vision-relay",
+                        "max_tokens": 8192,
+                        "input_modalities": ["text", "image"],
+                        "tool_calling": True,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(catalog["models"], ["vision-relay"])
+        capability = catalog["modelCapabilities"]["vision-relay"]
+        self.assertEqual(capability["maxOutputTokens"], 8192)
+        self.assertTrue(capability["supportsVision"])
+        self.assertTrue(capability["supportsTools"])
+
+    def test_provider_balance_accepts_quota_and_usage_aliases(self):
+        balance = core._parse_provider_balance(
+            {"data": {"totalBalance": "100.00", "totalUsed": "12.5", "currency": "usd"}}
+        )
+        self.assertEqual(balance["amount"], 87.5)
+        self.assertEqual(balance["limit"], 100.0)
+        self.assertEqual(balance["used"], 12.5)
+        self.assertEqual(balance["currency"], "USD")
+
     def test_api_document_import_keeps_embedded_model_capabilities(self):
         imported = core._provider_from_import_candidate(
             {

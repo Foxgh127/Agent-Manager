@@ -1458,6 +1458,7 @@ def _empty_update_center_status() -> dict:
                 "updateAvailable": None,
                 "updateState": "unknown",
                 "canAutoUpdate": False,
+                "canAutoInstall": bool(core.os.name == "nt"),
             },
         },
         "runtime": None,
@@ -1491,6 +1492,7 @@ def _normalize_update_cache(cache: dict) -> dict:
     cli.update(
         {
             "kind": "cli",
+            "canAutoInstall": bool(os.name == "nt"),
             "updateAvailable": update_available,
             "updateState": (
                 "not_installed"
@@ -1543,12 +1545,21 @@ def update_center_status(force: bool = False) -> dict:
             npm = _npm_installation()
             registry = core._registry_json("https://registry.npmjs.org/@openai%2Fcodex/latest")
             latest_cli = str(registry.get("version") or "").strip()
-            installed_cli = str(npm.get("version") or "").strip() or None
+            installed_cli = (
+                str(npm.get("version") or "").strip()
+                or str(runtime.get("version") or "").strip()
+                or None
+            )
             installed_version = _version_tuple(installed_cli)
             available_version = _version_tuple(latest_cli)
             comparable = bool(installed_version and available_version)
             update_available = available_version > installed_version if comparable else None
-            cli_installed = bool(npm.get("installed") or runtime.get("available"))
+            runtime_source = str(runtime.get("source") or "").strip().casefold()
+            # Desktop's bundled/native runtime is not the standalone CLI
+            # shown in this card.  Keep the products separate so a missing
+            # CLI can trigger an actual download.
+            standalone_sources = {"manager_managed", "npm_javascript", "configured", "system_path"}
+            cli_installed = bool(npm.get("installed") or runtime_source in standalone_sources)
             cli_state = (
                 "not_installed"
                 if not cli_installed
@@ -1563,13 +1574,14 @@ def update_center_status(force: bool = False) -> dict:
                 "desktop": desktop_updates.check(desktop),
                 "cli": {
                     "kind": "cli",
-                    "ownership": "npm" if npm.get("installed") else runtime.get("source"),
+                    "ownership": "npm" if npm.get("installed") else (runtime.get("source") if cli_installed else None),
                     "installed": cli_installed,
                     "installedVersion": installed_cli,
                     "availableVersion": latest_cli or None,
                     "updateAvailable": update_available,
                     "updateState": cli_state,
                     "canAutoUpdate": bool(npm.get("installed") and npm.get("npmCommand")),
+                    "canAutoInstall": bool(core.os.name == "nt"),
                     "runtimeSource": runtime.get("source"),
                     "command": runtime.get("command"),
                 },
@@ -1614,6 +1626,21 @@ def update_cli() -> dict:
         if status.get("lastError") or status.get("stale"):
             raise core.ManagerError("官方版本检查未成功，未使用旧缓存执行 Codex CLI 更新。")
         cli = status.get("components", {}).get("cli", {})
+        if cli.get("installed") is False:
+            result = core.install_codex_cli_latest()
+            refreshed = update_center_status(force=True)
+            refreshed_cli = refreshed.get("components", {}).get("cli", {})
+            if refreshed.get("lastError") or refreshed_cli.get("installed") is not True:
+                raise core.ManagerError("Codex CLI 已执行安装，但复检未发现独立 CLI，请重新检查。")
+            return {
+                "updated": True,
+                "installed": True,
+                "version": result.get("version") or refreshed_cli.get("installedVersion"),
+                "method": result.get("method"),
+                "status": refreshed,
+                "desktopUnaffected": True,
+                "message": result.get("message") or "Codex CLI 已安装并通过检查。",
+            }
         if cli.get("updateAvailable") is False:
             return {
                 "updated": False,
@@ -1626,7 +1653,20 @@ def update_cli() -> dict:
         if cli.get("updateAvailable") is not True:
             raise core.ManagerError("无法可靠比较 Codex CLI 的已安装版本与官方版本，未执行更新。")
         if not cli.get("canAutoUpdate"):
-            raise core.ManagerError("当前 Codex CLI 不是由 npm 管理，不能自动覆盖；可用“扫描并修复”部署受管运行时。")
+            result = core.install_codex_cli_latest()
+            refreshed = update_center_status(force=True)
+            refreshed_cli = refreshed.get("components", {}).get("cli", {})
+            if refreshed.get("lastError") or refreshed_cli.get("installed") is not True:
+                raise core.ManagerError("Codex CLI 已执行安装，但复检未发现独立 CLI，请重新检查。")
+            return {
+                "updated": True,
+                "installed": True,
+                "version": result.get("version") or refreshed_cli.get("installedVersion"),
+                "method": result.get("method"),
+                "status": refreshed,
+                "desktopUnaffected": True,
+                "message": result.get("message") or "Codex CLI 已更新并通过检查。",
+            }
         latest = str(cli.get("availableVersion") or "").strip()
         if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", latest):
             raise core.ManagerError("官方 npm 返回的 Codex CLI 版本号无效。")

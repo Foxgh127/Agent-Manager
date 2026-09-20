@@ -4644,6 +4644,12 @@ class AgentManagerTests(unittest.TestCase):
             core._provider_models_from_import({"models": {"mapped-model": {}}}),
             ["mapped-model"],
         )
+        self.assertEqual(
+            core._parse_provider_model_catalog(
+                {"data": [{"model_id": "gpt-model-id"}, {"modelName": "gpt-model-name"}]}
+            )["models"],
+            ["gpt-model-id", "gpt-model-name"],
+        )
 
     def test_history_sync_appends_safely_and_reports_divergence(self):
         local = self.root / "sessions" / "2026" / "task.jsonl"

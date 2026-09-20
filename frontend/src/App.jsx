@@ -5528,10 +5528,45 @@ function AccountsView({
       confirmLabel: "删除本机账号",
     });
     if (!approved) return;
-    act(async () => {
+    const pendingId = `relay:${account.id}`;
+    markPending(pendingId, true);
+    try {
       await api(`/api/relay-accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
+      const providerId = String(account.providerId || "");
+      updateData((current) => {
+        if (!current) return current;
+        const web2api = current.settings.web2api || {};
+        const sourceId = providerId ? `provider:${providerId}` : "";
+        return {
+          ...current,
+          settings: {
+            ...current.settings,
+            relayAccounts: (current.settings.relayAccounts || []).filter(
+              (item) => String(item.id || "") !== String(account.id),
+            ),
+            providers: providerId
+              ? current.settings.providers.filter((item) => String(item.id || "") !== providerId)
+              : current.settings.providers,
+            web2api: {
+              ...web2api,
+              providerIds: (web2api.providerIds || []).filter((id) => String(id) !== providerId),
+              sourceOrder: (web2api.sourceOrder || []).filter((id) => String(id) !== sourceId),
+            },
+          },
+          modelSources: providerId
+            ? current.modelSources.filter((source) => source.id !== sourceId)
+            : current.modelSources,
+          selectedModelKeys: providerId
+            ? (current.selectedModelKeys || []).filter((key) => !String(key).startsWith(`${sourceId}::`))
+            : current.selectedModelKeys,
+        };
+      });
       notify(`${account.name || account.siteName || "中转站账号"} 已从本机删除`);
-    });
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      markPending(pendingId, false);
+    }
   };
   const toggleProxy = async (item, enabled) => {
     const poolKey = item.kind === "provider" ? "providerIds" : "accountIds";
@@ -5643,7 +5678,8 @@ function AccountsView({
       confirmLabel: "删除本机记录",
     });
     if (!approved) return;
-    act(async () => {
+    setBusy(true);
+    try {
       const path =
         item.kind === "account"
           ? `/api/accounts/${encodeURIComponent(item.recordId)}`
@@ -5654,13 +5690,18 @@ function AccountsView({
         next.delete(item.id);
         return next;
       });
+      await reloadConnections();
       notify(
         result.configurationWarning
           ? `${item.name} 已删除；${result.configurationWarning}`
           : `${item.name} 已删除，相关子代理槽位已恢复默认`,
         result.configurationWarning ? "warning" : "success",
       );
-    });
+    } catch (error) {
+      notify(error.message, "error");
+    } finally {
+      setBusy(false);
+    }
   };
   const refreshAll = () =>
     act(async () => {
@@ -10827,13 +10868,13 @@ function UpdateEmergencyPanel({ data, reload, notify, confirm }) {
         <article className="update-component">
           <span className="update-icon cli"><Bot size={20} /></span>
           <div className="update-copy"><small>CODEX CLI</small><strong>{cli.currentVersion || cli.installedVersion || (cliMissing ? "尚未安装" : "未检测")}</strong><p role="status">{cliActivity ? (loading ? "正在检查更新" : working === "cli-deploy" ? "正在部署运行时" : "正在安装更新") : cliMissing ? "需要时可部署官方 CLI" : cliHasUpdate === true ? `可更新到 ${cli.latestVersion || cli.availableVersion || cli.version || "最新版"}` : cliHasUpdate === false ? "已是最新版" : "刷新状态后确认版本"}</p></div>
-          {cliMissing ? <UpdateAction busy={cliActivity} disabled={actionsDisabled} download label="一键部署" onClick={async () => {
-            const approved = await confirm({ title: "一键部署 Codex CLI？", message: "将先复用 Codex Desktop 内置运行时，再按环境选择官方安装方式并完成版本回验。", detail: "不会把 codex.cmd、codex.bat 或 codex.ps1 写入 CODEX_CLI_PATH；失败会保留现有环境并返回具体原因。", confirmLabel: "开始部署" });
-            if (approved) await action("cli-deploy", () => api("/api/codex-runtime/deploy", {
+          {cliMissing ? <UpdateAction busy={cliActivity} disabled={actionsDisabled} download label="下载最新版" onClick={async () => {
+            const approved = await confirm({ title: "下载最新版 Codex CLI？", message: "将检测 npm；如果电脑没有独立 CLI，则自动下载并校验官方最新版平台包。", detail: "Codex Desktop 的内置运行时不会被覆盖，也不会把包装脚本写入 CODEX_CLI_PATH。", confirmLabel: "下载并安装" });
+            if (approved) await action("cli-deploy", () => api("/api/updates/cli", {
               method: "POST",
               body: "{}",
               timeoutMs: 600_000,
-            }), "Codex CLI 已部署并通过检查");
+            }), "Codex CLI 已安装并通过检查");
           }} /> : cliHasUpdate === true ? <UpdateAction busy={cliActivity} disabled={actionsDisabled} download label="更新 CLI" onClick={async () => {
             const approved = await confirm({ title: "更新 Codex CLI？", message: "将更新独立的 npm Codex CLI，不会重启 Codex Desktop。", detail: "不会创建或修改 CODEX_CLI_PATH；桌面端继续自动使用安装包内的原生 codex.exe。", confirmLabel: "更新 CLI" });
             if (approved) await action("cli", () => api("/api/updates/cli", {
