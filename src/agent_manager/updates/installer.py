@@ -377,9 +377,19 @@ function Read-PersistentEnvironment([string]$scope) {
 function New-ManagerStartInfo {
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $script:installTarget
+    # An update starts a brand-new executable after the source process has
+    # exited. Keep this private argument so startup cannot mistake a stale
+    # runtime discovery file for the live replacement and return immediately
+    # after waking the old instance. It is parsed by the packaged manager and
+    # never exposed in the normal command-line help.
+    $info.Arguments = '--update-restart'
     $info.WorkingDirectory = [IO.Path]::GetDirectoryName($script:installTarget)
-    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
-    $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    # ProcessStartInfo.Hidden is inherited by the first GUI window on some
+    # Windows/WebView2 combinations. The helper itself is already hidden; the
+    # replacement manager must be launched as a normal desktop process so its
+    # native window is visible after the update completes.
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $false
+    $info.WindowStyle = [Diagnostics.ProcessWindowStyle]::Normal
     # The helper was launched BEFORE overlay recovery. Never pass its cached
     # credentials/runtime bootloader variables into the new manager baseline.
     $info.EnvironmentVariables.Clear()

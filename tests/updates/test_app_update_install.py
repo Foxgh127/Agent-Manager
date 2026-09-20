@@ -178,7 +178,10 @@ $info = New-ManagerStartInfo
 if ($info.FileName -cne $script:installSpec.target -or
     $info.EnvironmentVariables['USERPROFILE'] -cne $profilePath -or
     $info.EnvironmentVariables['APPDATA'] -cne $profilePath -or
-    $info.EnvironmentVariables['LOCALAPPDATA'] -cne $profilePath) { throw 'Unicode profile path changed.' }
+    $info.EnvironmentVariables['LOCALAPPDATA'] -cne $profilePath -or
+    $info.Arguments -cne '--update-restart' -or
+    $info.CreateNoWindow -ne $false -or
+    $info.WindowStyle -ne [Diagnostics.ProcessWindowStyle]::Normal) { throw 'Update restart launch settings changed.' }
 Assert-Hash $info.FileName $script:installSpec.originalSha256 $script:installSpec.originalSize
 Save-Result 'unicode-paths' $info.FileName
 """, invoke=False)

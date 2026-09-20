@@ -1470,6 +1470,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--browser", action="store_true", help="Use Edge/default browser instead of WebView2.")
     parser.add_argument("--quick-restart-token", help=_app.argparse.SUPPRESS)
+    parser.add_argument("--update-restart", action="store_true", help=_app.argparse.SUPPRESS)
     args = parser.parse_args(raw_argv)
     # A normal second click only needs to reveal the already independent live
     # instance. Do that before another PyInstaller Job handoff; otherwise a

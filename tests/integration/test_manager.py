@@ -9209,6 +9209,21 @@ class AgentManagerTests(unittest.TestCase):
         relaunch.assert_called_once_with([argument])
         run_server.assert_not_called()
 
+    def test_main_update_restart_skips_stale_runtime_fast_wake(self):
+        argument = "--update-restart"
+        with (
+            patch.object(app, "_consume_shell_job_handoff", return_value=([argument], False)),
+            patch.object(app, "open_existing_runtime") as wake,
+            patch.object(app, "_relaunch_frozen_manager_outside_parent_job", return_value=True) as relaunch,
+            patch.object(app, "run_server") as run_server,
+        ):
+            result = app.main([argument])
+
+        self.assertEqual(result, 0)
+        wake.assert_not_called()
+        relaunch.assert_called_once_with([argument])
+        run_server.assert_not_called()
+
     def test_existing_instance_fast_wake_rejects_oversized_runtime_file(self):
         runtime_file = self.root / "agent-manager" / "app-runtime.json"
         runtime_file.parent.mkdir(parents=True, exist_ok=True)
