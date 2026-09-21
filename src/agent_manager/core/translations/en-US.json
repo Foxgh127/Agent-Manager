@@ -1,0 +1,27 @@
+{
+  "errors": {
+    "account_not_found": "Account not found",
+    "invalid_runtime_url": "Invalid Codex runtime metadata URL",
+    "batch_request_range": "Codex App Server batch request count must be between {min} and {max}.",
+    "request_invalid": "Codex App Server request format is invalid.",
+    "config_read_failed": "Configuration read failed: {error}",
+    "config_write_failed": "Configuration write failed: {error}",
+    "network_timeout": "Network request timeout",
+    "auth_failed": "Authentication failed",
+    "invalid_credentials": "Invalid credentials"
+  },
+  "messages": {
+    "starting_server": "Starting server...",
+    "server_started": "Server started",
+    "stopping_server": "Stopping server...",
+    "server_stopped": "Server stopped",
+    "switching_account": "Switching account...",
+    "account_switched": "Account switched successfully"
+  },
+  "validation": {
+    "required_field": "Required field",
+    "invalid_format": "Invalid format",
+    "min_length": "Minimum length is {min}",
+    "max_length": "Maximum length is {max}"
+  }
+}

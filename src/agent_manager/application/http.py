@@ -27,7 +27,14 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _headers(self, content_type: str, length: int, status: int = 200, cache: str = "no-store") -> None:
+    def _headers(
+        self,
+        content_type: str,
+        length: int,
+        status: int = 200,
+        cache: str = "no-store",
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
@@ -40,9 +47,17 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
             "connect-src 'self'; font-src 'self'; frame-ancestors 'none'",
         )
+        for key, value in (extra_headers or {}).items():
+            self.send_header(str(key), str(value))
         self.end_headers()
 
-    def _json(self, payload: object, status: int = 200) -> None:
+    def _json(
+        self,
+        payload: object,
+        status: int = 200,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         data = _app.json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(data) > _app.MAX_RESPONSE_BYTES:
             status = 413
@@ -50,7 +65,22 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
                 {"ok": False, "error": "响应内容过大，请缩小查询范围后重试。"},
                 ensure_ascii=False,
             ).encode("utf-8")
-        self._headers("application/json; charset=utf-8", len(data), status)
+        if extra_headers:
+            try:
+                self._headers(
+                    "application/json; charset=utf-8",
+                    len(data),
+                    status,
+                    extra_headers=extra_headers,
+                )
+            except TypeError as exc:
+                # Keep compatibility with light-weight test doubles and
+                # adapters that implement the historical four-argument hook.
+                if "extra_headers" not in str(exc):
+                    raise
+                self._headers("application/json; charset=utf-8", len(data), status)
+        else:
+            self._headers("application/json; charset=utf-8", len(data), status)
         self.wfile.write(data)
 
     def _error(self, message: str, status: int = 400) -> None:
@@ -121,6 +151,36 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         return _app.secrets.compare_digest(self.headers.get("X-Agent-Manager-Token", ""), self.server.api_token)
+
+    def _rate_limit_category(self, path: str) -> str:
+        if path == "/api/oauth/status":
+            # The UI polls this read-only endpoint while a browser login is in
+            # progress; applying the callback budget here would throttle a
+            # normal login flow.
+            return "api"
+        if path.startswith("/api/oauth/") or (path.startswith("/api/accounts/") and path.endswith("/reauth")):
+            return "oauth"
+        if path in {"/api/session/bootstrap", "/api/window/show", _app.CONTROL_QUICK_RESTART_PATH}:
+            return "auth"
+        return "api"
+
+    def _check_rate_limit(self, path: str) -> bool:
+        checker = getattr(self.server, "check_rate_limit", None)
+        if not callable(checker):
+            return True
+        address = getattr(self, "client_address", ("unknown", 0))
+        client_id = str(address[0] if isinstance(address, tuple) and address else "unknown")
+        allowed, remaining = checker(self._rate_limit_category(path), client_id=client_id)
+        if allowed:
+            return True
+        retry_after = "300" if self._rate_limit_category(path) == "oauth" else "60"
+        self._json(
+            {"ok": False, "error": "请求过于频繁，请稍后重试。", "remaining": remaining},
+            429,
+            extra_headers={"Retry-After": retry_after},
+        )
+        self.close_connection = True
+        return False
 
     def _request_host_is_valid(self) -> bool:
         supplied = str(self.headers.get("Host") or "").strip()
@@ -216,6 +276,57 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
             return min(_app.MAX_BODY_BYTES, _app.MAX_CONFIG_BODY_BYTES)
         return min(_app.MAX_BODY_BYTES, _app.DEFAULT_JSON_BODY_BYTES)
 
+    def _read_request_body_streaming(self, max_size: int | None = None) -> bytes:
+        """Read a bounded request body in chunks and reject truncation.
+
+        ``BaseHTTPRequestHandler`` exposes a buffered socket, so a single
+        ``read(length)`` can still create a large temporary allocation. The
+        endpoint-specific limit is checked before reading and every chunk is
+        counted while it arrives. This helper is intentionally independent of
+        JSON decoding so upload routes can reuse the same framing guarantees.
+        """
+
+        if not self._request_framing_is_valid():
+            self._request_body_handled = True
+            raise _app.core.ManagerError("请求 HTTP framing 无效。")
+        content_lengths = self._content_length_values()
+        raw_length = content_lengths[0] if content_lengths else "0"
+        try:
+            length = int(raw_length, 10)
+        except (TypeError, ValueError) as exc:
+            self._request_body_handled = True
+            raise _app.core.ManagerError("请求长度无效。") from exc
+        limit = self._request_body_limit() if max_size is None else int(max_size)
+        if length < 0 or length > max(0, limit):
+            self._request_body_handled = True
+            if length > max(0, limit):
+                self.close_connection = True
+            raise _app.core.ManagerError(
+                f"请求内容为空或超过当前接口的安全限制（最大 {max(0, limit)} 字节）。"
+            )
+        if length == 0:
+            self._request_body_handled = True
+            return b""
+        chunks: list[bytes] = []
+        remaining = length
+        try:
+            while remaining:
+                chunk = self.rfile.read(min(65_536, remaining))
+                if not chunk:
+                    self.close_connection = True
+                    raise _app.core.ManagerError("请求内容未完整接收。")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        except _app.core.ManagerError:
+            self._request_body_handled = True
+            raise
+        except (OSError, TimeoutError):
+            self._request_body_handled = True
+            self.close_connection = True
+            raise
+        self._request_body_handled = True
+        return b"".join(chunks)
+
     def _read_json(self, optional: bool = False) -> dict:
         if not self._request_framing_is_valid():
             self._request_body_handled = True
@@ -240,11 +351,7 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
             self._request_body_handled = True
             raise _app.core.ManagerError("JSON 请求必须使用 Content-Type: application/json。")
         try:
-            raw = self.rfile.read(length)
-            self._request_body_handled = True
-            if len(raw) != length:
-                self.close_connection = True
-                raise _app.core.ManagerError("请求内容未完整接收。")
+            raw = self._read_request_body_streaming(self._request_body_limit())
             payload = _app.json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, _app.json.JSONDecodeError) as exc:
             raise _app.core.ManagerError("请求 JSON 无效。") from exc
@@ -290,6 +397,8 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
         parsed_request = _app.urlparse(self.path)
         path = parsed_request.path
         query = _app.urllib.parse.parse_qs(parsed_request.query, keep_blank_values=True)
+        if path.startswith("/api/") and path != "/api/health" and not self._check_rate_limit(path):
+            return
         if path == "/api/health":
             from agent_manager.platform.dlls import runtime_status as dll_runtime_status
             self._json(
@@ -520,6 +629,8 @@ class RequestHandler(_app.BaseHTTPRequestHandler):
         if not self._validate_local_request(write=True):
             return
         path = _app.urlparse(self.path).path
+        if not self._check_rate_limit(path):
+            return
         if path == "/api/window/show":
             supplied = self.headers.get("X-Agent-Manager-Activation", "")
             if not _app.secrets.compare_digest(supplied, self.server.activation_token):

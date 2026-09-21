@@ -6887,6 +6887,8 @@ function OrchestrationView({
   const runtimeTouchedRef = useRef(false);
   const configInitialRawRef = useRef("");
   const configInitialDraftsRef = useRef({});
+  const observedSourceIdRef = useRef(String(data.settings.modelWorkspace.activeSourceId || ""));
+  const pendingRouteConfigRefreshRef = useRef(false);
   const hydrateCodexConfigDocument = useCallback((document, syncRuntime = false) => {
     const nextDocument = document || {
       valid: true,
@@ -7075,6 +7077,20 @@ function OrchestrationView({
     (key) => configEntryDrafts[key] !== configInitialDraftsRef.current[key],
   );
   const configDirty = configRawDirty || configVisualDirty;
+  const activeSourceId = String(data.settings.modelWorkspace.activeSourceId || "");
+  useEffect(() => {
+    if (observedSourceIdRef.current !== activeSourceId) {
+      observedSourceIdRef.current = activeSourceId;
+      pendingRouteConfigRefreshRef.current = true;
+    }
+    if (!pendingRouteConfigRefreshRef.current || configDirty || configSaving) return;
+    pendingRouteConfigRefreshRef.current = false;
+    // Account/provider switches rewrite config.toml and may change the
+    // official context capability (including the 1M route).  Refresh the
+    // document after the state snapshot arrives so the routing page cannot
+    // keep showing the previous provider's limits.
+    loadCodexConfig(true).catch(() => {});
+  }, [activeSourceId, configDirty, configSaving, loadCodexConfig]);
   const dirty = orchestrationDirty || configDirty;
   const configSections = useMemo(() => {
     const sections = new Map();

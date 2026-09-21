@@ -1,0 +1,27 @@
+{
+  "errors": {
+    "account_not_found": "账号不存在",
+    "invalid_runtime_url": "官方 Codex 运行时元数据地址无效",
+    "batch_request_range": "Codex App Server 批量请求数量必须在 {min} 到 {max} 之间。",
+    "request_invalid": "Codex App Server 请求格式无效。",
+    "config_read_failed": "配置读取失败: {error}",
+    "config_write_failed": "配置写入失败: {error}",
+    "network_timeout": "网络请求超时",
+    "auth_failed": "认证失败",
+    "invalid_credentials": "无效的凭据"
+  },
+  "messages": {
+    "starting_server": "正在启动服务器...",
+    "server_started": "服务器已启动",
+    "stopping_server": "正在停止服务器...",
+    "server_stopped": "服务器已停止",
+    "switching_account": "正在切换账号...",
+    "account_switched": "账号切换成功"
+  },
+  "validation": {
+    "required_field": "必填字段",
+    "invalid_format": "格式无效",
+    "min_length": "最小长度为 {min}",
+    "max_length": "最大长度为 {max}"
+  }
+}

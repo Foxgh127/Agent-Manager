@@ -26,6 +26,11 @@ class OAuthDeviceLogin:
         on_account_saved: object | None = None,
     ) -> None:
         self.lock = _app.threading.RLock()
+        # ``_state_lock`` is kept as an explicit alias for callers that need to
+        # coordinate a state read/update with a callback timeout. The state
+        # object itself remains owned by ``lock`` so older integrations and the
+        # current implementation share one synchronization primitive.
+        self._state_lock = self.lock
         self.timeout_seconds = max(10.0, float(timeout_seconds))
         self.deadline_monotonic: float | None = None
         self.callback_server: ThreadingHTTPServer | None = None
@@ -63,6 +68,32 @@ class OAuthDeviceLogin:
         self._expire_if_due()
         with self.lock:
             return _app.json.loads(_app.json.dumps(self.data))
+
+    def _get_state_safe(self, login_id: str | None = None) -> dict | None:
+        """Return a copy of the active OAuth state under the shared lock."""
+
+        with self._state_lock:
+            current = self.data if isinstance(self.data, dict) else None
+            if current is None:
+                return None
+            if login_id is not None and current.get("loginId") != login_id:
+                return None
+            return _app.json.loads(_app.json.dumps(current))
+
+    def _set_state_safe(self, state_data: dict) -> None:
+        """Replace the public OAuth state atomically."""
+
+        if not isinstance(state_data, dict):
+            raise TypeError("state_data must be a dict")
+        with self._state_lock:
+            self.data = _app.json.loads(_app.json.dumps(state_data))
+
+    def _clear_state_safe(self, login_id: str | None = None) -> None:
+        """Clear state only when it still belongs to ``login_id``."""
+
+        with self._state_lock:
+            if login_id is None or self.data.get("loginId") == login_id:
+                self.data = self._new_state("idle")
 
     def _clear_secrets_locked(self) -> None:
         self.expected_state = None

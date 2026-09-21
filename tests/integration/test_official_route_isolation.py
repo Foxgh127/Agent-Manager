@@ -94,6 +94,91 @@ def test_official_config_removes_orphan_endpoint_absent_from_cards(official):
     assert config.get("model_provider", "openai") == "openai"
 
 
+def test_provider_readiness_skips_chatgpt_identity_probe(official, monkeypatch):
+    root, settings, _account, _source = official
+    settings["providers"] = [{
+        "id": "relay",
+        "kind": "custom",
+        "name": "Relay",
+        "baseUrl": "https://relay.example.invalid/v1",
+        "envKey": "RELAY_API_KEY",
+    }]
+    core.CONFIG_FILE.write_text(
+        f'model = "{MODEL}"\nmodel_provider = "relay"\n'
+        '[model_providers.relay]\n'
+        'base_url = "https://relay.example.invalid/v1"\n'
+        'env_key = "RELAY_API_KEY"\n'
+        'wire_api = "responses"\n',
+        encoding="utf-8",
+    )
+    calls = []
+
+    def request(requests, **kwargs):
+        calls.append((requests, kwargs))
+        assert [method for method, _params in requests] == ["model/list", "config/read"]
+        assert requests[-1][1]["cwd"] == str(root.resolve())
+        return [
+            {"data": [{"id": MODEL}]},
+            {"config": {
+                "model": MODEL,
+                "model_provider": "relay",
+                "model_providers": {"relay": {
+                    "base_url": "https://relay.example.invalid/v1",
+                    "env_key": "RELAY_API_KEY",
+                    "wire_api": "responses",
+                }},
+            }},
+        ]
+
+    monkeypatch.setattr(core, "codex_app_server_requests", request)
+    result = core.wait_for_codex_runtime_ready(
+        expected_model=MODEL,
+        timeout_seconds=1,
+        launch_plan={"apiProviderId": "relay", "workspace": str(root)},
+    )
+    assert result["ready"]
+    assert calls
+
+
+def test_invalid_probe_workspace_falls_back_to_recent_workspace(official, monkeypatch):
+    root, _settings, account, _source = official
+    runtime = root / "codex.exe"
+    runtime.write_bytes(b"synthetic")
+    monkeypatch.setattr(core, "_recent_codex_workspace", lambda: root)
+
+    def spawn(command, **kwargs):
+        assert command == [str(runtime), "app-server", "--listen", "stdio://"]
+        assert kwargs["cwd"] == str(root.resolve())
+        raise core.ManagerError("synthetic workspace checkpoint")
+
+    monkeypatch.setattr(core.subprocess, "Popen", spawn)
+    with pytest.raises(core.ManagerError, match="synthetic workspace checkpoint"):
+        APP_SERVER_REQUESTS(
+            [("model/list", {})],
+            launch_plan={
+                "officialAccountId": account["id"],
+                "appServerExecutable": str(runtime),
+                "workspace": str(root / "deleted-project"),
+            },
+        )
+
+
+def test_isolated_runtime_removes_all_configured_relay_variables(official, monkeypatch):
+    _root, settings, _account, _source = official
+    settings["providers"] = [
+        {"id": "relay-a", "kind": "custom", "envKey": "RELAY_A_KEY"},
+        {"id": "relay-b", "kind": "custom", "envKey": "RELAY_B_KEY"},
+    ]
+    monkeypatch.setenv("RELAY_A_KEY", "old-a")
+    monkeypatch.setenv("RELAY_B_KEY", "old-b")
+    env = core._codex_runtime_environment(
+        {"RELAY_A_KEY": "override-a", "RELAY_B_KEY": "override-b"},
+        official=True,
+    )
+    assert "RELAY_A_KEY" not in env
+    assert "RELAY_B_KEY" not in env
+
+
 def test_gateway_audit_keeps_official_oauth_separate_from_relay_adapters():
     from agent_manager.gateway.service import routing_safety_audit
 
@@ -193,6 +278,7 @@ def test_package_identity_launch_preserves_custom_home_inside_store_package(offi
     )
     assert ok
     assert method == "package_identity"
+    assert run.call_args.kwargs["env"]["CODEX_HOME"] == str(root)
     command = run.call_args.args[0][-1]
     assert "Invoke-CommandInDesktopPackage" in command
     encoded = command.split("-EncodedCommand ", 1)[1].split("'", 1)[0]

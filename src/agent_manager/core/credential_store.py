@@ -14,10 +14,41 @@ def _make_blob(data: bytes) -> tuple[_core.DataBlob, _core.ctypes.Array]:
 
 
 
-def dpapi_protect(secret: str) -> bytes:
+_MAX_DPAPI_PAYLOAD_BYTES = 1024 * 1024
+
+
+def _validated_dpapi_bytes(value: object, *, name: str, minimum: int = 1) -> bytes:
+    """Validate a DPAPI payload before passing it to the native API.
+
+    DPAPI accepts an opaque byte buffer. The application historically exposed
+    ``dpapi_protect`` as a string API, so strings remain supported while bytes
+    are accepted for callers that already have an encoded payload. Keeping the
+    checks here means malformed input is rejected consistently on every
+    platform, before the Windows-only guard or ctypes call runs.
+    """
+
+    if isinstance(value, str):
+        payload = value.encode("utf-8")
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        payload = bytes(value)
+    else:
+        raise ValueError(f"{name} must be bytes or str")
+    if not payload:
+        raise ValueError(f"{name} cannot be empty")
+    if len(payload) < minimum:
+        raise ValueError(f"{name} too short: minimum {minimum} bytes required")
+    if len(payload) > _MAX_DPAPI_PAYLOAD_BYTES:
+        raise ValueError(
+            f"{name} too large: maximum {_MAX_DPAPI_PAYLOAD_BYTES} bytes allowed"
+        )
+    return payload
+
+
+def dpapi_protect(secret: str | bytes) -> bytes:
+    plaintext = _validated_dpapi_bytes(secret, name="Plaintext")
     if _core.os.name != "nt":
         raise _core.ManagerError("DPAPI 密钥存储仅支持 Windows。")
-    in_blob, in_buffer = _core._make_blob(secret.encode("utf-8"))
+    in_blob, in_buffer = _core._make_blob(plaintext)
     out_blob = _core.DataBlob()
     ok = _core.ctypes.windll.crypt32.CryptProtectData(
         _core.ctypes.byref(in_blob), _core.APP_NAME, None, None, None, 0x1, _core.ctypes.byref(out_blob)
@@ -33,6 +64,7 @@ def dpapi_protect(secret: str) -> bytes:
 
 
 def dpapi_unprotect(ciphertext: bytes) -> str:
+    ciphertext = _validated_dpapi_bytes(ciphertext, name="Ciphertext", minimum=16)
     if _core.os.name != "nt":
         raise _core.ManagerError("DPAPI 密钥存储仅支持 Windows。")
     in_blob, in_buffer = _core._make_blob(ciphertext)

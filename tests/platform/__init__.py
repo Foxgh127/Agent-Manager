@@ -1,0 +1,1 @@
+"""Platform helper tests."""

@@ -2,7 +2,33 @@
 from __future__ import annotations
 
 import json
+import re
 import agent_manager.core as core
+
+
+_EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
+
+def validate_email(email: object) -> bool:
+    """Return whether *email* is a bounded, syntactically valid address.
+
+    Reauthentication compares identities from two independently sourced
+    documents. Rejecting empty, non-string, oversized, or malformed values
+    before comparison avoids treating malformed data as a valid account match.
+    This intentionally validates syntax only; mailbox ownership belongs to the
+    OAuth provider.
+    """
+
+    if not isinstance(email, str):
+        return False
+    candidate = email.strip()
+    if not candidate or len(candidate) > 254 or any(ord(char) < 32 for char in candidate):
+        return False
+    return _EMAIL_PATTERN.fullmatch(candidate) is not None
 
 
 def target(account_id: str) -> dict:
@@ -20,6 +46,10 @@ def reauthenticate(account_id: str, auth_bytes: bytes) -> dict:
         _snapshot, identity = core._snapshot_from_bytes(auth_bytes, None)
         previous_email = str(account.get("email") or "").strip().casefold()
         incoming_email = str(identity.get("email") or "").strip().casefold()
+        if previous_email and not validate_email(previous_email):
+            raise core.ManagerError("已保存账号的邮箱格式无效，未执行重新认证。")
+        if incoming_email and not validate_email(incoming_email):
+            raise core.ManagerError("重新认证返回的邮箱格式无效，原账号未被覆盖。")
         if not core._account_matches_identity(account, identity) or (
             previous_email and incoming_email and previous_email != incoming_email
         ):

@@ -30,3 +30,6 @@ release/
 
 frontend/.preview/
 src/agent_manager/resources/ui/
+
+# 临时备份文件（模块化时使用）
+src/agent_manager/core/*.py.bak

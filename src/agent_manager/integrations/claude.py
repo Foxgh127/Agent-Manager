@@ -21,6 +21,7 @@ import urllib.parse
 import uuid
 
 import agent_manager.core as core
+from agent_manager.platform.paths import is_windows_store_path
 
 
 PROFILE_ID = "00000000-0000-4000-8000-000000a6e17a"
@@ -271,7 +272,7 @@ def _running_claude_desktop_processes() -> list[dict]:
     for row in rows:
         path = str(row.get("ExecutablePath") or "")
         normalized = path.replace("/", "\\").casefold()
-        if path and ("\\claude\\" in normalized or "\\windowsapps\\" in normalized):
+        if path and ("\\claude\\" in normalized or is_windows_store_path(path)):
             result.append({"pid": row.get("ProcessId"), "name": row.get("Name"), "path": path})
     return result
 

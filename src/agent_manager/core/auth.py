@@ -1,6 +1,178 @@
 """Auth services."""
 from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import threading
+import time
+
 from agent_manager import core as _core
+
+
+_JWT_PUBLIC_KEYS: dict[str, object] = {}
+_JWT_PUBLIC_KEYS_LOCK = threading.RLock()
+_JWT_MAX_BYTES = 256_000
+_JWT_ALLOWED_ALGORITHMS = frozenset({"RS256", "ES256", "HS256"})
+
+
+def load_jwt_public_key(key_id: str, pem_data: bytes | str | object) -> None:
+    """Register a key used by :func:`validate_jwt_with_signature`.
+
+    The registry is deliberately explicit. A token whose ``kid`` is unknown
+    is rejected instead of falling back to unsigned payload parsing. PEM bytes,
+    HMAC secrets, and already-loaded cryptography key objects are supported so
+    callers can choose the key transport appropriate to their deployment.
+    """
+
+    normalized_id = str(key_id or "").strip()
+    if not normalized_id or len(normalized_id) > 128:
+        raise ValueError("JWT key_id must be a non-empty value up to 128 characters")
+    if isinstance(pem_data, str):
+        key = pem_data.encode("utf-8")
+    elif isinstance(pem_data, (bytes, bytearray, memoryview)):
+        key = bytes(pem_data)
+    else:
+        key = pem_data
+    if isinstance(key, (bytes, bytearray)) and not key:
+        raise ValueError("JWT key material cannot be empty")
+    if isinstance(key, (bytes, bytearray)) and len(key) > _JWT_MAX_BYTES:
+        raise ValueError("JWT key material is too large")
+    with _JWT_PUBLIC_KEYS_LOCK:
+        _JWT_PUBLIC_KEYS[normalized_id] = key
+
+
+def clear_jwt_public_keys() -> None:
+    """Clear registered verification keys (useful for rotation and tests)."""
+
+    with _JWT_PUBLIC_KEYS_LOCK:
+        _JWT_PUBLIC_KEYS.clear()
+
+
+def _b64url_decode(value: str, *, label: str) -> bytes:
+    if not isinstance(value, str) or not value or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for char in value):
+        raise ValueError(f"Invalid JWT {label}")
+    try:
+        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError(f"Invalid JWT {label}") from exc
+
+
+def _jwt_segments(token: str) -> tuple[dict, dict, bytes]:
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("JWT token must be a non-empty string")
+    if len(token.encode("utf-8", errors="replace")) > _JWT_MAX_BYTES:
+        raise ValueError("JWT token is too large")
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("JWT must contain exactly three segments")
+    try:
+        header = json.loads(_b64url_decode(parts[0], label="header").decode("utf-8"))
+        payload = json.loads(_b64url_decode(parts[1], label="payload").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid JWT JSON") from exc
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise ValueError("JWT header and payload must be objects")
+    signature = b"" if parts[2] == "" else _b64url_decode(parts[2], label="signature")
+    return header, payload, signature
+
+
+def _jwt_key_for(key_id: str) -> object:
+    with _JWT_PUBLIC_KEYS_LOCK:
+        if key_id not in _JWT_PUBLIC_KEYS:
+            raise ValueError(f"Unknown JWT key id: {key_id}")
+        return _JWT_PUBLIC_KEYS[key_id]
+
+
+def _verify_jwt_signature(algorithm: str, signing_input: bytes, signature: bytes, key: object) -> None:
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    if algorithm == "HS256":
+        if not isinstance(key, (bytes, bytearray, memoryview)):
+            raise ValueError("HS256 requires byte-string key material")
+        expected = hmac.new(bytes(key), signing_input, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, signature):
+            raise ValueError("JWT signature verification failed")
+        return
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, padding
+        from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    except ImportError as exc:
+        raise ValueError("cryptography is required to verify this JWT algorithm") from exc
+    if isinstance(key, (bytes, bytearray, memoryview)):
+        try:
+            key = serialization.load_pem_public_key(bytes(key))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid JWT public key") from exc
+    if algorithm == "RS256":
+        if not hasattr(key, "verify"):
+            raise ValueError("RS256 requires an RSA public key")
+        try:
+            key.verify(signature, signing_input, padding.PKCS1v15(), hashes.SHA256())
+        except Exception as exc:
+            raise ValueError("JWT signature verification failed") from exc
+        return
+    if algorithm == "ES256":
+        if len(signature) != 64:
+            raise ValueError("Invalid ES256 signature length")
+        if not hasattr(key, "verify"):
+            raise ValueError("ES256 requires an EC public key")
+        try:
+            key.verify(encode_dss_signature(int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big")), signing_input, ec.ECDSA(hashes.SHA256()))
+        except Exception as exc:
+            raise ValueError("JWT signature verification failed") from exc
+        return
+    raise ValueError(f"Unsupported JWT algorithm: {algorithm}")
+
+
+def validate_jwt_with_signature(
+    token: str,
+    key_id: str | None = None,
+    algorithms: list[str] | tuple[str, ...] | None = None,
+    *,
+    now: float | None = None,
+    leeway: float = 0.0,
+) -> dict:
+    """Decode and verify a compact JWT against an explicitly registered key."""
+
+    header, payload, signature = _jwt_segments(token)
+    algorithm = str(header.get("alg") or "").strip()
+    allowed = set(algorithms or _JWT_ALLOWED_ALGORITHMS)
+    if algorithm not in allowed or algorithm not in _JWT_ALLOWED_ALGORITHMS:
+        raise ValueError(f"JWT algorithm is not allowed: {algorithm or 'missing'}")
+    header_key_id = str(header.get("kid") or "").strip()
+    selected_key_id = str(key_id or header_key_id or "").strip()
+    if not selected_key_id:
+        raise ValueError("JWT key id is required")
+    key = _jwt_key_for(selected_key_id)
+    parts = token.split(".")
+    _verify_jwt_signature(algorithm, f"{parts[0]}.{parts[1]}".encode("ascii"), signature, key)
+    current = time.time() if now is None else float(now)
+    try:
+        if "exp" in payload and float(payload["exp"]) < current - float(leeway):
+            raise ValueError("JWT token has expired")
+        if "nbf" in payload and float(payload["nbf"]) > current + float(leeway):
+            raise ValueError("JWT token is not yet valid")
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("JWT token"):
+            raise
+        raise ValueError("JWT time claims are invalid") from exc
+    return payload
+
+
+def parse_jwt_claims(token: str, *, verify_signature: bool = True, key_id: str | None = None) -> dict:
+    """Parse JWT claims with explicit verification semantics.
+
+    Callers that only need identity hints from an untrusted import may set
+    ``verify_signature=False``; authentication paths should keep the default.
+    """
+
+    if verify_signature:
+        return validate_jwt_with_signature(token, key_id=key_id)
+    return _jwt_segments(token)[1]
 
 
 def _credential_store_mode() -> str:

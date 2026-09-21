@@ -739,6 +739,34 @@ from .settings_store import (
     load_settings,
     save_settings,
 )
+from .rate_limiter import (
+    RateLimiter,
+    IPRateLimiter,
+)
+from .url_validator import (
+    URLValidationError,
+    validate_url,
+    validate_provider_url,
+    validate_provider_portal_url,
+    validate_webhook_url,
+    validate_redirect_url,
+    normalize_url,
+)
+from .http_client import (
+    SafeHTTPClient,
+    SameOriginRedirectHandler,
+    create_same_origin_client,
+    create_registry_client,
+    create_api_client,
+)
+from .process_utils import (
+    ProcessCheckMode,
+    ProcessInfo,
+    detect_codex_processes,
+    kill_process_tree,
+    wait_for_process_exit,
+)
+from .i18n import I18n, t, set_locale
 from .credential_store import (
     DataBlob,
     _make_blob,
@@ -766,6 +794,10 @@ from .credential_store import (
 )
 from .auth import (
     _credential_store_mode,
+    load_jwt_public_key,
+    clear_jwt_public_keys,
+    validate_jwt_with_signature,
+    parse_jwt_claims,
     _jwt_payload,
     _jwt_payload_segment,
     _nested_string,

@@ -1,6 +1,7 @@
 """Server services."""
 from __future__ import annotations
 from agent_manager import application as _app
+from agent_manager.core.rate_limiter import IPRateLimiter
 
 
 class ManagerServer(_app.ThreadingHTTPServer):
@@ -56,6 +57,57 @@ class ManagerServer(_app.ThreadingHTTPServer):
         self._thread_slots = _app.threading.BoundedSemaphore(_app.MAX_MANAGEMENT_THREADS)
         self.ui_bootstrap_lock = _app.threading.RLock()
         self.ui_bootstrap_tokens: dict[str, tuple[float, int]] = {}
+        # Keep abuse controls per server instance so a restart does not carry
+        # stale counters. The management API is loopback-only, but a local
+        # browser or compromised helper can still generate unbounded requests.
+        self._oauth_rate_limiter = IPRateLimiter(max_requests=5, window_seconds=300)
+        self._auth_rate_limiter = IPRateLimiter(max_requests=20, window_seconds=60)
+        self._api_rate_limiter = IPRateLimiter(max_requests=120, window_seconds=60)
+
+    def _rate_limiter(self, category: str) -> IPRateLimiter:
+        return {
+            "oauth": self._oauth_rate_limiter,
+            "auth": self._auth_rate_limiter,
+            "api": self._api_rate_limiter,
+        }.get(str(category).casefold(), self._api_rate_limiter)
+
+    def _check_rate_limit(
+        self,
+        headers: object | None,
+        limiter: IPRateLimiter,
+        limit_name: str,
+        *,
+        remote_addr: str | None = None,
+    ) -> tuple[bool, str]:
+        """Compatibility helper for endpoint-specific limiter checks."""
+
+        try:
+            client_id = limiter.extract_client_id(headers, remote_addr=remote_addr)
+        except (AttributeError, TypeError, ValueError):
+            client_id = "unknown"
+        if not limiter.is_allowed(client_id):
+            return False, f"Rate limit exceeded for {limit_name}. Try again later."
+        return True, ""
+
+    def check_rate_limit(
+        self,
+        category: str,
+        *,
+        client_id: str | None = None,
+        headers: object | None = None,
+    ) -> tuple[bool, int]:
+        """Consume one request token and return ``(allowed, remaining)``."""
+
+        limiter = self._rate_limiter(category)
+        if not client_id:
+            raw_headers = headers or {}
+            try:
+                client_id = limiter.extract_client_id(raw_headers)
+            except (AttributeError, TypeError):
+                client_id = "unknown"
+        normalized = str(client_id or "unknown").strip() or "unknown"
+        allowed = limiter.is_allowed(normalized)
+        return allowed, limiter.get_remaining(normalized)
 
     def server_bind(self) -> None:
         _app._bind_exclusive_loopback(self)
