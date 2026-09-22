@@ -8,13 +8,18 @@ from __future__ import annotations
 import math
 import re
 from typing import Any
+from agent_manager.detection.model_fingerprint import (
+    observe_headers as observe_stack_headers,
+    observe_payload as observe_stack_payload,
+    safe_fingerprint,
+)
 
 EVIDENCE_VERSION = 2
 SHORT_CONTEXT_LIMIT = 272_000
 IDENTITY_FIELDS = (
     "actualModel", "modelEvidence", "serviceTier", "contextTier",
     "cacheWriteEvidence", "cachedInputEvidence", "inputOutputEvidence", "reasoningEvidence",
-    "usageEvidenceVersion", "systemFingerprint",
+    "usageEvidenceVersion", "systemFingerprint", "modelFingerprint", "modelIdentityAuthority",
 )
 SERVICE_TIERS = {"default", "priority", "fast", "flex", "batch", "ultrafast"}
 EVIDENCE_FIELDS = ("cacheWriteEvidence", "cachedInputEvidence", "inputOutputEvidence", "reasoningEvidence")
@@ -89,6 +94,7 @@ def safe_metadata(value: Any) -> dict:
         "modelEvidenceSource": model_evidence_source,
         "systemFingerprint": fingerprint,
         "fingerprintEvidence": fingerprint_evidence,
+        "modelFingerprint": safe_fingerprint(value.get("modelFingerprint")),
         "serviceTier": value.get("serviceTier") if current and isinstance(value.get("serviceTier"), str) and value["serviceTier"] in SERVICE_TIERS else "unknown",
         "contextTier": value.get("contextTier") if current and isinstance(value.get("contextTier"), str) and value["contextTier"] in {"short", "long"} else "unknown",
         **{key: "known" if current and value.get(key) == "known" else "unknown" for key in EVIDENCE_FIELDS},
@@ -101,6 +107,7 @@ def observe_metadata(previous: Any, payload: Any) -> dict:
     result["usageEvidenceVersion"] = EVIDENCE_VERSION
     if not isinstance(payload, dict):
         return result
+    result["modelFingerprint"] = observe_stack_payload(result["modelFingerprint"], payload)
     response = payload.get("response")
     source = response if isinstance(response, dict) else payload
     sources = [source]
@@ -114,7 +121,7 @@ def observe_metadata(previous: Any, payload: Any) -> dict:
                 break
             if not result.get("actualModel"):
                 result.update(actualModel="", modelEvidence="requested", modelEvidenceSource="unknown")
-    if not result.get("systemFingerprint"):
+    if result.get("fingerprintEvidence") != "response_body":
         for candidate in sources:
             for key in ("system_fingerprint", "systemFingerprint"):
                 if key in candidate:
@@ -122,7 +129,7 @@ def observe_metadata(previous: Any, payload: Any) -> dict:
                     if fingerprint:
                         result.update(systemFingerprint=fingerprint, fingerprintEvidence="response_body")
                         break
-            if result.get("systemFingerprint"):
+            if result.get("fingerprintEvidence") == "response_body":
                 break
     if "service_tier" in source:
         tier = source.get("service_tier")
@@ -162,6 +169,7 @@ def observe_response_headers(previous: Any, headers: Any) -> dict:
     # Without this marker ``safe_metadata`` would intentionally discard the
     # model/fingerprint when the usage record is persisted.
     result["usageEvidenceVersion"] = EVIDENCE_VERSION
+    result["modelFingerprint"] = observe_stack_headers(result["modelFingerprint"], headers)
     if headers is None or not hasattr(headers, "items"):
         return result
     values: dict[str, str] = {}

@@ -717,14 +717,13 @@ class AppUpdateService:
             asset for asset in assets
             if isinstance(asset, dict) and asset.get("platform") == self.platform
         ]
-        if len(selected) != 1:
-            raise UpdateError("该版本缺少唯一的当前平台更新文件。", "asset_selection")
-        asset = selected[0]
         template = source.get("assetName")
         if template:
             wanted_name = template.replace("{version}", str(version)).replace("{tag}", "v" + str(version))
-            if asset.get("name") != wanted_name:
-                raise UpdateError("发布 manifest 没有配置的当前平台资产。", "asset_selection")
+            selected = [asset for asset in selected if asset.get("name") == wanted_name]
+        if len(selected) != 1:
+            raise UpdateError("该版本缺少唯一的当前平台更新文件。", "asset_selection")
+        asset = selected[0]
         asset_url = asset.get("url")
         parsed_asset, _host = _url(asset_url, {"github.com"})
         prefix = f"/{source['repository']}/releases/download/"
@@ -745,6 +744,7 @@ class AppUpdateService:
     def _github_asset_release(self, release, source):
         tag = release["tag_name"]
         version = tag[1:] if tag[:1].lower() == "v" else tag
+        parsed_version = Version.parse(version)
         template = source.get("assetName")
         wanted = template.replace("{version}", version).replace("{tag}", tag) if template else None
         assets = release.get("assets")
@@ -759,18 +759,26 @@ class AppUpdateService:
         if self.release_epoch:
             manifests = [item for item in assets if isinstance(item, dict) and item.get("name") == "app-update-manifest.json" and item.get("state", "uploaded") == "uploaded"]
             if len(manifests) != 1:
-                raise UpdateError("发布缺少当前版本系列的说明文件，未提供更新。", "release_epoch_missing")
-            manifest_url = manifests[0].get("browser_download_url")
-            manifest_parsed, _host_name = _url(manifest_url, {"github.com"})
-            prefix = f"/{source['repository']}/releases/download/"
-            if (manifest_parsed.path[:len(prefix)].casefold() != prefix.casefold()
-                    or unquote(manifest_parsed.path[len(prefix):]) != f"{tag}/app-update-manifest.json"):
-                raise UpdateError("发布说明不属于当前仓库和版本。", "asset_origin_mismatch")
-            manifest = self._json_remote(manifest_url, set(GITHUB_ASSET_HOSTS))
-            self._require_release_epoch(manifest, version)
-            matching = [item for item in manifest.get("assets", []) if isinstance(item, dict) and item.get("name") == asset.get("name") and item.get("platform") == self.platform]
-            if len(matching) != 1 or matching[0].get("sha256") != str(digest).removeprefix("sha256:") or matching[0].get("size") != asset.get("size"):
-                raise UpdateError("发布说明与安装包的校验信息不一致。", "manifest_asset_mismatch")
+                # A release older than the running build cannot be selected for
+                # download.  Treating it as a hard failure made every local
+                # development build show “检查失败” until a newer release was
+                # published, even though the check had safely found that no
+                # update was available. Keep the version-series manifest requirement
+                # for releases that could actually be installed.
+                if parsed_version > self._version:
+                    raise UpdateError("发布缺少当前版本系列的说明文件，未提供更新。", "release_epoch_missing")
+            else:
+                manifest_url = manifests[0].get("browser_download_url")
+                manifest_parsed, _host_name = _url(manifest_url, {"github.com"})
+                prefix = f"/{source['repository']}/releases/download/"
+                if (manifest_parsed.path[:len(prefix)].casefold() != prefix.casefold()
+                        or unquote(manifest_parsed.path[len(prefix):]) != f"{tag}/app-update-manifest.json"):
+                    raise UpdateError("发布说明不属于当前仓库和版本。", "asset_origin_mismatch")
+                manifest = self._json_remote(manifest_url, set(GITHUB_ASSET_HOSTS))
+                self._require_release_epoch(manifest, version)
+                matching = [item for item in manifest.get("assets", []) if isinstance(item, dict) and item.get("name") == asset.get("name") and item.get("platform") == self.platform]
+                if len(matching) != 1 or matching[0].get("sha256") != str(digest).removeprefix("sha256:") or matching[0].get("size") != asset.get("size"):
+                    raise UpdateError("发布说明与安装包的校验信息不一致。", "manifest_asset_mismatch")
         return self._asset({"name": asset.get("name"), "size": asset.get("size"), "url": asset.get("browser_download_url"),
                             "sha256": digest[7:] if isinstance(digest, str) and digest.startswith("sha256:") else ""},
                            source, version, tag=tag, notes=release.get("body"), published=release.get("published_at"))

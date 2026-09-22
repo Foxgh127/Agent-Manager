@@ -1,0 +1,20 @@
+.usage-model-identity { min-width: 170px; max-width: 320px; }
+.usage-model-name { overflow-wrap: anywhere; }
+.usage-model-evidence { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.usage-model-evidence.candidate, .usage-model-evidence.reference { color: var(--accent); }
+.usage-model-evidence.ambiguous { color: var(--amber); }
+.usage-model-details { min-width: 0; }
+.usage-model-details > summary { width: fit-content; padding: 3px 0; color: var(--muted); cursor: pointer; font-size: 10px; }
+.usage-model-details > summary:hover { color: var(--text); }
+.usage-model-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.usage-model-detail-body { margin-top: 5px; padding: 9px; border: 1px solid var(--border-soft); border-radius: 8px; background: rgb(var(--line-rgb) / .025); white-space: normal; overflow-wrap: anywhere; }
+.usage-model-detail-body > p { margin: 0 0 8px; font-size: 10px; line-height: 1.6; }
+.usage-model-detail-body .usage-model-ambiguous { color: var(--amber); }
+.usage-model-detail-body dl { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 6px 9px; margin: 0; font-size: 10px; line-height: 1.5; }
+.usage-model-detail-body dt { color: var(--muted-2, var(--muted)); }
+.usage-model-detail-body dd { min-width: 0; margin: 0; color: var(--text); }
+.usage-model-detail-body dd code { font-size: 10px; }
+.usage-model-candidates { display: grid; gap: 4px; }
+.usage-model-detail-body .usage-model-sources { display: flex; flex-wrap: wrap; gap: 5px 9px; margin: 10px 0 0; }
+.usage-model-sources a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.usage-model-observation-note { margin: 10px 0; color: var(--muted); font-size: 11px; line-height: 1.5; }

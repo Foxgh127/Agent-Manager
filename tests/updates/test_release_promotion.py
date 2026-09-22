@@ -8,6 +8,11 @@ import agent_manager.application as app
 
 class ReleasePromotionTests(unittest.TestCase):
 
+    def test_hyphenated_release_name_is_recognized_for_promotion_and_version(self):
+        path = Path("Agent-Manager-1.3.3.exe")
+        self.assertTrue(app._release_executable_name(path))
+        self.assertEqual(app._executable_version(path), (1, 3, 3, 0))
+
     def test_versioned_handoff_promotes_exact_bytes_then_canonical_cleans_fallbacks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

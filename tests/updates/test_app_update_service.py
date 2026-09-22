@@ -192,6 +192,28 @@ def test_github_release_digest_and_exact_asset_selection(service):
     assert instance.check()["errorCode"] == "missing_checksum"
 
 
+def test_github_older_release_without_epoch_manifest_is_a_clean_noop(service):
+    instance, fetcher = service
+    source = {"kind": "github", "repository": "publisher/agent-manager", "assetName": "Agent-{version}.exe"}
+    fetcher.metadata = {
+        "tag_name": "v9.10.0",
+        "draft": False,
+        "prerelease": False,
+        "assets": [{
+            "name": "Agent-9.10.0.exe",
+            "size": len(PAYLOAD),
+            "browser_download_url": "https://github.com/publisher/agent-manager/releases/download/v9.10.0/Agent-9.10.0.exe",
+            "digest": "sha256:" + hashlib.sha256(PAYLOAD).hexdigest(),
+        }],
+    }
+    instance.release_epoch = 1
+    instance.configure(source)
+    status = instance.check()
+    assert status["state"] == "current"
+    assert status["updateAvailable"] is False
+    assert status["error"] == ""
+
+
 def test_github_ambiguous_exes_require_name(service):
     instance, fetcher = service
     fetcher.metadata = {"tag_name": "v9.12.0", "assets": [{"name": "one.exe"}, {"name": "two.exe"}]}

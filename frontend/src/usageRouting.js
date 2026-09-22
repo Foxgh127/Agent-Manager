@@ -12,17 +12,32 @@ function usableModel(value) {
 /**
  * Resolve the model evidence shown by the usage view.
  *
- * The configured/routed model remains the primary label.  Actual response
- * metadata is surfaced only when it contradicts that route, so consistent
- * requests keep the compact table layout users already know.
+ * A unique fingerprint candidate is the display label when available.
+ * Response model metadata is an upstream declaration, never proof of the
+ * model's weights. The configured route remains separate for comparison.
  */
 export function usageModelRouting(item = {}) {
   const requestedModel = usableModel(item.requestedModel);
   const routedModel = usableModel(item.routedModel);
   const fallbackModel = usableModel(item.model || item.modelName);
-  const expectedModel = routedModel || requestedModel || fallbackModel;
-  const displayModel = expectedModel || "未确定模型";
+  const expectedModel = routedModel || requestedModel || usableModel(item.modelRoutingExpected) || fallbackModel;
   const actualModel = item.modelEvidence === "actual" ? usableModel(item.actualModel) : "";
+  const identity = item.modelIdentity && typeof item.modelIdentity === "object" ? item.modelIdentity : {};
+  const identityCandidates = [...new Set((Array.isArray(identity.candidates) ? identity.candidates : [])
+    .map(usableModel).filter(Boolean))].slice(0, 8);
+  const rawIdentityStatus = text(identity.status);
+  const identityStatus = identityCandidates.length > 1 ? "ambiguous"
+    : identityCandidates.length === 1 && ["candidate", "reference"].includes(rawIdentityStatus)
+      ? rawIdentityStatus : "unknown";
+  const identityCandidate = ["candidate", "reference"].includes(identityStatus) ? identityCandidates[0] : "";
+  const displayModel = identityCandidate || actualModel || expectedModel || "未确定模型";
+  const identityLabel = identityStatus === "reference" ? "官方响应"
+    : identityStatus === "candidate" ? "指纹候选"
+      : actualModel ? "上游声明 · 型号未确认" : "仅路由 · 型号未确认";
+  const referenceCount = Number(identity.referenceCount);
+  const modelFingerprint = item.modelFingerprint && typeof item.modelFingerprint === "object" ? item.modelFingerprint : {};
+  const fingerprintTags = values => [...new Set((Array.isArray(values) ? values : [])
+    .map(text).filter(Boolean))].slice(0, 24);
   let status = text(item.modelRoutingStatus).toLowerCase();
   if (actualModel && expectedModel) {
     // Recompute when evidence is present so a stale aggregate status cannot
@@ -37,6 +52,15 @@ export function usageModelRouting(item = {}) {
     expectedModel,
     displayModel,
     actualModel,
+    declaredModel: actualModel,
+    identityStatus,
+    identityLabel,
+    identityCandidate,
+    identityCandidates,
+    referenceCount: Number.isFinite(referenceCount) && referenceCount > 0 ? Math.floor(referenceCount) : 0,
+    passiveFingerprint: text(modelFingerprint.signature),
+    protocols: fingerprintTags(modelFingerprint.protocols),
+    fingerprintFeatures: fingerprintTags(modelFingerprint.features),
     status,
     mismatch: status === "mismatch",
     fingerprint: text(item.systemFingerprint),

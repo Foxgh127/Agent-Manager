@@ -21,6 +21,7 @@ import json
 import math
 import ssl
 from typing import Any, Optional
+from agent_manager._version import VERSION
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import (
@@ -317,7 +318,7 @@ class SafeHTTPClient:
         timeout: int | float = 30,
         proxy: Optional[str] = None,
         verify_ssl: bool = True,
-        user_agent: str = "AgentManager/1.2.3",
+        user_agent: str | None = None,
         max_response_bytes: int | None = DEFAULT_MAX_RESPONSE_BYTES,
         *,
         max_response_size: int | None = None,
@@ -328,7 +329,7 @@ class SafeHTTPClient:
         self.origin = origin
         self.timeout = _validated_timeout(timeout)
         self.verify_ssl = bool(verify_ssl)
-        self.user_agent = str(user_agent)
+        self.user_agent = str(user_agent or f"AgentManager/{VERSION}")
 
         if max_response_size is not None:
             if max_response_bytes != DEFAULT_MAX_RESPONSE_BYTES and max_response_bytes != max_response_size:
@@ -550,7 +551,7 @@ def create_registry_client(proxy: Optional[str] = None, **kwargs: Any) -> SafeHT
     return SafeHTTPClient(
         timeout=60,
         proxy=proxy,
-        user_agent="AgentManager-Registry/1.2.3",
+        user_agent=f"AgentManager-Registry/{VERSION}",
         **kwargs,
     )
 

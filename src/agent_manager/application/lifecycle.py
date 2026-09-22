@@ -238,7 +238,7 @@ def _take_restart_handoff(token: str | None) -> dict | None:
 
 def _executable_version(path: _app.Path) -> tuple[int, int, int, int]:
     match = _app.re.fullmatch(
-        r"(?:AgentManager|CodexAgentManager)-(\d+)\.(\d+)\.(\d+)(?:[.-](\d+))?\.exe",
+        r"(?:Agent-Manager|AgentManager|CodexAgentManager)-(\d+)\.(\d+)\.(\d+)(?:[.-](\d+))?\.exe",
         path.name,
         _app.re.IGNORECASE,
     )
@@ -395,12 +395,12 @@ def _manager_restart_command(token: str) -> tuple[list[str], _app.Path]:
         current = _app.Path(_app.sys.executable).resolve()
         candidates = [current]
         current_epoch = _app.executable_release_epoch(current)
-        for pattern in ("AgentManager*.exe", "CodexAgentManager*.exe"):
+        for pattern in ("Agent-Manager-*.exe", "AgentManager*.exe", "CodexAgentManager*.exe"):
             for candidate in current.parent.glob(pattern):
                 if _app.executable_release_epoch(candidate) != current_epoch:
                     continue
                 if _app.re.fullmatch(
-                    r"(?:AgentManager|CodexAgentManager)(?:-[0-9][A-Za-z0-9_.-]*)?\.exe",
+                    r"(?:Agent-Manager|AgentManager|CodexAgentManager)(?:-[0-9][A-Za-z0-9_.-]*)?\.exe",
                     candidate.name,
                     _app.re.IGNORECASE,
                 ):

@@ -78,6 +78,13 @@ class CodexLabelsPolicyTests(unittest.TestCase):
             self.assertEqual(routed["id"], "gpt-6-astra")
             self.assertIn(routed["sourceRecordId"], {"hajimi", "other"})
 
+    def test_provider_balance_is_safe_catalog_metadata(self):
+        self.settings["providers"][0]["balance"] = {
+            "amount": 12.5, "currency": "usd", "limit": 20, "used": 7.5,
+        }
+        catalog, _records = core.build_synced_model_catalog(self.settings)
+        assert any("余额 12.5 USD" in row["description"] for row in catalog["models"])
+
     def test_independent_provider_and_official_account_labels(self):
         self.settings["modelWorkspace"]["mode"] = "independent"
         doc = tomllib.loads(core.build_codex_config(self.settings))

@@ -29,13 +29,12 @@ def wait_for_codex_runtime_ready(
         attempts += 1
         remaining = max(1.0, deadline - _core.time.monotonic())
         try:
-            requests = [
-                    ("account/read", {"refreshToken": False}),
-                    # A selected model is not guaranteed to be the first item.
-                    # Asking for one entry made healthy providers fail readiness
-                    # whenever their default ordering changed.
-                    ("model/list", {"cursor": None, "limit": 100 if expected_model_id else 1}),
-                ]
+            provider_probe = bool(isinstance(probe_plan, dict) and probe_plan.get("apiProviderId"))
+            requests = [] if provider_probe else [("account/read", {"refreshToken": False})]
+            # A selected model is not guaranteed to be the first item. Asking
+            # for one entry made healthy providers fail readiness whenever
+            # their default ordering changed.
+            requests.append(("model/list", {"cursor": None, "limit": 100 if expected_model_id else 1}))
             if probe_plan is not None:
                 requests.append(("config/read", {"includeLayers": True, "cwd": probe_plan.get("workspace")}))
             results = _core.codex_app_server_requests(
@@ -43,7 +42,13 @@ def wait_for_codex_runtime_ready(
                 timeout=max(2, min(8, int(remaining))),
                 **probe_options,
             )
-            account_result, model_result = results[:2]
+            if provider_probe:
+                account_result = {}
+                model_result = results[0] if results else {}
+                config_result = results[1] if len(results) > 1 else None
+            else:
+                account_result, model_result = results[:2]
+                config_result = results[2] if len(results) > 2 else None
             account = account_result.get("account") if isinstance(account_result, dict) else None
             actual_email = str(account.get("email") or "").strip() if isinstance(account, dict) else ""
             if expected and not actual_email:
@@ -53,7 +58,7 @@ def wait_for_codex_runtime_ready(
                     f"Codex 读取到的账号是 {actual_email}，并非刚切换的 {expected_email}。"
                 )
             if probe_plan is not None:
-                effective = results[2].get("config") if len(results) > 2 and isinstance(results[2], dict) else None
+                effective = config_result.get("config") if isinstance(config_result, dict) else None
                 if not isinstance(effective, dict) or not _core._probe_configuration_matches(expected_config, effective):
                     raise _core.ManagerError("Codex 探针有效配置与刚写入的账号路由不一致。")
             models = model_result.get("data") if isinstance(model_result, dict) else None

@@ -89,6 +89,33 @@ def test_response_fingerprint_and_header_model_are_bounded_passive_evidence():
     assert invalid["actualModel"] == "" and invalid["systemFingerprint"] == ""
 
 
+def test_provider_model_headers_survive_gateway_allowlist():
+    from agent_manager.gateway.service import _safe_response_headers
+
+    forwarded = _safe_response_headers({
+        "x-model": "provider-native",
+        "x-codex-model": "provider-native",
+        "x-system-fingerprint": "fp_native",
+        "authorization": "Bearer must-not-forward",
+    })
+    assert forwarded["x-model"] == "provider-native"
+    assert forwarded["x-codex-model"] == "provider-native"
+    assert forwarded["x-system-fingerprint"] == "fp_native"
+    assert "authorization" not in forwarded
+
+
+def test_body_fingerprint_supersedes_weaker_header_in_json_and_sse():
+    for response in ({"model": "native", "system_fingerprint": "fp_body"},
+                     {"response": {"model": "native"}, "system_fingerprint": "fp_body"},
+                     {"type": "response.created", "response": {"model": "native", "system_fingerprint": "fp_body"}}):
+        header = observe_response_headers(None, {"x-system-fingerprint": "fp_header"})
+        result = observe_metadata(header, response)
+        assert result["systemFingerprint"] == "fp_body"
+        assert result["fingerprintEvidence"] == "response_body"
+        terminal = observe_metadata(result, {"type": "response.completed", "response": {"usage": {}}})
+        assert terminal["systemFingerprint"] == "fp_body"
+
+
 def test_route_diagnostic_only_flags_a_response_route_mismatch():
     consistent = enrich_context(
         {"requestedModel": "default", "routedModel": "gpt-6-astra"},

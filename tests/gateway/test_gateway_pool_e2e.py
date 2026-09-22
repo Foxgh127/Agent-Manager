@@ -92,6 +92,7 @@ def pool(request, tmp_path, monkeypatch):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("system-fingerprint", "fp-" + identity)
+                self.send_header("cf-ray", "private-routing-id")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if mode == "hold":
@@ -255,6 +256,22 @@ def test_tools_survive_stream_and_complete_with_original_arguments(pool):
     assert record["contextTier"] == "long" and record["serviceTier"] == "priority"
     assert record["cacheWriteEvidence"] == "known" and record["usageEvidenceVersion"] == 2
     assert (record["inputTokens"], record["cachedInputTokens"], record["cacheWriteTokens"], record["outputTokens"]) == (300000, 200000, 10000, 4)
+    assert record["modelFingerprint"]["engine"] == "modelprint-headerdna+loongport-passive"
+    assert "cf-ray" in record["modelFingerprint"]["features"]
+    assert record["modelFingerprint"]["protocols"] == ["openai_responses"]
+    assert "private-routing-id" not in json.dumps(stats)
+    assert record["modelIdentity"]["status"] == ("reference" if pool["kind"] == "account" else "unknown")
+
+
+def test_buffered_fingerprint_observes_original_headers_without_additional_requests(pool):
+    before = len(pool["observed"])
+    status, body, _headers = pool["post"]()
+    assert status == 200
+    assert json.loads(body)["model"] == "gpt-test"
+    assert len(pool["observed"]) == before + 1
+    record = pool["manager"].usage_stats.snapshot()["recentRequests"][0]
+    assert "cf-ray" in record["modelFingerprint"]["features"]
+    assert record["modelFingerprint"]["signature"].startswith("pfp_")
 
 
 def test_reasoning_output_also_prohibits_replay(pool):

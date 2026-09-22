@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 import re
 from agent_manager import core as _core
-from .client import codex_app_server_request, codex_app_server_requests
 from .thread_utils import _codex_thread_list_params, _codex_thread_rows, _subagent_turn_status
 
 
@@ -63,7 +62,7 @@ def stale_subagent_health(
     while len(rows) < limit:
         params = _codex_thread_list_params(min(100, limit - len(rows)), False, False, cursor)
         params["sourceKinds"] = list(_core.SUBAGENT_SOURCE_KINDS)
-        listed = codex_app_server_request("thread/list", params, timeout=30)
+        listed = _core.codex_app_server_request("thread/list", params, timeout=30)
         rows.extend(_codex_thread_rows(listed, False))
         next_cursor = listed.get("nextCursor") or listed.get("next_cursor")
         if not next_cursor or str(next_cursor) in seen_cursors:
@@ -87,7 +86,7 @@ def stale_subagent_health(
         results = []
         for offset in range(0, len(old_rows), 100):
             results.extend(
-                codex_app_server_requests(
+                _core.codex_app_server_requests(
                     [
                         ("thread/read", {"threadId": row["id"], "includeTurns": True})
                         for row in old_rows[offset : offset + 100]
@@ -145,7 +144,7 @@ def cleanup_stale_subagents(thread_ids: list[str] | None = None) -> dict:
     if _core.running_codex_processes():
         raise _core.ManagerError("Codex 仍在运行。请先保存工作并关闭 Codex，再清理卡死子代理。")
 
-    health = stale_subagent_health()
+    health = _core.stale_subagent_health()
     allowed = {str(item.get("threadId") or "") for item in health.get("candidates", [])}
     requested = set(str(value or "").strip() for value in (thread_ids or allowed))
     targets = sorted((allowed & requested) - {""})
@@ -169,7 +168,7 @@ def cleanup_stale_subagents(thread_ids: list[str] | None = None) -> dict:
                 _core.manage_codex_threads("restore", batch)
             except Exception as rollback_exc:
                 rollback_errors.append(str(rollback_exc)[:240])
-        detail = f"；回滚异常：{'；'.join(rollback_errors)}" if rollback_errors else ""
+        detail = f"；回滚异常：{'；'.join(rollback_errors)}" if rollback_errors else "；已恢复已归档任务"
         raise _core.ManagerError(
             f"清理失败：{_core._redact_sensitive_text(exc, limit=320)}{detail}"
         ) from exc

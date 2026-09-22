@@ -232,6 +232,17 @@ def _codex_runtime_environment(env_overrides: dict | None = None, *, official: b
     blocked = {"codex_cli_path", "codex_home"}
     if official:
         blocked.update(name.casefold() for name in _core._OFFICIAL_AUTH_ENV_OVERRIDES)
+        try:
+            settings = _core.load_settings()
+            blocked.update(
+                str(provider.get("envKey") or "").casefold()
+                for provider in settings.get("providers", [])
+                if isinstance(provider, dict) and provider.get("envKey")
+            )
+        except Exception:
+            # Environment construction must remain available during first-run
+            # setup when settings have not been created yet.
+            pass
     for key in list(env):
         if key.casefold() in blocked:
             env.pop(key, None)
@@ -460,6 +471,7 @@ def _launch_codex_via_package_identity(
             encoding="utf-8",
             errors="replace",
             timeout=15,
+            env=env,
             creationflags=flags,
         )
     except (OSError, _core.subprocess.TimeoutExpired) as exc:
@@ -758,5 +770,4 @@ def launch_codex_app(
         "launcherPid": process.pid,
         "launchedAt": _core.now_iso(),
     }
-
 

@@ -83,7 +83,7 @@ class UsageExportV8Tests(unittest.TestCase):
             "requestCount": 1, "tokens": 3, "response": "must-not-export",
         }]}}
         _result, saved, _runtime = self.export(snapshot, {
-            "source": "accounts", "sourceFilter": "all", "model": "gpt-6-astra", "date": "all"
+            "source": "accounts", "sourceFilter": "all", "model": "gpt-5.6-luna", "date": "all"
         })
         row = saved["document"]["records"][0]
         self.assertEqual(row["actualModel"], "gpt-5.6-luna")
@@ -101,6 +101,20 @@ class UsageExportV8Tests(unittest.TestCase):
         _, provider_saved, _ = self.export(snapshot, {"source": "accounts", "sourceFilter": "provider:same", "model": "all", "date": "all"})
         self.assertEqual(account_saved["document"]["records"][0]["totalTokens"], 1)
         self.assertEqual(provider_saved["document"]["records"][0]["totalTokens"], 2)
+
+    def test_unique_fingerprint_candidate_matches_the_display_model_filter(self):
+        snapshot = {"accountAttribution": {"records": [{
+            "date": "2026-09-06", "providerId": "p", "routedModel": "alias",
+            "actualModel": "declaration", "modelEvidence": "actual", "requestCount": 1,
+            "modelIdentity": {"status": "candidate", "candidates": ["reference-model"], "referenceCount": 3},
+        }]}}
+        _result, saved, _runtime = self.export(snapshot, {
+            "source": "accounts", "sourceFilter": "all", "model": "reference-model", "date": "all",
+        })
+        row = saved["document"]["records"][0]
+        self.assertEqual(row["model"], "reference-model")
+        self.assertEqual(row["actualModel"], "declaration")
+        self.assertEqual(row["modelIdentity"]["status"], "candidate")
 
     def test_codex_role_derivation_and_role_filter(self):
         snapshot = {"codexSessions": {"items": [

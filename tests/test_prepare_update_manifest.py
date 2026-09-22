@@ -1,6 +1,8 @@
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -46,3 +48,61 @@ def test_manifest_rejects_oversized_notes(tmp_path):
     with pytest.raises(ValueError, match="12,000"):
         build_manifest(version="1.2.0", release_epoch=1, repository="owner/app",
                        asset_name=asset.name, asset_path=asset, notes_path=notes)
+
+
+def _aliased_manifest(tmp_path):
+    asset = tmp_path / "Agent-Manager-1.3.3.exe"
+    asset.write_bytes(b"MZ identical release bytes")
+    return build_manifest(
+        version="1.3.3", release_epoch=1, repository="owner/app",
+        asset_name=asset.name, asset_path=asset, notes_path=None,
+        alias_names=("AgentManager-1.3.3.exe",),
+    )
+
+
+def test_manifest_compatibility_alias_preserves_bytes_and_versioned_download(tmp_path):
+    document = _aliased_manifest(tmp_path)
+    primary, alias = document["assets"]
+    assert primary["name"] == "Agent-Manager-1.3.3.exe"
+    assert alias["name"] == "AgentManager-1.3.3.exe"
+    assert primary["sha256"] == alias["sha256"]
+    assert primary["size"] == alias["size"]
+    assert alias["url"] == "https://github.com/owner/app/releases/download/v1.3.3/AgentManager-1.3.3.exe"
+
+
+@pytest.mark.parametrize("field,value", [("size", 999), ("sha256", "0" * 64)])
+def test_manifest_rejects_alias_with_different_executable_bytes(tmp_path, field, value):
+    document = _aliased_manifest(tmp_path)
+    document["assets"][1][field] = value
+    with pytest.raises(ValueError, match="same executable bytes"):
+        validate_manifest(document)
+
+
+def test_manifest_rejects_duplicate_alias_names(tmp_path):
+    document = _aliased_manifest(tmp_path)
+    document["assets"][1] = dict(document["assets"][0])
+    with pytest.raises(ValueError, match="unique"):
+        validate_manifest(document)
+
+
+def test_manifest_rejects_alias_from_another_release(tmp_path):
+    document = _aliased_manifest(tmp_path)
+    document["assets"][1]["url"] = document["assets"][1]["url"].replace("/v1.3.3/", "/v1.3.2/")
+    with pytest.raises(ValueError, match="same GitHub release"):
+        validate_manifest(document)
+
+
+def test_manifest_cli_writes_and_validates_both_compatibility_names(tmp_path):
+    asset = tmp_path / "Agent-Manager-1.3.3.exe"
+    asset.write_bytes(b"MZ release fixture")
+    output = tmp_path / "app-update-manifest.json"
+    command = [
+        sys.executable, str(Path(__file__).resolve().parents[1] / "scripts/prepare_update_manifest.py"),
+        "--version", "1.3.3", "--release-epoch", "1", "--repository", "owner/app",
+        "--asset-name", asset.name, "--alias-name", "AgentManager-1.3.3.exe",
+        "--asset-path", str(asset), "--output", str(output),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    subprocess.run([*command, "--validate"], check=True, capture_output=True, text=True)
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert [item["name"] for item in document["assets"]] == [asset.name, "AgentManager-1.3.3.exe"]

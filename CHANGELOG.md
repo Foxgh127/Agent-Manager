@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Nothing yet
 
+## [1.3.3] - 2026-09-22
+
+- Added passive response fingerprint parsing adapted from MIT-licensed modelprint and LoongPort, with no synthetic requests or content storage.
+- Added bounded correlation with recent official-response fingerprints, explicit ambiguous/unknown states, and evidence details in usage records and exports.
+- Unified product metadata and retained both historical release asset names with a validated manifest and checksums.
+- Fixed session pagination, batch actions, local pinning, name updates, provider readiness, official environment isolation and Store-package environment propagation.
+- Kept provider billing snapshots separate from native Codex quotas and Credits, with freshness information in model descriptions.
+
 ## [1.3.0] - 2026-09-21
 
 ### 🎉 Major Refactoring Release

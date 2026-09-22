@@ -74,3 +74,27 @@ def test_usage_snapshot_exposes_actual_model_and_route_evidence(tmp_path):
     assert snapshot["routingEvidence"]["mismatchRequests"] == 1
     assert snapshot["routingEvidence"]["fingerprintedRequests"] == 2
     assert snapshot["routingEvidence"]["fingerprintChanges"] == 1
+
+
+def test_reference_candidates_survive_ledger_reload_and_account_attribution(tmp_path):
+    path = tmp_path / "usage.json"
+    store = gateway.UsageStatsStore(path)
+    try:
+        for official in (True, False):
+            context = {"sourceKind": "account" if official else "provider", "requestedModel": "alias",
+                       "routedModel": "native-model" if official else "alias",
+                       "modelIdentityAuthority": "official_direct" if official else "unknown",
+                       "accountId": "a" if official else "", "providerId": "" if official else "p"}
+            store.record(enrich_context(context, {"object": "response", "model": "native-model" if official else "alias",
+                         "system_fingerprint": "fp_reference"}), {"inputTokens": 4, "outputTokens": 2})
+        assert store.flush(force=True)
+        snapshot = gateway.UsageStatsStore(path).snapshot()
+        attribution = gateway.account_attribution_snapshot(snapshot, None)
+        row = next(item for item in attribution["recentRequests"] if item.get("providerId"))
+        assert row["actualModel"] == "alias"  # preserve declaration, do not rewrite billing
+        assert row["modelIdentity"]["status"] == "candidate"
+        assert row["modelIdentity"]["candidates"] == ["native-model"]
+        assert row["modelIdentity"]["referenceCount"] == 1
+    finally:
+        if store.flush_timer:
+            store.flush_timer.cancel()

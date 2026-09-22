@@ -1,5 +1,6 @@
 import hashlib
 import json
+import pytest
 from unittest.mock import patch
 import agent_manager.updates.service as updates
 from tests.updates.test_app_update_service import Stream
@@ -90,6 +91,24 @@ def test_retired_nine_x_release_is_not_a_new_update(tmp_path):
         state=service.check();assert state['errorCode']=='release_epoch_mismatch'
         assert not state['canDownload']
     finally:service.close()
+
+
+@pytest.mark.parametrize("template", ["Agent-Manager-{version}.exe", "AgentManager-{version}.exe"])
+def test_manifest_fallback_selects_configured_name_among_same_platform_aliases(tmp_path, template):
+    service = updates.AppUpdateService("1.3.0", tmp_path / "config.json", tmp_path / "downloads", release_epoch=1)
+    source = {"kind": "github", "repository": "owner/app", "channel": "stable", "assetName": template}
+    digest = hashlib.sha256(b"fixture").hexdigest()
+    payload = {"schemaVersion": 1, "appId": updates.APP_ID, "version": "1.3.3", "releaseEpoch": 1,
+        "assets": [{"name": name, "platform": "windows-x64", "size": 7, "sha256": digest,
+                    "url": "https://github.com/owner/app/releases/download/v1.3.3/" + name}
+                   for name in ("Agent-Manager-1.3.3.exe", "AgentManager-1.3.3.exe")]}
+    try:
+        with patch.object(service, "_json_remote", return_value=payload):
+            result = service._discover_github_latest_manifest(source)
+        assert result["name"] == template.replace("{version}", "1.3.3")
+        assert result["sha256"] == digest
+    finally:
+        service.close()
 
 
 def test_previous_generation_cache_is_not_presented_as_new_release(tmp_path):

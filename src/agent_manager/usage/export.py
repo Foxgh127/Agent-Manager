@@ -7,6 +7,7 @@ from datetime import date as date_value, datetime, timedelta, timezone
 from typing import Any
 
 import agent_manager.core as core
+from agent_manager.detection.model_fingerprint import safe_fingerprint
 
 
 EXPORT_FORMAT = "agent-manager-usage-statistics"
@@ -179,6 +180,12 @@ def _normalize(item: dict, source: str) -> dict:
         if _first_text(item, ("modelEvidence",), "") == "actual"
         else ""
     )
+    identity = item.get("modelIdentity") if isinstance(item.get("modelIdentity"), dict) else {}
+    candidates = identity.get("candidates") if isinstance(identity.get("candidates"), list) else []
+    candidates = list(dict.fromkeys(value.strip() for value in candidates[:8] if isinstance(value, str) and 0 < len(value.strip()) <= 200))
+    identity_status = "ambiguous" if len(candidates) > 1 else identity.get("status") if len(candidates) == 1 and identity.get("status") in {"candidate", "reference"} else "unknown"
+    candidate = candidates[0] if identity_status in {"candidate", "reference"} else ""
+    model = candidate or actual_model or model
     normalized = {
         "sourceKey": _source_key(item, source, role),
         "date": day[:10],
@@ -190,6 +197,13 @@ def _normalize(item: dict, source: str) -> dict:
         "modelRoutingStatus": _first_text(item, ("modelRoutingStatus",), "unknown"),
         "systemFingerprint": _first_text(item, ("systemFingerprint",), ""),
         "fingerprintEvidence": _first_text(item, ("fingerprintEvidence",), "unknown"),
+        "modelFingerprint": safe_fingerprint(item.get("modelFingerprint")),
+        "modelIdentity": {
+            "status": identity_status,
+            "candidates": candidates,
+            "method": "official_observation_fingerprint",
+            "referenceCount": _counter(identity, ("referenceCount",)),
+        },
         "role": role,
         "requestClassification": _first_text(
             item, ("requestClassification", "classification"), "unclassified"

@@ -36,7 +36,8 @@ def _plain_text(path: Path) -> str:
 def validate_manifest(document: object, *, expected_version: str | None = None,
                       expected_asset_name: str | None = None,
                       expected_asset_size: int | None = None,
-                      expected_asset_sha256: str | None = None) -> dict:
+                      expected_asset_sha256: str | None = None,
+                      expected_alias_names: tuple[str, ...] | None = None) -> dict:
     """Validate the producer-side manifest contract and return the document."""
     if not isinstance(document, dict):
         raise ValueError("Update manifest must be a JSON object.")
@@ -61,9 +62,33 @@ def validate_manifest(document: object, *, expected_version: str | None = None,
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
         raise ValueError("Update manifest releaseEpoch is invalid.")
     assets = document["assets"]
-    if not isinstance(assets, list) or len(assets) != 1:
-        raise ValueError("Update manifest must contain exactly one Windows asset.")
+    if not isinstance(assets, list) or not 1 <= len(assets) <= 8:
+        raise ValueError("Update manifest must contain a Windows asset and at most seven compatibility aliases.")
     asset = assets[0]
+    _validate_asset(asset)
+    names = [asset["name"]]
+    for alias in assets[1:]:
+        _validate_asset(alias)
+        if alias["size"] != asset["size"] or alias["sha256"] != asset["sha256"]:
+            raise ValueError("Compatibility aliases must describe the same executable bytes.")
+        if alias["url"].rsplit("/", 1)[0] != asset["url"].rsplit("/", 1)[0]:
+            raise ValueError("Compatibility aliases must belong to the same GitHub release.")
+        names.append(alias["name"])
+    if len(set(names)) != len(names):
+        raise ValueError("Update manifest asset names must be unique.")
+    if expected_alias_names is not None and tuple(names[1:]) != expected_alias_names:
+        raise ValueError("Update manifest compatibility aliases do not match the package.")
+    if expected_asset_name is not None and asset["name"] != expected_asset_name:
+        raise ValueError("Update manifest asset name does not match the package.")
+    if expected_asset_size is not None and asset["size"] != expected_asset_size:
+        raise ValueError("Update manifest asset size does not match the package.")
+    if expected_asset_sha256 is not None and asset["sha256"] != expected_asset_sha256:
+        raise ValueError("Update manifest asset SHA-256 does not match the package.")
+    return document
+
+
+def _validate_asset(asset: object) -> None:
+    """Aliases share a platform and bytes; clients select their configured name."""
     if not isinstance(asset, dict) or set(asset) != {"platform", "name", "url", "size", "sha256"}:
         raise ValueError("Update manifest asset fields are invalid.")
     if asset["platform"] != "windows-x64" or not isinstance(asset["name"], str):
@@ -71,34 +96,30 @@ def validate_manifest(document: object, *, expected_version: str | None = None,
     if (not asset["name"].endswith(".exe") or "/" in asset["name"] or "\\" in asset["name"]
             or asset["name"] in {".", ".."}):
         raise ValueError("Update manifest asset name is unsafe.")
-    if expected_asset_name is not None and asset["name"] != expected_asset_name:
-        raise ValueError("Update manifest asset name does not match the package.")
     size = asset["size"]
     if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= MAX_ASSET_BYTES:
         raise ValueError("Update manifest asset size is invalid.")
-    if expected_asset_size is not None and size != expected_asset_size:
-        raise ValueError("Update manifest asset size does not match the package.")
     digest = asset["sha256"]
     if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
         raise ValueError("Update manifest asset SHA-256 is invalid.")
-    if expected_asset_sha256 is not None and digest != expected_asset_sha256:
-        raise ValueError("Update manifest asset SHA-256 does not match the package.")
     if not isinstance(asset["url"], str) or not asset["url"].startswith("https://github.com/"):
         raise ValueError("Update manifest asset URL must be an HTTPS GitHub release URL.")
-    return document
 
 
 def build_manifest(*, version: str, release_epoch: int, repository: str,
                    asset_name: str, asset_path: Path, notes_path: Path | None,
-                   published_at: str | None = None) -> dict:
+                   published_at: str | None = None,
+                   alias_names: tuple[str, ...] = ()) -> dict:
     if not _VERSION.fullmatch(version):
         raise ValueError("Version must be a stable x.y.z value.")
     if not _REPOSITORY.fullmatch(repository):
         raise ValueError("Repository must be owner/name.")
     if isinstance(release_epoch, bool) or not isinstance(release_epoch, int) or release_epoch < 0:
         raise ValueError("Release epoch must be a non-negative integer.")
-    if not asset_name.endswith(".exe") or "/" in asset_name or "\\" in asset_name:
-        raise ValueError("Asset name must be a plain .exe filename.")
+    all_names = (asset_name, *alias_names)
+    for name in all_names:
+        if not isinstance(name, str) or not name.endswith(".exe") or "/" in name or "\\" in name:
+            raise ValueError("Asset name must be a plain .exe filename.")
     asset_path = asset_path.resolve()
     if not asset_path.is_file():
         raise ValueError("Release executable does not exist.")
@@ -117,14 +138,15 @@ def build_manifest(*, version: str, release_epoch: int, repository: str,
         "releaseEpoch": release_epoch,
         "assets": [{
             "platform": "windows-x64",
-            "name": asset_name,
-            "url": f"https://github.com/{repository}/releases/download/v{version}/{asset_name}",
+            "name": name,
+            "url": f"https://github.com/{repository}/releases/download/v{version}/{name}",
             "size": size,
             "sha256": digest,
-        }],
+        } for name in all_names],
     }
     return validate_manifest(document, expected_version=version, expected_asset_name=asset_name,
-                             expected_asset_size=size, expected_asset_sha256=digest)
+                             expected_asset_size=size, expected_asset_sha256=digest,
+                             expected_alias_names=tuple(alias_names))
 
 
 def _write(document: dict, output: Path) -> None:
@@ -144,6 +166,8 @@ def main() -> None:
     parser.add_argument("--release-epoch", required=True, type=int)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--asset-name", required=True)
+    parser.add_argument("--alias-name", action="append", default=[],
+                        help="Compatibility filename for the same executable; may be repeated.")
     parser.add_argument("--asset-path", type=Path)
     parser.add_argument("--notes-file", type=Path)
     parser.add_argument("--published-at")
@@ -153,7 +177,8 @@ def main() -> None:
     try:
         if args.validate:
             document = json.loads(args.output.read_text(encoding="utf-8-sig"))
-            validate_manifest(document, expected_version=args.version, expected_asset_name=args.asset_name)
+            validate_manifest(document, expected_version=args.version, expected_asset_name=args.asset_name,
+                              expected_alias_names=tuple(args.alias_name))
             encoded_size = len(args.output.read_bytes())
             if encoded_size > MAX_METADATA_BYTES:
                 raise ValueError("Update manifest exceeds the 2 MiB consumer limit.")
@@ -163,7 +188,8 @@ def main() -> None:
             _write(build_manifest(version=args.version, release_epoch=args.release_epoch,
                                   repository=args.repository, asset_name=args.asset_name,
                                   asset_path=args.asset_path, notes_path=args.notes_file,
-                                  published_at=args.published_at), args.output)
+                                  published_at=args.published_at,
+                                  alias_names=tuple(args.alias_name)), args.output)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         parser.error(str(exc))
 

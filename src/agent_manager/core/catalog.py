@@ -1,12 +1,17 @@
 """Catalog services."""
 from __future__ import annotations
 from agent_manager import core as _core
+from agent_manager.usage.provider_quota_feedback import source_balance_text
 
 
 _PROBE_LOCK = _core.threading.RLock()
 _PERSISTED_PROBE_TTL = 24 * 60 * 60
 _FAILED_PROBE_RETRY_SECONDS = 30
 _MODEL_PROBE_FAILURE = {}
+
+
+def _source_balance_text(balance: object, *, updated_at: object = None, error: object = None) -> str:
+    return source_balance_text(balance, updated_at=updated_at, error=error)
 
 
 def _installation_identity() -> list | None:
@@ -504,6 +509,9 @@ def model_sources(settings: dict | None = None, local_models: list[dict] | None 
                 "relayKeyId": str(provider.get("relayKeyId") or ""),
                 "relayPlatform": str(provider.get("relayPlatform") or ""),
                 "relayRateMultiplier": provider.get("relayRateMultiplier"),
+                "balance": provider.get("balance"),
+                "balanceUpdatedAt": provider.get("balanceUpdatedAt"),
+                "balanceError": provider.get("balanceError"),
                 "available": (
                     _core.provider_key_configured(provider_id)
                     and bool(models)
@@ -552,6 +560,9 @@ def _all_model_records(
                     "sourceRecordId": source["recordId"],
                     "sourceName": source["name"],
                     "available": source["available"],
+                    "balance": source.get("balance"),
+                    "balanceUpdatedAt": source.get("balanceUpdatedAt"),
+                    "balanceError": source.get("balanceError"),
                 }
             )
     return records
@@ -571,6 +582,9 @@ def selected_model_records(settings: dict | None = None, aggregate: bool | None 
             "sourceRecordId": source["recordId"],
             "sourceName": source["name"],
             "available": source["available"],
+            "balance": source.get("balance"),
+            "balanceUpdatedAt": source.get("balanceUpdatedAt"),
+            "balanceError": source.get("balanceError"),
         }
         for source in sources
         for model in source["models"]
@@ -865,7 +879,25 @@ def build_synced_model_catalog(settings: dict | None = None) -> tuple[dict, list
         # Manager labels belong in descriptions, not in the model's name.
         # Keep the opaque slug unchanged for routing and resumed conversations.
         item["display_name"] = record["id"]
-        item["description"] = f"由 Agent Manager 路由到 {record['sourceName']}。"
+        # Codex 26.915+ requires model_messages.instructions_template for
+        # custom models.  Apply the fallback after display_name is normalized;
+        # the previous order raised KeyError for catalog templates that did not
+        # carry base_instructions.
+        if "model_messages" not in item:
+            base_inst = item.get("base_instructions", "")
+            item["model_messages"] = {
+                "instructions_template": base_inst
+                or f"You are {record['id']}, an AI assistant."
+            }
+        base_description = f"由 Agent Manager 路由到 {record['sourceName']}"
+        balance_text = _source_balance_text(
+            record.get("balance"),
+            updated_at=record.get("balanceUpdatedAt"),
+            error=record.get("balanceError"),
+        )
+        if balance_text:
+            base_description += balance_text
+        item["description"] = base_description + "。"
         item["visibility"] = "hide" if record.get("subagentAlias") else "list"
         item["priority"] = priority
         item["supported_in_api"] = True

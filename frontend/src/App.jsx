@@ -26,6 +26,7 @@ import { contextBudget } from "./contextBudget.js";
 import { createConfirmationQueue } from "./confirmationQueue.js";
 import { usageSourceKey, usageSourceLabels, usageBackfillState } from "./usageViewModel.js";
 import { usageModelRouting, usageRoutingSummary } from "./usageRouting.js";
+import UsageModelIdentity from "./components/UsageModelIdentity.jsx";
 import { applyDashboardMoveResult } from "./dashboardMove.js";
 import { normalizeUsageRange, resolveUsageRange, filterUsageRecordsByRange, usageRecordDateKey } from "./usageRange.js";
 import DiscreteSlider from "./components/DiscreteSlider.jsx";
@@ -10574,8 +10575,9 @@ function UsageView({ data, notify, confirm, embedded = false }) {
           <span>角色可识别 <b>{totals.requests ? `${(((totals.requests - visible.filter((item) => item.role === "unclassified").reduce((sum, item) => sum + item.requests, 0)) / totals.requests) * 100).toFixed(1)}%` : "—"}</b></span>
           <span>缓存写入 <b>{usagePayload?.coverage?.cacheWriteAvailable === false ? "当前 Codex 日志未提供" : formatTokenCount(totals.cacheWrite)}</b></span>
         </div>
-        {routingSummary.mismatchRequests > 0 && <p className="usage-routing-warning" role="status"><AlertTriangle size={14} /><span>发现 {formatTokenCount(routingSummary.mismatchRequests)} 个请求的响应模型与配置路由不一致；实际模型仅依据响应元数据记录，不能单独证明“降智”。</span></p>}
-        {!routingSummary.mismatchRequests && routingSummary.fingerprintChanges > 0 && <p className="usage-routing-warning" role="status"><AlertTriangle size={14} /><span>响应系统指纹出现 {formatTokenCount(routingSummary.fingerprintChanges)} 次变体；这只是基础设施元数据变化，不能单独证明“降智”。</span></p>}
+        <p className="usage-model-observation-note">被动观察，不发额外请求；协议指纹不能证明模型权重。</p>
+        {routingSummary.mismatchRequests > 0 && <p className="usage-routing-warning" role="status"><AlertTriangle size={14} /><span>发现 {formatTokenCount(routingSummary.mismatchRequests)} 个请求的上游声明与配置路由不一致；声明的模型名不等于身份验证。</span></p>}
+        {!routingSummary.mismatchRequests && routingSummary.fingerprintChanges > 0 && <p className="usage-routing-warning" role="status"><AlertTriangle size={14} /><span>检测到 {formatTokenCount(routingSummary.fingerprintChanges)} 个额外系统指纹；指纹变化本身不能确认型号变化。</span></p>}
         <div className="usage-filters" aria-label="用量筛选">
           <label><span>{effectiveUsageSource === "codex" ? "代理角色" : "账号 / API 来源"}</span><select value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}><option value="all">全部{effectiveUsageSource === "codex" ? "角色" : "账号"}</option>{accounts.map((item) => <option key={item} value={item}>{accountLabels.get(item)}</option>)}</select></label>
           <label><span>模型</span><select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}><option value="all">全部模型</option>{models.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
@@ -10603,7 +10605,7 @@ function UsageView({ data, notify, confirm, embedded = false }) {
           <table className="usage-table">
             <thead><tr><th>时间（最新在上）</th><th>{effectiveUsageSource === "codex" ? "日志来源" : "实际消耗账号"}</th><th>模型</th><th>角色</th><th>请求</th><th>输入</th><th>缓存读取</th><th>输出</th><th>推理</th><th>合计</th></tr></thead>
             <tbody>{pagedDetails.map((item) => <tr key={item.rowId} className={cx(item.uncertain && "uncertain", item.modelMismatch && "model-routing-mismatch", item.role === "mainAgent" && "main-agent-row", item.role === "subagent" && "subagent-row")}>
-              <td>{item.timestamp.length > 10 ? formatDateTime(item.timestamp) : item.date}</td><td><strong>{item.account}</strong></td><td><div className="usage-model-cell"><code>{item.model}</code>{item.modelMismatch && <span className="model-routing-issue" title={item.systemFingerprint ? `服务指纹：${item.systemFingerprint}` : "响应元数据与配置路由不一致"}><AlertTriangle size={12} />实际：{item.actualModel || "未知"}</span>}</div></td><td>{item.role === "mainAgent" ? <span className="agent-role-badge main"><Bot size={12} />主代理</span> : item.role === "subagent" ? <span className="agent-role-badge sub"><Route size={12} />子代理</span> : <span className="uncertain-tag">未标记</span>}</td><td>{formatTokenCount(item.requests)}</td><td>{formatTokenCount(item.inputTokens ?? item.input_tokens)}</td><td>{formatTokenCount(item.cachedInputTokens ?? item.cached_input_tokens ?? item.cachedTokens ?? item.cached_tokens)}</td><td>{formatTokenCount(item.outputTokens ?? item.output_tokens)}</td><td>{formatTokenCount(item.reasoningOutputTokens ?? item.reasoning_output_tokens ?? item.reasoningTokens)}</td><td><b>{formatTokenCount(item.tokens)}</b></td>
+              <td>{item.timestamp.length > 10 ? formatDateTime(item.timestamp) : item.date}</td><td><strong>{item.account}</strong></td><td><UsageModelIdentity item={item} /></td><td>{item.role === "mainAgent" ? <span className="agent-role-badge main"><Bot size={12} />主代理</span> : item.role === "subagent" ? <span className="agent-role-badge sub"><Route size={12} />子代理</span> : <span className="uncertain-tag">未标记</span>}</td><td>{formatTokenCount(item.requests)}</td><td>{formatTokenCount(item.inputTokens ?? item.input_tokens)}</td><td>{formatTokenCount(item.cachedInputTokens ?? item.cached_input_tokens ?? item.cachedTokens ?? item.cached_tokens)}</td><td>{formatTokenCount(item.outputTokens ?? item.output_tokens)}</td><td>{formatTokenCount(item.reasoningOutputTokens ?? item.reasoning_output_tokens ?? item.reasoningTokens)}</td><td><b>{formatTokenCount(item.tokens)}</b></td>
             </tr>)}</tbody>
           </table>
           {!visibleDetails.length && <div className="table-empty">当前筛选条件没有可显示记录。</div>}

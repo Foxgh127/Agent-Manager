@@ -222,7 +222,7 @@ class OAuthCallbackServer(_app.ThreadingHTTPServer):
 def _release_executable_name(path: _app.Path) -> bool:
     return bool(
         _app.re.fullmatch(
-            r"(?:AgentManager|CodexAgentManager)(?:-[0-9][A-Za-z0-9_.-]*)?\.exe",
+            r"(?:Agent-Manager|AgentManager|CodexAgentManager)(?:-[0-9][A-Za-z0-9_.-]*)?\.exe",
             path.name,
             _app.re.IGNORECASE,
         )
@@ -279,7 +279,7 @@ def _promote_and_cleanup_release_executable(retry_seconds: float = 8.0) -> dict:
     # A running versioned executable cannot delete itself.  The canonical
     # process on the next handoff/start performs this bounded cleanup.
     if current.name.casefold() == canonical.name.casefold():
-        for pattern in ("AgentManager-*.exe", "CodexAgentManager*.exe"):
+        for pattern in ("Agent-Manager-*.exe", "AgentManager-*.exe", "CodexAgentManager*.exe"):
             for candidate in current.parent.glob(pattern):
                 try:
                     resolved = candidate.resolve()

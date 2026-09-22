@@ -29,7 +29,12 @@ from zoneinfo import ZoneInfo
 
 import agent_manager.core as core
 from agent_manager._version import VERSION as MANAGER_VERSION
+from agent_manager.detection.reference_index import annotate_identities
 from .scheduling import Scheduler, LeasedResponse, SessionStateError, session_key
+from agent_manager.usage.provider_quota_feedback import (
+    apply_quota_headers as _apply_provider_quota_headers,
+    codex_quota_headers as _provider_quota_headers,
+)
 from agent_manager.usage.request_metadata import (
     IDENTITY_FIELDS,
     enrich_context,
@@ -66,6 +71,9 @@ RESPONSES_AUXILIARY_PATHS = {"/v1/responses/compact", "/v1/responses/input_token
 UPSTREAM_QUEUE_TIMEOUT_SECONDS = 2.0
 SAFE_FORWARD_HEADERS = {
     "openai-model",
+    "x-openai-model",
+    "x-model",
+    "x-codex-model",
     "x-reasoning-included",
     "retry-after",
     "x-codex-history-compatibility",
@@ -713,6 +721,8 @@ class UsageStatsStore:
             "sourceRecordId": _bounded_text(raw_route.get("sourceRecordId"), 200),
             "accountId": _bounded_text(raw_route.get("accountId"), 200),
             "providerId": _bounded_text(raw_route.get("providerId"), 200),
+            "modelIdentityAuthority": "official_direct" if raw_route.get("modelIdentityAuthority") == "official_direct"
+                and raw_route.get("sourceKind") == "account" and not raw_route.get("providerId") else "unknown",
             "requestedModel": _bounded_text(raw_route.get("requestedModel"), 200, "unknown"),
             "routedModel": _bounded_text(raw_route.get("routedModel"), 200, "unknown"),
             "modelRoutingStatus": _bounded_text(raw_route.get("modelRoutingStatus"), 24, "unknown"),
@@ -1161,6 +1171,8 @@ class UsageStatsStore:
         self._prune_document(document)
         self._recalculate_totals(document)
         total_requests = int(document.get("totals", {}).get("requestCount", 0) or 0)
+        identity_records = [row for day in document["days"].values() for row in day["routes"].values()]
+        annotate_identities(identity_records, document["recentRequests"])
         reported_requests = int(document.get("totals", {}).get("usageReportedCount", 0) or 0)
         explicitly_classified = sum(
             int(item.get("requestCount", 0) or 0)
@@ -3040,35 +3052,12 @@ def _epoch_seconds(value: Any) -> int | None:
 
 
 def _codex_quota_headers(headers: Any, account: dict | None = None) -> dict[str, str]:
-    """Preserve upstream quota headers and fill a weekly-only fallback.
+    """Preserve native quota evidence; present API billing as catalog snapshots."""
+    return _provider_quota_headers(_safe_response_headers(headers), account)
 
-    Codex parses the x-codex-* family into its native RateLimitSnapshot. The
-    fallback is used only when an upstream response omits window headers.
-    """
-    forwarded = _safe_response_headers(headers)
-    if not account:
-        return forwarded
-    usage = account.get("usage") if isinstance(account.get("usage"), dict) else {}
-    weekly = usage.get("weekly") if isinstance(usage.get("weekly"), dict) else {}
-    try:
-        remaining = float(weekly.get("remainingPercent"))
-    except (TypeError, ValueError):
-        remaining = None
-    if remaining is not None:
-        used = max(0.0, min(100.0, 100.0 - remaining))
-        try:
-            window_minutes = int(weekly.get("windowMinutes") or 10_080)
-        except (TypeError, ValueError):
-            window_minutes = 10_080
-        forwarded.setdefault("x-codex-primary-used-percent", f"{used:g}")
-        forwarded.setdefault("x-codex-primary-window-minutes", str(max(1, window_minutes)))
-        reset_at = _epoch_seconds(weekly.get("resetAt"))
-        if reset_at:
-            forwarded.setdefault("x-codex-primary-reset-at", str(reset_at))
-    plan = str(account.get("plan") or account.get("planLabel") or "").strip()
-    if plan:
-        forwarded.setdefault("x-codex-plan-type", plan)
-    return forwarded
+
+def _apply_quota_headers(response: Any, headers: dict[str, str]) -> None:
+    _apply_provider_quota_headers(response, headers)
 
 
 def _read_limited(response: Any) -> bytes:
@@ -4616,6 +4605,9 @@ class Web2APIManager:
             "sourceRecordId": source_record_id,
             "accountId": account_id,
             "providerId": resolved_provider_id,
+            # Only this code path talks directly to the fixed official Codex
+            # endpoint. Provider declarations must never train the reference index.
+            "modelIdentityAuthority": "official_direct" if account_id and source_kind == "account" else "unknown",
             "requestedModel": requested_model,
             "routedModel": _bounded_text((route or {}).get("id"), 200, requested_model or "unknown"),
             "routeKey": _bounded_text(
@@ -5647,7 +5639,7 @@ class Web2APIManager:
                 try:
                     rejected_body = _read_limited(exc)
                     rejected_type = exc.headers.get_content_type() if exc.headers else "application/json"
-                    rejected_headers = _safe_response_headers(exc.headers)
+                    rejected_headers = _codex_quota_headers(exc.headers, provider)
                 finally:
                     exc.close()
                 replay = _encrypted_history_replay(forwarded, exc.code, rejected_body)
@@ -5661,13 +5653,16 @@ class Web2APIManager:
                 response.headers["X-Codex-History-Compatibility"] = "plaintext-replay"
             response._gateway_identity_fingerprint = fingerprint
             _set_response_idle_timeout(response)
+            # Preserve real upstream Codex quota feedback. Ordinary provider
+            # balances are separate snapshots, not native Codex rate limits.
+            _apply_quota_headers(response, _codex_quota_headers(response.headers, provider))
             self.last_error = None
             return response
         except HTTPError as exc:
             try:
                 body = _read_limited(exc)
                 content_type = exc.headers.get_content_type() if exc.headers else "application/json"
-                headers = _safe_response_headers(exc.headers)
+                headers = _codex_quota_headers(exc.headers, provider)
             finally:
                 exc.close()
             error = GatewayError(
@@ -5903,6 +5898,7 @@ class Web2APIManager:
         with response:
             body = _read_limited(response)
         return {"body": body, "headers": headers, "account": account,
+                "fingerprintMetadata": observe_response_headers(None, getattr(response, "headers", None)),
                 "identityFingerprint": str(getattr(response, "_gateway_identity_fingerprint", ""))} if include_headers else body
 
     @staticmethod
@@ -6366,6 +6362,7 @@ class Web2APIManager:
                 "_abort": lambda: _abort_upstream_response(response),
             }
         capture = _SSEUsageCapture()
+        capture.observe_headers(getattr(response, "headers", None))
         capture.observe_headers(headers)
         chunks = self._tracked_chunks(
             self._chat_stream_chunks(response, requested_model, capture,
@@ -6429,6 +6426,7 @@ class Web2APIManager:
                     result = {"body": result, "headers": {}}
                 context = self._usage_route_context(payload, model, route=route, account=result.get("account"))
                 capture = _SSEUsageCapture()
+                capture.billing_metadata = safe_metadata(result.get("fingerprintMetadata"))
                 capture.observe_headers(result.get("headers"))
                 usage, _failed = _inspect_usage_body(result["body"], capture)
                 context = enrich_context(context, capture)
@@ -6455,6 +6453,7 @@ class Web2APIManager:
             body = _read_limited(response)
             status = int(getattr(response, "status", 200))
             headers = _safe_response_headers(response.headers)
+            response_metadata = observe_response_headers(None, response.headers)
             decoded = json.loads(body)
         except (ValueError, UnicodeError) as exc:
             raise GatewayError("Responses 辅助端点未返回有效 JSON。", 502) from exc
@@ -6471,7 +6470,7 @@ class Web2APIManager:
             if not isinstance(output, list) or not any(isinstance(item, dict) and item.get("type") == "compaction" for item in output):
                 raise GatewayError("上游未返回有效的压缩上下文。", 502)
             context = self._usage_route_context(payload, model, route=route, provider_id=str(route["sourceRecordId"]))
-            metadata = observe_metadata(None, decoded)
+            metadata = observe_metadata(response_metadata, decoded)
             metadata = observe_response_headers(metadata, headers)
             self._record_usage(enrich_context(context, metadata), _payload_usage(decoded), failed=status >= 400)
         self.request_count += 1
@@ -6532,6 +6531,7 @@ class Web2APIManager:
                 content_type = response.headers.get("Content-Type", "application/json; charset=utf-8")
                 status = int(getattr(response, "status", 200))
                 headers = _safe_response_headers(response.headers)
+                response_metadata = observe_response_headers(None, response.headers)
             except Exception:
                 self._record_usage(context, None, failed=True)
                 raise
@@ -6539,6 +6539,7 @@ class Web2APIManager:
                 response.close()
             self.request_count += 1
             capture = _SSEUsageCapture()
+            capture.billing_metadata = response_metadata
             capture.observe_headers(headers)
             usage, body_failed = _inspect_usage_body(body, capture)
             context = enrich_context(context, capture)
@@ -6630,6 +6631,7 @@ class Web2APIManager:
         account = upstream.get("account") if isinstance(upstream.get("account"), dict) else None
         context = self._usage_route_context(payload, requested_model, route=route, account=account)
         capture = _SSEUsageCapture()
+        capture.billing_metadata = safe_metadata(upstream.get("fingerprintMetadata"))
         capture.observe_headers(headers)
         usage, body_failed = _inspect_usage_body(body, capture)
         context = enrich_context(context, capture)
